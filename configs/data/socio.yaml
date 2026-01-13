@@ -1,0 +1,35 @@
+label_col: y_moved
+drop_cols: [year]
+
+cat_cols: [age_group_lag1, nat_lag1, eerste_nationaliteit]
+
+num_cols:
+  - lag1_available
+
+  - moved_lag1
+  - birth1_lag1
+  - birth2_lag1
+  - divorce_lag1
+
+  - years_since_last_moved_cap
+  - moved_duration_censored
+  - years_since_last_birth1_cap
+  - birth1_duration_censored
+  - years_since_last_birth2_cap
+  - birth2_duration_censored
+  - years_since_last_divorce_cap
+  - divorce_duration_censored
+  - "socio_niet_europese_niet_eu_herkomst_t_o_v_inwoners_2020"
+  - "socio_hooggeschoold_t_o_v_25_64_jarigen_2020"
+  - "socio_werkzoekenden_t_o_v_alle_inwoners_2020"
+  - "socio_appartementen_mediaanprijs_2020"
+  - "socio_prijs_inkomen_ratio_woonhuizen_alle_huizen_excl_appartementen_2020"
+  - "socio_woonduur_gemeente_5_jaar_of_minder_t_o_v_inwoners_2020"
+  - "socio_gemiddelde_huishoudensgrootte_2020"
+  - "socio_middengeschoold_t_o_v_25_64_jarigen_2020"
+  - "socio_laaggeschoold_t_o_v_25_64_jarigen_2020"
+  - "socio_gemiddeld_netto_belastbaar_inkomen_per_inwoner_2020"
+  - "socio_immigratie_vanuit_een_andere_belgische_gemeente_per_1_000_inwoners_2020"
+  - "socio_emigratie_naar_een_andere_belgische_gemeente_per_1_000_inwoners_2020"
+  - "socio_loontrekkend_en_zelfstandig_t_o_v_alle_inwoners_2020"
+  - "socio_mediaan_huurprijs_nieuwe_huurcontracten_verhuurder_rechtspersoon_2020"

@@ -1,0 +1,32 @@
+
+features_col: features
+preprocess:
+  label_cast: double
+  numeric_cast: double
+  categorical_cast: string
+  bin_null_to: 0.0
+  nan_to_null: true
+  inf_to_null: true
+  impute:
+    enabled: true
+    strategy: median
+encoding:
+  handle_invalid: keep
+scaling:
+  enabled: true
+  withMean: false
+  withStd: true
+  input_col: cont_vec
+  output_col: cont_vec_scaled
+dim_reduction:
+  enabled: true
+  k: 10
+  output_col: cont_vec_pca
+model:
+  type: logistic_regression
+  params:
+    elasticNetParam: 0.0
+    regParam: 0.01
+    maxIter: 50
+    standardization: true    # we do our own scaling
+

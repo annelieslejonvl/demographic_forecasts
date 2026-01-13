@@ -1,0 +1,12 @@
+# model_rf.yaml
+preprocess:
+  impute: { enabled: true, strategy: median }
+encoding: { handle_invalid: keep }
+scaling: { enabled: false }
+dim_reduction: { enabled: false }
+model:
+  type: random_forest
+  params:
+    numTrees: 200
+    maxDepth: 12
+    featureSubsetStrategy: sqrt
