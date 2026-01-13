@@ -1,0 +1,42 @@
+# PyTorch MLP Configuration
+# Supports both CPU and CUDA GPU training
+
+backend: pytorch
+model_type: mlp
+
+# Device configuration
+device:
+  type: auto        # auto, cpu, or gpu
+  gpu_id: null      # Specific GPU index (null = auto-select)
+  num_workers: 4    # DataLoader workers
+  memory_fraction: 0.9
+
+# Preprocessing
+scaling:
+  enabled: true
+  type: standard    # standard or minmax
+
+dim_reduction:
+  enabled: false
+  k: 50             # Number of PCA components
+
+# Model architecture
+model:
+  type: mlp
+  params:
+    # Architecture
+    hidden_dims: [256, 128, 64]
+    dropout: 0.3
+    activation: gelu  # relu, gelu, silu, tanh
+    
+    # Training
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    epochs: 100
+    batch_size: 256
+    early_stopping_patience: 15
+
+# Column configuration
+label_col: label
+features_col: features
+weight_col: null

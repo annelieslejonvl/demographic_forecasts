@@ -1,0 +1,38 @@
+# Parquet Data Source Configuration
+# Works with local files, DBFS, S3, ADLS, GCS
+
+source_type: parquet
+
+# Single file
+path: /mnt/datalake/ml/features/customer_features.parquet
+
+# Multiple files (uncomment to use instead of single path)
+# paths:
+#   - /mnt/datalake/ml/features/2023/*.parquet
+#   - /mnt/datalake/ml/features/2024/*.parquet
+
+# Cloud storage examples:
+# AWS S3:
+#   path: s3a://my-bucket/ml/features.parquet
+# 
+# Azure ADLS Gen2:
+#   path: abfss://container@storageaccount.dfs.core.windows.net/ml/features.parquet
+# 
+# Google Cloud Storage:
+#   path: gs://my-bucket/ml/features.parquet
+# 
+# Databricks DBFS:
+#   path: dbfs:/mnt/datalake/features.parquet
+
+# Partition filter (if data is partitioned)
+partition_filter: "year >= 2020 AND year <= 2024"
+
+# Sampling (for development/testing with large data)
+sample_fraction: null  # Set to 0.1 for 10% sample
+sample_seed: 42
+
+# Read options
+options:
+  mergeSchema: true
+  # recursiveFileLookup: true   # Scan all subdirectories
+  # pathGlobFilter: "*.parquet" # Only read .parquet files

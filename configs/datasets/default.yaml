@@ -1,0 +1,49 @@
+# Dataset Configuration
+# Controls train/valid/test splitting and sampling
+
+# Key columns for deduplication and joining
+key_cols:
+  - customer_id
+  - year
+
+# Time-based split configuration  
+split:
+  year_col: year
+  train_range: [2018, 2022]
+  valid_range: [2022, 2023]  # Set to null if no validation
+  test_range: [2023, 2025]
+
+# ==============================================================================
+# Tuning mode: fast iterations with aggressive sampling
+# ==============================================================================
+tune:
+  sampling:
+    type: undersample       # none, random, stratified, undersample, oversample
+    target_ratio: 0.5       # Target pos/neg ratio
+    fraction: 0.1           # Additional subsampling (10% of data)
+    seed: 42
+  
+  hard_negatives:
+    enabled: false          # Skip hard negatives in tune mode (too slow)
+
+# ==============================================================================
+# Final mode: best performance with hard negative mining
+# ==============================================================================
+final:
+  sampling:
+    type: hard_negative     # Use hard negative mining
+    target_ratio: 0.3       # Final pos/neg ratio
+    seed: 42
+  
+  hard_negatives:
+    enabled: true
+    fraction: 0.6           # 60% hard negatives, 40% random
+    method: top_prob        # top_prob, margin, entropy
+    
+    # Baseline model for scoring (optional)
+    baseline:
+      type: logistic_regression
+      sample_fraction: 0.1  # Train baseline on 10% of data (fast)
+      params:
+        maxIter: 100
+        regParam: 0.01

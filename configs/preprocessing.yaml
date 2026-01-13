@@ -1,0 +1,60 @@
+# Preprocessing Configuration
+# Applies to all backends (Spark, PyTorch, XGBoost)
+
+# ==============================================================================
+# Global defaults (applied to all columns unless overridden)
+# ==============================================================================
+
+# Numeric column defaults
+numeric_imputation: median    # mean, median, mode, constant, none
+numeric_scaling: standard     # standard, minmax, robust, none
+
+# Categorical column defaults  
+categorical_encoding: onehot  # onehot, label, ordinal, target, none
+categorical_imputation: mode  # mode, constant, none
+
+# How to handle unknown categories at inference time
+handle_unknown: keep          # keep, error, skip
+
+# ==============================================================================
+# PCA dimensionality reduction (optional)
+# ==============================================================================
+pca:
+  enabled: false
+  k: 50                       # Number of components
+
+# ==============================================================================
+# Column-specific overrides (optional)
+# ==============================================================================
+columns:
+  # Example: Override settings for specific columns
+  - name: age
+    dtype: numeric
+    imputation: median
+    scaling: standard
+  
+  - name: income
+    dtype: numeric
+    imputation: median
+    scaling: robust           # Robust to outliers
+  
+  - name: gender
+    dtype: categorical
+    encoding: onehot
+    imputation: mode
+  
+  - name: state
+    dtype: categorical
+    encoding: label           # StringIndexer only (for tree models)
+  
+  - name: category_high_cardinality
+    dtype: categorical
+    encoding: label           # Don't one-hot encode high cardinality
+  
+  - name: is_active
+    dtype: boolean            # Passed through as-is
+
+# ==============================================================================
+# Output configuration
+# ==============================================================================
+output_col: features          # Final assembled features column name
