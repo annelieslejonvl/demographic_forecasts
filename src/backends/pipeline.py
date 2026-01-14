@@ -159,7 +159,7 @@ class UnifiedPipeline:
     
     def _prepare_data(
         self,
-        data: Any,
+        data: Tuple[Any, Any],
         feature_cols: List[str],
         fit: bool = False,
     ) -> Tuple[Any, Any]:
@@ -170,7 +170,7 @@ class UnifiedPipeline:
             (X, y) tuple appropriate for the backend
         """
         label_col = self.config.label_col
-        
+
         if self.config.backend == BackendType.SPARK:
             # Spark keeps data as DataFrame
             if fit:
@@ -194,7 +194,8 @@ class UnifiedPipeline:
                 X = pdf[feature_cols].values
                 y = pdf[label_col].values
             else:
-                X, y = data, None
+                X, y = data
+                print(X)
             
             if fit:
                 self.preprocessor_ = self._create_preprocessor()
@@ -206,9 +207,9 @@ class UnifiedPipeline:
     
     def fit(
         self,
-        train_data: Any,
+        train_data: Tuple[Any, Any] ,  # (X_train, y_train)
         feature_cols: List[str],
-        eval_data: Optional[Any] = None,
+        eval_data: Optional[Tuple[Any, Any]] = None,
         sample_weight: Optional[Any] = None,
     ) -> TrainResult:
         """
@@ -229,12 +230,14 @@ class UnifiedPipeline:
         self.feature_cols_ = feature_cols
         
         # Prepare training data
-        X_train, y_train = self._prepare_data(train_data, feature_cols, fit=True)
         
+        X_train, y_train = self._prepare_data(train_data, feature_cols, fit=True)
+        print('eval_set')
         # Prepare eval data if provided
         eval_set = None
         if eval_data is not None:
             X_eval, y_eval = self._prepare_data(eval_data, feature_cols, fit=False)
+            
             if self.config.backend != BackendType.SPARK:
                 eval_set = [(X_eval, y_eval)]
         
@@ -256,7 +259,7 @@ class UnifiedPipeline:
                 y_train,
                 sample_weight=sample_weight,
                 eval_set=eval_set,
-                feature_names=feature_cols,
+                feature_cols=feature_cols,
             )
         
         self._is_fitted = True

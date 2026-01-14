@@ -43,13 +43,13 @@ hard_negative_method: top_prob
 
 # For tuning phase: use aggressive sampling for fast iterations
 tune:
-  strategy: undersample
+  type: undersample
   target_ratio: 0.5
   fraction: 0.1  # 10% sample for quick experiments
 
 # For final phase: use hard negatives for best performance
 final:
-  strategy: hard_negative
+  type: hard_negative
   target_ratio: 0.3
   hard_negative_fraction: 0.6
   hard_negative_method: top_prob

@@ -44,9 +44,9 @@ from src.backends import (
 )
 from src.backends.base import BackendFactory
 from src.utils.device import get_device_manager
-#from src.config_loader import load_yaml
-#from src.specs import DataSpec, ModelSpec
-#from src.dataset import DatasetBuilder, DatasetSpec
+from src.config_loader import load_yaml
+from src.specs import DataSpec, ModelSpec
+from src.dataset import DatasetBuilder, DatasetSpec
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,7 @@ def spark_to_numpy(
     feature_cols: List[str],
     label_col: str,
     weight_col: Optional[str] = None,
+    limit_rows = None
 ) -> Tuple:
     """Convert Spark DataFrame to numpy arrays for PyTorch/XGBoost."""
     import numpy as np
@@ -219,11 +220,13 @@ def spark_to_numpy(
     cols = feature_cols + [label_col]
     if weight_col:
         cols.append(weight_col)
-    
-    pdf = spark_df.select(cols).toPandas()
+    if (limit_rows is None):
+        pdf = spark_df.select(cols).toPandas()
+    else:
+        pdf = spark_df.limit(limit_rows).select(cols).toPandas()
     
     X = pdf[feature_cols].values.astype(np.float32)
-    y = pdf[label_col].values.astype(np.float32)
+    y = pdf[label_col].values.astype(np.float32).ravel()
     w = pdf[weight_col].values.astype(np.float32) if weight_col else None
     
     return X, y, w
@@ -380,35 +383,37 @@ def run_experiments(
                     valid_metrics = _spark_binary_metrics(pred_valid, label_col)
             
             else:
+        
                 # PyTorch/XGBoost need numpy arrays
                 X_train, y_train, w_train = spark_to_numpy(
                     train_df_sampled, feature_cols, label_col,
-                    model_cfg.get("weight_col"),
+                    model_cfg.get("weight_col"), limit_rows = 10000
                 )
-                X_test, y_test, _ = spark_to_numpy(test_df, feature_cols, label_col)
+                X_test, y_test, _ = spark_to_numpy(test_df, feature_cols, label_col, limit_rows=None)
                 
                 eval_set = None
                 if valid_df is not None:
-                    X_val, y_val, _ = spark_to_numpy(valid_df, feature_cols, label_col)
+                    X_val, y_val, _ = spark_to_numpy(valid_df, feature_cols, label_col, limit_rows=None)
                     eval_set = [(X_val, y_val)]
-                
+                print('fitting')
                 train_result = pipeline.fit(
-                    X_train,
-                    feature_cols,
-                    eval_data=X_val if valid_df else None,
+                    train_data = (X_train,y_train),  # <-- TOEVOEGEN
+                    feature_cols =feature_cols,
+                    eval_data=(X_val, y_val) if valid_df else None,  
                     sample_weight=w_train,
-                )
+                    )
                 
                 # Note: For non-Spark, we need to handle y separately
-                pred_train = pipeline.predict_proba(X_train)
-                pred_test = pipeline.predict_proba(X_test)
+                print('fitting done')
+                pred_train = pipeline.predict_proba((X_train, None))
+                pred_test = pipeline.predict_proba((X_test, None))
                 
                 train_metrics = _numpy_binary_metrics(y_train, pred_train.probabilities)
                 test_metrics = _numpy_binary_metrics(y_test, pred_test.probabilities)
                 
                 valid_metrics = None
                 if valid_df is not None:
-                    pred_valid = pipeline.predict_proba(X_val)
+                    pred_valid = pipeline.predict_proba( (X_val, None))
                     valid_metrics = _numpy_binary_metrics(y_val, pred_valid.probabilities)
             
             # Build run name

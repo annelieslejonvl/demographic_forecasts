@@ -38,8 +38,25 @@ class SamplingConfig:
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SamplingConfig":
+        # Accept both "type" and "strategy" keys
+        strategy_str = d.get("type", d.get("strategy", "none"))
+        
+        # Handle case where strategy_str might be None
+        if strategy_str is None:
+            strategy_str = "none"
+        
+        # Convert to enum with error handling
+        try:
+            strategy = SamplingStrategy(strategy_str)
+        except ValueError:
+            valid_strategies = [s.value for s in SamplingStrategy]
+            raise ValueError(
+                f"Unknown sampling strategy: '{strategy_str}'. "
+                f"Valid options are: {valid_strategies}"
+            )
+        
         return cls(
-            strategy=SamplingStrategy(d.get("type", d.get("strategy", "none"))),
+            strategy=strategy,
             fraction=d.get("fraction", 1.0),
             seed=d.get("seed", 42),
             target_ratio=d.get("target_ratio"),
