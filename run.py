@@ -387,7 +387,7 @@ def run_experiments(
                 # PyTorch/XGBoost need numpy arrays
                 X_train, y_train, w_train = spark_to_numpy(
                     train_df_sampled, feature_cols, label_col,
-                    model_cfg.get("weight_col"), limit_rows = 10000
+                    model_cfg.get("weight_col"),
                 )
                 X_test, y_test, _ = spark_to_numpy(test_df, feature_cols, label_col, limit_rows=None)
                 
