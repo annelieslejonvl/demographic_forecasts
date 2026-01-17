@@ -16,6 +16,10 @@ scaling:
   enabled: true
   type: standard    # standard or minmax
 
+# Categorical encoding (onehot is better for neural networks)
+categorical:
+  encoding: onehot
+
 dim_reduction:
   enabled: false
   k: 50             # Number of PCA components

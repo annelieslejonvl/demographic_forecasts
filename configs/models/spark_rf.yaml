@@ -14,6 +14,10 @@ scaling:
   enabled: true
   type: standard    # standard or minmax
 
+# Categorical encoding (label is better for tree models like RF/GBT)
+categorical:
+  encoding: label
+
 dim_reduction:
   enabled: true
   k: 100            # PCA components

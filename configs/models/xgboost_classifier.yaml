@@ -6,13 +6,17 @@ model_type: classifier
 
 # Device configuration
 device:
-  type: auto        # auto, cpu, or gpu
+  type: cpu        # auto, cpu, or gpu
   gpu_id: null      # Specific GPU index
 
 # Preprocessing (XGBoost typically doesn't need scaling)
 scaling:
   enabled: false
   type: none
+
+# Categorical encoding (label/ordinal is better for tree models than onehot)
+categorical:
+  encoding: label
 
 dim_reduction:
   enabled: false
