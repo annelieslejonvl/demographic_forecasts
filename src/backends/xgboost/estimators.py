@@ -83,15 +83,15 @@ class XGBoostPreprocessor(BasePreprocessor):
     """Preprocessor for XGBoost backend.
 
     Note: XGBoost handles missing values internally, so preprocessing
-    is often lighter than for neural networks. Uses label encoding for
-    categoricals (not one-hot) since tree models handle this better.
+    is often lighter than for neural networks. Supports native categorical
+    handling (no one-hot) for tree-friendly splits.
     """
 
     def __init__(
         self,
         scaling: str = "none",  # XGBoost doesn't need scaling typically
         handle_missing: str = "keep",  # "keep", "mean", "median"
-        categorical_encoding: str = "label",  # "label", "ordinal", "onehot"
+        categorical_encoding: str = "label",  # "label", "ordinal", "onehot", "native"
         categorical_cols: Optional[List[str]] = None,
         numeric_cols: Optional[List[str]] = None,
     ):
@@ -104,6 +104,8 @@ class XGBoostPreprocessor(BasePreprocessor):
         self.imputer_ = None
         self.encoders_: Dict[str, Any] = {}  # Per-column encoders
         self.feature_cols_: Optional[List[str]] = None
+        self.categorical_categories_: Dict[str, List[str]] = {}
+        self.native_categorical_ = False
     
     def fit(
         self,
@@ -129,6 +131,9 @@ class XGBoostPreprocessor(BasePreprocessor):
         self.feature_cols_ = feature_cols
         self.categorical_cols = categorical_cols or self.categorical_cols
         self.numeric_cols = numeric_cols or self.numeric_cols
+        self.encoders_ = {}
+        self.categorical_categories_ = {}
+        self.native_categorical_ = False
 
         # Auto-detect column types if not specified
         if not self.categorical_cols and not self.numeric_cols:
@@ -138,21 +143,32 @@ class XGBoostPreprocessor(BasePreprocessor):
                 else:
                     self.numeric_cols.append(col)
 
-        # Fit categorical encoders
-        for col in self.categorical_cols:
-            if col not in df.columns:
-                continue
-            if self.categorical_encoding in ("label", "ordinal"):
-                encoder = LabelEncoder()
-                # Handle missing values before encoding
+        # Fit categorical encoders or capture categories for native handling
+        if self.categorical_encoding == "native":
+            self.native_categorical_ = True
+            for col in self.categorical_cols:
+                if col not in df.columns:
+                    continue
                 col_data = df[col].fillna("__missing__").astype(str)
-                encoder.fit(col_data)
-                self.encoders_[col] = encoder
-            elif self.categorical_encoding == "onehot":
-                encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-                col_data = df[[col]].fillna("__missing__").astype(str)
-                encoder.fit(col_data)
-                self.encoders_[col] = encoder
+                categories = list(pd.Series(col_data).unique())
+                if "__missing__" not in categories:
+                    categories.append("__missing__")
+                self.categorical_categories_[col] = categories
+        else:
+            for col in self.categorical_cols:
+                if col not in df.columns:
+                    continue
+                if self.categorical_encoding in ("label", "ordinal"):
+                    encoder = LabelEncoder()
+                    # Handle missing values before encoding
+                    col_data = df[col].fillna("__missing__").astype(str)
+                    encoder.fit(col_data)
+                    self.encoders_[col] = encoder
+                elif self.categorical_encoding == "onehot":
+                    encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+                    col_data = df[[col]].fillna("__missing__").astype(str)
+                    encoder.fit(col_data)
+                    self.encoders_[col] = encoder
 
         # Imputation for numeric columns
         if self.handle_missing in ("mean", "median") and self.numeric_cols:
@@ -173,7 +189,7 @@ class XGBoostPreprocessor(BasePreprocessor):
 
         return self
     
-    def transform(self, data: Union[np.ndarray, Any]) -> np.ndarray:
+    def transform(self, data: Union[np.ndarray, Any]) -> Any:
         """Transform data using fitted preprocessor."""
         import pandas as pd
 
@@ -184,6 +200,30 @@ class XGBoostPreprocessor(BasePreprocessor):
             df = pd.DataFrame(data, columns=self.feature_cols_)
         else:
             df = data[self.feature_cols_].copy()
+
+        if self.categorical_encoding == "native":
+            result_df = df.copy()
+
+            if self.numeric_cols:
+                numeric_data = result_df[self.numeric_cols].values.astype(np.float32)
+                if self.imputer_ is not None:
+                    numeric_data = self.imputer_.transform(numeric_data)
+                if self.scaler_ is not None:
+                    numeric_data = self.scaler_.transform(numeric_data)
+                result_df.loc[:, self.numeric_cols] = numeric_data.astype(np.float32)
+
+            for col in self.categorical_cols:
+                if col not in result_df.columns:
+                    continue
+                col_data = result_df[col].fillna("__missing__").astype(str)
+                categories = self.categorical_categories_.get(col, ["__missing__"])
+                cat_dtype = pd.CategoricalDtype(categories=categories)
+                col_cat = pd.Series(pd.Categorical(col_data, dtype=cat_dtype))
+                if "__missing__" in categories:
+                    col_cat = col_cat.fillna("__missing__")
+                result_df[col] = col_cat
+
+            return result_df
 
         result_arrays = []
 
@@ -228,7 +268,7 @@ class XGBoostPreprocessor(BasePreprocessor):
         feature_cols: List[str],
         categorical_cols: Optional[List[str]] = None,
         numeric_cols: Optional[List[str]] = None,
-    ) -> np.ndarray:
+    ) -> Any:
         """Fit and transform in one step."""
         self.fit(data, label_col, feature_cols, categorical_cols, numeric_cols)
         return self.transform(data)
@@ -247,6 +287,8 @@ class XGBoostPreprocessor(BasePreprocessor):
             "scaling": self.scaling,
             "handle_missing": self.handle_missing,
             "categorical_encoding": self.categorical_encoding,
+            "categorical_categories": self.categorical_categories_,
+            "native_categorical": self.native_categorical_,
         }, os.path.join(path, "preprocessor.joblib"))
 
     @classmethod
@@ -265,6 +307,8 @@ class XGBoostPreprocessor(BasePreprocessor):
         preprocessor.imputer_ = data["imputer"]
         preprocessor.encoders_ = data.get("encoders", {})
         preprocessor.feature_cols_ = data["feature_cols"]
+        preprocessor.categorical_categories_ = data.get("categorical_categories", {})
+        preprocessor.native_categorical_ = data.get("native_categorical", False)
         return preprocessor
 
 

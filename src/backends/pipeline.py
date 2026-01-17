@@ -36,7 +36,7 @@ class PipelineConfig:
     # Preprocessing
     scaling: bool = False
     scaling_type: str = "standard"
-    categorical_encoding: str = "onehot"  # onehot, label, ordinal
+    categorical_encoding: str = "onehot"  # onehot, label, ordinal, native
     dim_reduction: Optional[Dict[str, Any]] = None
     
     # Model parameters
@@ -157,6 +157,11 @@ class UnifiedPipeline:
             "type": self.config.model_type,
             "params": self.config.model_params,
         }
+        if self.config.backend == BackendType.XGBOOST and self.config.categorical_encoding == "native":
+            model_config["params"] = {
+                **model_config["params"],
+                "enable_categorical": model_config["params"].get("enable_categorical", True),
+            }
         return BackendFactory.get_estimator(
             self.config.backend,
             self.config.model_type,
@@ -215,7 +220,10 @@ class UnifiedPipeline:
                 print(f"Loaded {len(pdf):,} rows, {len(cols_to_select)} cols, "
                     f"~{pdf.memory_usage(deep=True).sum() / 1e6:.1f} MB")
                 
-                X = pdf[feature_cols].values
+                if self.config.backend == BackendType.XGBOOST and self.config.categorical_encoding == "native":
+                    X = pdf[feature_cols]
+                else:
+                    X = pdf[feature_cols].values
                 y = pdf[label_col].values
             else:
                 X, y = data
@@ -322,7 +330,10 @@ class UnifiedPipeline:
         first_batch_X, first_batch_y = next(sample_iter)
 
         self.preprocessor_ = self._create_preprocessor()
-        X_sample = first_batch_X[feature_cols].values
+        if self.config.backend == BackendType.XGBOOST and self.config.categorical_encoding == "native":
+            X_sample = first_batch_X[feature_cols]
+        else:
+            X_sample = first_batch_X[feature_cols].values
         self.preprocessor_.fit(X_sample, self.config.label_col, feature_cols)
 
         # Prepare eval set if provided
@@ -370,7 +381,10 @@ class UnifiedPipeline:
         total_samples = 0
         for i, (batch_X, batch_y) in enumerate(batch_iter):
             # Transform batch
-            X_batch = self.preprocessor_.transform(batch_X[feature_cols].values)
+            if self.config.categorical_encoding == "native":
+                X_batch = self.preprocessor_.transform(batch_X[feature_cols])
+            else:
+                X_batch = self.preprocessor_.transform(batch_X[feature_cols].values)
             y_batch = batch_y.values
             total_samples += len(y_batch)
 

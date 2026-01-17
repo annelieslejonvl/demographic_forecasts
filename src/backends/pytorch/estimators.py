@@ -97,13 +97,14 @@ class PyTorchPreprocessor(BasePreprocessor):
     def __init__(
         self,
         scaling: str = "standard",  # "standard", "minmax", "none"
-        categorical_encoding: str = "onehot",  # "onehot", "label", "ordinal"
+        categorical_encoding: str = "onehot",  # "onehot", "label", "ordinal", "native"
         categorical_cols: Optional[List[str]] = None,
         numeric_cols: Optional[List[str]] = None,
         dim_reduction: Optional[Dict[str, Any]] = None,
     ):
         self.scaling = scaling
         self.categorical_encoding = categorical_encoding
+        self.effective_categorical_encoding_ = categorical_encoding
         self.categorical_cols = categorical_cols or []
         self.numeric_cols = numeric_cols or []
         self.dim_reduction = dim_reduction or {}
@@ -145,16 +146,22 @@ class PyTorchPreprocessor(BasePreprocessor):
                 else:
                     self.numeric_cols.append(col)
 
+        if self.categorical_encoding == "native":
+            logger.warning("Native categorical encoding is not supported in PyTorch; using onehot encoding.")
+            self.effective_categorical_encoding_ = "onehot"
+        else:
+            self.effective_categorical_encoding_ = self.categorical_encoding
+
         # Fit categorical encoders
         for col in self.categorical_cols:
             if col not in df.columns:
                 continue
-            if self.categorical_encoding in ("label", "ordinal"):
+            if self.effective_categorical_encoding_ in ("label", "ordinal"):
                 encoder = LabelEncoder()
                 col_data = df[col].fillna("__missing__").astype(str)
                 encoder.fit(col_data)
                 self.encoders_[col] = encoder
-            elif self.categorical_encoding == "onehot":
+            elif self.effective_categorical_encoding_ == "onehot":
                 encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
                 col_data = df[[col]].fillna("__missing__").astype(str)
                 encoder.fit(col_data)
@@ -190,7 +197,7 @@ class PyTorchPreprocessor(BasePreprocessor):
             encoder = self.encoders_[col]
             col_data = df[col].fillna("__missing__").astype(str)
 
-            if self.categorical_encoding in ("label", "ordinal"):
+            if self.effective_categorical_encoding_ in ("label", "ordinal"):
                 known_classes = set(encoder.classes_)
                 col_data = col_data.apply(lambda x: x if x in known_classes else "__missing__")
                 encoded = encoder.transform(col_data).reshape(-1, 1)
@@ -274,6 +281,10 @@ class PyTorchPreprocessor(BasePreprocessor):
             numeric_cols=data.get("numeric_cols", []),
             dim_reduction=data["dim_reduction"],
         )
+        if preprocessor.categorical_encoding == "native":
+            preprocessor.effective_categorical_encoding_ = "onehot"
+        else:
+            preprocessor.effective_categorical_encoding_ = preprocessor.categorical_encoding
         preprocessor.scaler_ = data["scaler"]
         preprocessor.pca_ = data["pca"]
         preprocessor.encoders_ = data.get("encoders", {})
