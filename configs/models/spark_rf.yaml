@@ -1,0 +1,55 @@
+# Spark ML Configuration
+# Supports CPU and RAPIDS GPU acceleration
+
+backend: spark
+model_type: random_forest  # logistic_regression, random_forest, gbt
+
+# Device configuration
+device:
+  type: auto        # auto, cpu, or gpu (requires RAPIDS)
+  gpu_id: null
+
+# Preprocessing
+scaling:
+  enabled: true
+  type: standard    # standard or minmax
+
+dim_reduction:
+  enabled: true
+  k: 100            # PCA components
+
+# Model parameters - varies by model_type
+model:
+  type: random_forest
+  params:
+    # Random Forest specific
+    numTrees: 200
+    maxDepth: 12
+    minInstancesPerNode: 5
+    subsamplingRate: 0.8
+    featureSubsetStrategy: sqrt
+    seed: 42
+
+# Alternative: Logistic Regression
+# model:
+#   type: logistic_regression
+#   params:
+#     maxIter: 200
+#     regParam: 0.01
+#     elasticNetParam: 0.5  # 0=L2, 1=L1, 0.5=mixed
+#     threshold: 0.5
+
+# Alternative: Gradient Boosted Trees
+# model:
+#   type: gbt
+#   params:
+#     maxIter: 150
+#     maxDepth: 6
+#     stepSize: 0.1
+#     subsamplingRate: 0.8
+#     minInstancesPerNode: 5
+
+# Column configuration
+label_col: label
+features_col: features
+weight_col: weight  # Optional sample weights

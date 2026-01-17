@@ -1,0 +1,59 @@
+# XGBoost Configuration
+# Supports both CPU and CUDA GPU training
+
+backend: xgboost
+model_type: classifier
+
+# Device configuration
+device:
+  type: auto        # auto, cpu, or gpu
+  gpu_id: null      # Specific GPU index
+
+# Preprocessing (XGBoost typically doesn't need scaling)
+scaling:
+  enabled: false
+  type: none
+
+dim_reduction:
+  enabled: false
+
+# Model parameters
+model:
+  type: classifier
+  params:
+    # Core params
+    objective: binary:logistic
+    eval_metric: [logloss, auc, aucpr]
+    
+    # Tree structure
+    max_depth: 8
+    min_child_weight: 3
+    gamma: 0.1
+    
+    # Regularization
+    reg_alpha: 0.1      # L1 regularization
+    reg_lambda: 1.0     # L2 regularization
+    
+    # Sampling
+    subsample: 0.8
+    colsample_bytree: 0.8
+    colsample_bylevel: 0.8
+    
+    # Learning
+    learning_rate: 0.05
+    n_estimators: 500
+    early_stopping_rounds: 30
+    
+    # Class imbalance
+    scale_pos_weight: 1  # Set to n_negative/n_positive for imbalanced data
+    
+    # Reproducibility
+    seed: 42
+    
+    # Logging
+    verbose_eval: 25
+
+# Column configuration
+label_col: label
+features_col: features
+weight_col: null

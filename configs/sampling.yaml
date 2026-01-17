@@ -1,0 +1,55 @@
+# Sampling Configuration
+# Strategies for handling class imbalance and data selection
+
+# ==============================================================================
+# Strategy Selection
+# ==============================================================================
+# Options: none, random, stratified, undersample, oversample, hard_negative, hard_negative_mixed
+
+strategy: hard_negative
+
+# ==============================================================================
+# General Sampling Parameters
+# ==============================================================================
+fraction: 1.0           # Base fraction of data to use (for random/stratified)
+seed: 42                # Random seed for reproducibility
+
+# ==============================================================================
+# Class Balance Parameters
+# ==============================================================================
+target_ratio: 0.5       # Target positive/negative ratio (null for balanced)
+min_samples: 100        # Minimum samples per class
+
+# ==============================================================================
+# Hard Negative Mining Parameters
+# ==============================================================================
+
+# Fraction of negatives that should be "hard" (model-selected)
+# Remaining fraction will be random negatives
+hard_negative_fraction: 0.5
+
+# Percentile threshold for hard negative selection
+hard_negative_percentile: 0.8
+
+# Method for selecting hard negatives:
+#   - top_prob: Highest predicted probability (model thinks they're positive)
+#   - margin: Closest to decision boundary (most uncertain)
+#   - entropy: Highest prediction entropy (most uncertain)
+hard_negative_method: top_prob
+
+# ==============================================================================
+# Workflow: Tune vs Final Mode
+# ==============================================================================
+
+# For tuning phase: use aggressive sampling for fast iterations
+tune:
+  type: undersample
+  target_ratio: 0.5
+  fraction: 0.1  # 10% sample for quick experiments
+
+# For final phase: use hard negatives for best performance
+final:
+  type: hard_negative
+  target_ratio: 0.3
+  hard_negative_fraction: 0.6
+  hard_negative_method: top_prob

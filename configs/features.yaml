@@ -1,0 +1,77 @@
+# Feature Configuration
+# Defines the feature set for ML pipelines
+
+# ==============================================================================
+# Target / Label Column
+# ==============================================================================
+label_col: y_moved
+
+# ==============================================================================
+# Columns to Drop (not used as features)
+# ==============================================================================
+drop_cols:
+  - year
+  # - id
+  # - timestamp
+
+# ==============================================================================
+# Key Columns (for joins, not features)
+# ==============================================================================
+key_cols:
+  - sid
+  - year
+
+# ==============================================================================
+# Weight Column (optional, for weighted training)
+# ==============================================================================
+weight_col: null  # or "sample_weight"
+
+# ==============================================================================
+# Categorical Columns (will be encoded)
+# ==============================================================================
+cat_cols:
+  - age_group_lag1
+  - nat_lag1
+  - eerste_nationaliteit
+  # - years_since_last_moved_bin   # optioneel, maar dan *_cap schrappen
+
+# ==============================================================================
+# Numeric Columns (will be scaled/imputed)
+# ==============================================================================
+num_cols:
+  # Availability flag
+  - lag1_available
+  
+  # Event flags (binary)
+  - moved_lag1
+  - birth1_lag1
+  - birth2_lag1
+  - divorce_lag1
+  
+  # Duration features (capped/censored)
+  - years_since_last_moved_cap
+  - moved_duration_censored
+  - years_since_last_birth1_cap
+  - birth1_duration_censored
+  - years_since_last_birth2_cap
+  - birth2_duration_censored
+  - years_since_last_divorce_cap
+  - divorce_duration_censored
+
+# ==============================================================================
+# Auto-Detection Settings
+# ==============================================================================
+
+# Auto-detect remaining columns not in cat_cols, num_cols, or drop_cols
+auto_detect_remaining: false  # Set to true to include unlisted columns
+
+# How to treat auto-detected columns with unknown type
+treat_unknown_as: numeric  # "numeric" or "categorical"
+
+# ==============================================================================
+# Validation
+# ==============================================================================
+
+# If true, fail when configured columns are missing from DataFrame
+# If false, log warning and skip missing columns
+strict: false

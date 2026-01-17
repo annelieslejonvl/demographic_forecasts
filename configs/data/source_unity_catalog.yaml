@@ -1,0 +1,67 @@
+# Data Source Configuration
+# Supports Unity Catalog, Parquet, Delta, and CSV
+
+# ==============================================================================
+# Option 1: Unity Catalog Table
+# ==============================================================================
+source_type: unity_catalog
+catalog: main                    # Unity Catalog name
+schema: ml_data                  # Schema/database name  
+table: customer_features         # Table name
+
+# Optional: partition filter (SQL WHERE syntax)
+partition_filter: "year >= 2020"
+
+# Optional: sampling for large datasets
+sample_fraction: null            # e.g., 0.1 for 10% sample
+sample_seed: 42
+
+# ==============================================================================
+# Option 2: Parquet Files
+# ==============================================================================
+# source_type: parquet
+# path: /mnt/data/features.parquet
+# 
+# # Or multiple files:
+# # paths:
+# #   - /mnt/data/features_2023.parquet
+# #   - /mnt/data/features_2024.parquet
+# 
+# # Cloud storage paths:
+# # path: s3://bucket/path/to/data.parquet
+# # path: abfss://container@account.dfs.core.windows.net/path/data.parquet
+# # path: gs://bucket/path/data.parquet
+# # path: dbfs:/mnt/datalake/features.parquet
+
+# ==============================================================================
+# Option 3: Delta Table
+# ==============================================================================
+# source_type: delta
+# path: /mnt/delta/customer_features
+# 
+# # Time travel (Delta-specific)
+# options:
+#   versionAsOf: 10              # Specific version
+#   # OR
+#   timestampAsOf: "2024-01-01"  # Specific timestamp
+
+# ==============================================================================
+# Option 4: CSV Files
+# ==============================================================================
+# source_type: csv
+# path: /mnt/data/features.csv
+# options:
+#   header: true
+#   delimiter: ","
+#   quote: '"'
+#   escape: "\\"
+#   nullValue: "NA"
+# infer_schema: true
+
+# ==============================================================================
+# Read options (apply to all file-based sources)
+# ==============================================================================
+options:
+  mergeSchema: true              # Handle schema evolution
+  # pathGlobFilter: "*.parquet"  # Filter files by pattern
+  # recursiveFileLookup: true    # Scan subdirectories

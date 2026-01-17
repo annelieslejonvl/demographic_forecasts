@@ -1,128 +1,233 @@
-from dataclasses import dataclass
-from typing import Dict, Any, Optional, Tuple, List
-from pyspark.sql import DataFrame, functions as F
+"""
+Dataset building utilities.
 
+DatasetSpec: Configuration for train/valid/test splits and sampling
+DatasetBuilder: Creates time-based splits and applies sampling strategies
+"""
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, List
+from .sampling import SamplingConfig, SamplingStrategy, SparkSampler
 
-from dataclasses import dataclass
-from typing import Any, Dict, List
-
-@dataclass(frozen=True)
-class DatasetSpec:
-    key_cols: List[str]
-    split: Dict[str, Any]
-    tune: Dict[str, Any]
-    final: Dict[str, Any]
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "DatasetSpec":
-        return cls(
-            key_cols=list(d["key_cols"]),
-            split=dict(d.get("split", {})),
-            tune=dict(d.get("tune", {})),
-            final=dict(d.get("final", {})),
-        )
 
 @dataclass
-class DatasetBuilder:
-    label_col: str
-    key_cols: List[str]
-    year_col: str
+class DatasetSpec:
+    """
+    Dataset specification - defines splits and sampling strategy.
+    
+    Maps to configs/datasets/default.yaml structure.
+    """
+    
+    key_cols: List[str] = field(default_factory=list)
+    
+    # Split configuration
+    split: Dict[str, Any] = field(default_factory=lambda: {
+        "year_col": "year",
+        "train_range": [2018, 2022],
+        "valid_range": None,
+        "test_range": [2023, 2025],
+    })
+    
+    # Mode-specific configurations
+    tune: Dict[str, Any] = field(default_factory=lambda: {
+        "sampling": {"type": "stratified", "fraction": 0.1},
+        "hard_negatives": {"enabled": False},
+    })
+    
+    final: Dict[str, Any] = field(default_factory=lambda: {
+        "sampling": {"type": "none"},
+        "hard_negatives": {"enabled": False},
+    })
+    
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "DatasetSpec":
+        """Create from dictionary (YAML config)."""
+        return cls(
+            key_cols=d.get("key_cols", []),
+            split=d.get("split", {}),
+            tune=d.get("tune", {}),
+            final=d.get("final", {}),
+        )
+    
+    def get_sampling_config(self, mode: str) -> SamplingConfig:
+        """Get sampling config for mode (tune or final)."""
+        mode_cfg = self.tune if mode == "tune" else self.final
+        sampling_dict = mode_cfg.get("sampling", {"type": "none"})
+        return SamplingConfig.from_dict(sampling_dict)
 
-    # ---------- SPLIT ----------
+
+class DatasetBuilder:
+    """
+    Builds train/valid/test datasets with time-based splits and sampling.
+    
+    Usage:
+        builder = DatasetBuilder(label_col="y", key_cols=["id"], year_col="year")
+        train, valid, test = builder.time_split(df, (2018, 2022), (2022, 2023), (2023, 2025))
+        train_sampled, info = builder.sample_train(train, {"type": "undersample", "target_ratio": 0.5})
+    """
+    
+    def __init__(
+        self,
+        label_col: str,
+        key_cols: Optional[List[str]] = None,
+        year_col: str = "year",
+    ):
+        self.label_col = label_col
+        self.key_cols = key_cols or []
+        self.year_col = year_col
+    
     def time_split(
         self,
-        df: DataFrame,
+        df,
         train_range: Tuple[int, int],
         valid_range: Optional[Tuple[int, int]],
         test_range: Tuple[int, int],
-    ):
-        train_df = df.filter(F.col(self.year_col).between(*train_range))
-
-        valid_df = (
-            df.filter(F.col(self.year_col).between(*valid_range))
-            if valid_range is not None
-            else None
+    ) -> Tuple[Any, Optional[Any], Any]:
+        """
+        Split DataFrame by time periods.
+        
+        Args:
+            df: Spark DataFrame with year_col
+            train_range: (start_year, end_year) inclusive for training
+            valid_range: (start_year, end_year) for validation, or None
+            test_range: (start_year, end_year) for testing
+        
+        Returns:
+            (train_df, valid_df, test_df) - valid_df is None if valid_range is None
+        """
+        from pyspark.sql import functions as F
+        
+        year_col = self.year_col
+        
+        # Training data
+        train_df = df.filter(
+            (F.col(year_col) >= train_range[0]) & 
+            (F.col(year_col) < train_range[1])
         )
-
-        test_df = df.filter(F.col(self.year_col).between(*test_range))
+        
+        # Validation data (optional)
+        valid_df = None
+        if valid_range:
+            valid_df = df.filter(
+                (F.col(year_col) >= valid_range[0]) & 
+                (F.col(year_col) < valid_range[1])
+            )
+        
+        # Test data
+        test_df = df.filter(
+            (F.col(year_col) >= test_range[0]) & 
+            (F.col(year_col) < test_range[1])
+        )
+        
         return train_df, valid_df, test_df
-
-    # ---------- SAMPLING ----------
+    
     def sample_train(
         self,
-        train_df: DataFrame,
-        sampling_cfg: Optional[Dict[str, Any]],
-    ):
-        if not sampling_cfg or sampling_cfg.get("type", "none") == "none":
-            return train_df, {"sampling": "none"}
-
-        seed = int(sampling_cfg.get("seed", 42))
-        t = sampling_cfg["type"]
-
-        pos = train_df.filter(F.col(self.label_col) == 1)
-        neg = train_df.filter(F.col(self.label_col) == 0)
-
-        if t == "neg_frac":
-            frac = float(sampling_cfg["neg_frac"])
-            neg_s = neg.sample(False, frac, seed)
-            return pos.unionByName(neg_s), {
-                "sampling": "neg_frac",
-                "neg_frac": frac,
-                "seed": seed,
-            }
-
-        if t == "neg_per_pos":
-            # ⚠️ gebruikt counts → liever NIET in tune
-            n_pos = pos.count()
-            n_neg = neg.count()
-            target_neg = int(n_pos * float(sampling_cfg["neg_per_pos"]))
-            frac = min(1.0, target_neg / max(1, n_neg))
-            neg_s = neg.sample(False, frac, seed)
-            return pos.unionByName(neg_s), {
-                "sampling": "neg_per_pos",
-                "neg_per_pos": sampling_cfg["neg_per_pos"],
-                "neg_frac": frac,
-                "seed": seed,
-            }
-
-        raise ValueError(f"Unknown sampling type: {t}")
-
-    # ---------- HARD NEGATIVES ----------
-    def hard_negatives(
+        train_df,
+        sampling_cfg: Dict[str, Any],
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Apply sampling strategy to training data.
+        
+        Args:
+            train_df: Training Spark DataFrame
+            sampling_cfg: Sampling configuration dict
+        
+        Returns:
+            (sampled_df, info_dict)
+        """
+        config = SamplingConfig.from_dict(sampling_cfg)
+        
+        if config.strategy == SamplingStrategy.NONE:
+            n_total = train_df.count()
+            return train_df, {"strategy": "none", "n_total": n_total}
+        
+        sampler = SparkSampler(config)
+        sampled_df, info = sampler.sample(train_df, self.label_col, self.key_cols)
+        
+        return sampled_df, info
+    
+    def deduplicate(
         self,
-        train_df: DataFrame,
-        scored_negatives: DataFrame,
-        hard_cfg: Dict[str, Any],
-        n_pos: int,
+        df,
+        key_cols: Optional[List[str]] = None,
+        keep: str = "first",
     ):
         """
-        scored_negatives: DataFrame with columns key_cols + p1
+        Remove duplicate rows based on key columns.
+        
+        Args:
+            df: Spark DataFrame
+            key_cols: Columns to deduplicate on (uses self.key_cols if None)
+            keep: "first" or "last"
+        
+        Returns:
+            Deduplicated DataFrame
         """
-        hard_per_pos = int(hard_cfg.get("hard_per_pos", 10))
-        q = float(hard_cfg.get("q", 0.001))
-
-        K = hard_per_pos * n_pos
-
-        thr = scored_negatives.approxQuantile("p1", [1 - q], 0.01)[0]
-        hard_keys = (
-            scored_negatives
-            .filter(F.col("p1") >= thr)
-            .select(*self.key_cols)
-            .limit(K)
-        )
-
-        pos = train_df.filter(F.col(self.label_col) == 1)
-        hard_neg = (
-            train_df
-            .filter(F.col(self.label_col) == 0)
-            .join(hard_keys, on=self.key_cols, how="inner")
-        )
-
-        return pos.unionByName(hard_neg), {
-            "hard_per_pos": hard_per_pos,
-            "q": q,
-            "K": K,
+        from pyspark.sql import functions as F
+        from pyspark.sql.window import Window
+        
+        key_cols = key_cols or self.key_cols
+        
+        if not key_cols:
+            return df.dropDuplicates()
+        
+        if keep == "first":
+            window = Window.partitionBy(*key_cols).orderBy(F.monotonically_increasing_id())
+        else:
+            window = Window.partitionBy(*key_cols).orderBy(F.monotonically_increasing_id().desc())
+        
+        df_ranked = df.withColumn("_rank", F.row_number().over(window))
+        df_dedup = df_ranked.filter(F.col("_rank") == 1).drop("_rank")
+        
+        return df_dedup
+    
+    def get_class_distribution(self, df) -> Dict[str, Any]:
+        """Get class distribution statistics."""
+        from pyspark.sql import functions as F
+        
+        stats = df.groupBy(self.label_col).count().collect()
+        
+        distribution = {int(row[self.label_col]): row["count"] for row in stats}
+        total = sum(distribution.values())
+        
+        return {
+            "distribution": distribution,
+            "total": total,
+            "positive_rate": distribution.get(1, 0) / total if total > 0 else 0,
         }
+    
+    def print_split_summary(
+        self,
+        train_df,
+        valid_df,
+        test_df,
+    ) -> None:
+        """Print summary of data splits."""
+        print("=" * 60)
+        print("DATASET SPLIT SUMMARY")
+        print("=" * 60)
+        
+        train_stats = self.get_class_distribution(train_df)
+        print(f"Train: {train_stats['total']:,} rows, {train_stats['positive_rate']*100:.2f}% positive")
+        
+        if valid_df is not None:
+            valid_stats = self.get_class_distribution(valid_df)
+            print(f"Valid: {valid_stats['total']:,} rows, {valid_stats['positive_rate']*100:.2f}% positive")
+        
+        test_stats = self.get_class_distribution(test_df)
+        print(f"Test:  {test_stats['total']:,} rows, {test_stats['positive_rate']*100:.2f}% positive")
+        
+        print("=" * 60)
+
+
+def create_dataset_builder(
+    spec: DatasetSpec,
+    label_col: str,
+) -> DatasetBuilder:
+    """Factory function to create DatasetBuilder from spec."""
+    return DatasetBuilder(
+        label_col=label_col,
+        key_cols=spec.key_cols,
+        year_col=spec.split.get("year_col", "year"),
+    )
