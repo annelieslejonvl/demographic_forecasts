@@ -248,7 +248,7 @@ class SparkPreprocessor:
         # Add encoded categoricals
         if encoded_cols:
             assembled_cols.extend(encoded_cols)
-        elif indexed_cols and self.config.categorical_encoding == EncodingStrategy.LABEL:
+        elif indexed_cols and self.config.categorical_encoding in (EncodingStrategy.LABEL, EncodingStrategy.NATIVE):
             assembled_cols.extend(indexed_cols)
         
         if boolean_cols:

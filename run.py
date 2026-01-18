@@ -212,25 +212,52 @@ def spark_to_numpy(
     feature_cols: List[str],
     label_col: str,
     weight_col: Optional[str] = None,
-    limit_rows = None
+    limit_rows: Optional[int] = 10_000,  # 👈 Safe default!
+    sample_fraction: Optional[float] = None,  # 👈 Nieuwe optie
 ) -> Tuple:
-    """Convert Spark DataFrame to numpy arrays for PyTorch/XGBoost."""
+    """Convert Spark DataFrame to numpy arrays for PyTorch/XGBoost.
+    
+    WARNING: This loads data into memory. For large datasets, use
+    create_batch_iterator() instead.
+    
+    Args:
+        limit_rows: Max rows to load (default 10k for safety)
+        sample_fraction: Alternative to limit_rows, sample % of data
+    """
     import numpy as np
     
     cols = feature_cols + [label_col]
     if weight_col:
         cols.append(weight_col)
-    if (limit_rows is None):
+    
+    # Apply sampling/limiting
+    if sample_fraction is not None:
+        n_rows = spark_df.count()
+        print(f"Sampling {sample_fraction:.2%} of {n_rows:,} rows")
+        spark_df = spark_df.sample(fraction=sample_fraction, seed=42)
         pdf = spark_df.select(cols).toPandas()
-    else:
+    elif limit_rows is not None:
+        print(f"Limiting to {limit_rows:,} rows")
         pdf = spark_df.limit(limit_rows).select(cols).toPandas()
+    else:
+        # Expliciete check - forceer gebruiker om bewust te zijn
+        n_rows = spark_df.count()
+        if n_rows > 100_000:
+            raise ValueError(
+                f"Dataset has {n_rows:,} rows. This will use ~{n_rows * len(cols) * 4 / 1e9:.1f}GB RAM. "
+                f"Use limit_rows= or sample_fraction= to avoid memory issues, "
+                f"or use create_batch_iterator() for streaming."
+            )
+        pdf = spark_df.select(cols).toPandas()
+    
+    print(f"Loaded {len(pdf):,} rows, {len(cols)} cols, "
+          f"~{pdf.memory_usage(deep=True).sum() / 1e6:.1f} MB")
     
     X = pdf[feature_cols].values.astype(np.float32)
     y = pdf[label_col].values.astype(np.float32).ravel()
     w = pdf[weight_col].values.astype(np.float32) if weight_col else None
     
     return X, y, w
-
 
 # =============================================================================
 # Run Naming & Config Hashing
@@ -281,6 +308,7 @@ def run_experiments(
     override_params_list: Optional[List[Dict[str, Any]]] = None,
     persist_features: bool = True,
     cache_clean_df: bool = False,
+    fit= True,
 ) -> List[Dict[str, Any]]:
     """
     Run ML experiments across multiple backends.
@@ -365,56 +393,103 @@ def run_experiments(
             # Prepare data based on backend
             if backend == BackendType.SPARK:
                 # Spark uses DataFrame directly
+                if(fit==False):
+                    X_train, y_train, feature_cols = pipeline._prepare_data(train_df_sampled, feature_cols,fit=True)
+                    return (X_train, y_train), feature_cols , (None)
+                    
                 train_result = pipeline.fit(
-                    train_df_sampled,
-                    feature_cols,
+                    train_data=train_df_sampled,
+                    feature_cols = feature_cols,
                     eval_data=valid_df,
                 )
-                
+
+                # Threshold tuning on validation set
+                threshold_config = run_model_cfg.get("threshold_tuning", {})
+                if threshold_config.get("enabled", False) and valid_df is not None:
+                    strategy = threshold_config.get("strategy", "f1")
+                    # Build kwargs for threshold tuning
+                    tuning_kwargs = {}
+                    if "beta" in threshold_config:
+                        tuning_kwargs["beta"] = threshold_config["beta"]
+                    if "min_precision" in threshold_config:
+                        tuning_kwargs["min_precision"] = threshold_config["min_precision"]
+                    if "min_recall" in threshold_config:
+                        tuning_kwargs["min_recall"] = threshold_config["min_recall"]
+
+                    logger.info(f"Tuning threshold using {strategy} strategy on validation set")
+                    optimal_threshold = pipeline.tune_threshold(valid_df, strategy=strategy, **tuning_kwargs)
+                    logger.info(f"Optimal threshold: {optimal_threshold:.4f}")
+                else:
+                    optimal_threshold = 0.5
+
                 pred_train = pipeline.predict(train_df_sampled).predictions
                 pred_test = pipeline.predict(test_df).predictions
-                
-                train_metrics = _spark_binary_metrics(pred_train, label_col)
-                test_metrics = _spark_binary_metrics(pred_test, label_col)
-                
+
+                train_metrics = _spark_binary_metrics(pred_train, label_col, threshold=optimal_threshold)
+                test_metrics = _spark_binary_metrics(pred_test, label_col, threshold=optimal_threshold)
+
                 valid_metrics = None
                 if valid_df is not None:
                     pred_valid = pipeline.predict(valid_df).predictions
-                    valid_metrics = _spark_binary_metrics(pred_valid, label_col)
+                    valid_metrics = _spark_binary_metrics(pred_valid, label_col, threshold=optimal_threshold)
             
             else:
         
                 # PyTorch/XGBoost need numpy arrays
                 X_train, y_train, w_train = spark_to_numpy(
                     train_df_sampled, feature_cols, label_col,
-                    model_cfg.get("weight_col"),
+                    model_cfg.get("weight_col"),  sample_fraction= 0.1
                 )
-                X_test, y_test, _ = spark_to_numpy(test_df, feature_cols, label_col, limit_rows=None)
+                X_test, y_test, _ = spark_to_numpy(test_df, feature_cols, label_col, limit_rows=None, sample_fraction=0.1)
                 
                 eval_set = None
                 if valid_df is not None:
-                    X_val, y_val, _ = spark_to_numpy(valid_df, feature_cols, label_col, limit_rows=None)
+                    X_val, y_val, _ = spark_to_numpy(valid_df, feature_cols, label_col, limit_rows=None, sample_fraction=0.1)
                     eval_set = [(X_val, y_val)]
                 print('fitting')
-                train_result = pipeline.fit(
-                    train_data = (X_train,y_train),  # <-- TOEVOEGEN
-                    feature_cols =feature_cols,
-                    eval_data=(X_val, y_val) if valid_df else None,  
-                    sample_weight=w_train,
-                    )
-                
+                if(fit  ==False):
+                    print('preparing data')
+                    X_train_prep, y_train_prep = pipeline._prepare_data((X_train, y_train), feature_cols, fit=True, max_samples=50_000)
+                    return (X_train_prep, y_train_prep), feature_cols , (X_val,y_val) if valid_df is not None else None
+                else:
+                    train_result = pipeline.fit(
+                        train_data = train_df_sampled,  # <-- TOEVOEGEN
+                        feature_cols =feature_cols,
+                        eval_data=(X_val, y_val) if valid_df else None,
+                        sample_weight=w_train,
+                        )
+
+                # Threshold tuning on validation set
+                threshold_config = run_model_cfg.get("threshold_tuning", {})
+                if threshold_config.get("enabled", False) and valid_df is not None:
+                    strategy = threshold_config.get("strategy", "f1")
+                    # Build kwargs for threshold tuning
+                    tuning_kwargs = {}
+                    if "beta" in threshold_config:
+                        tuning_kwargs["beta"] = threshold_config["beta"]
+                    if "min_precision" in threshold_config:
+                        tuning_kwargs["min_precision"] = threshold_config["min_precision"]
+                    if "min_recall" in threshold_config:
+                        tuning_kwargs["min_recall"] = threshold_config["min_recall"]
+
+                    logger.info(f"Tuning threshold using {strategy} strategy on validation set")
+                    optimal_threshold = pipeline.tune_threshold((X_val, y_val), strategy=strategy, **tuning_kwargs)
+                    logger.info(f"Optimal threshold: {optimal_threshold:.4f}")
+                else:
+                    optimal_threshold = 0.5
+
                 # Note: For non-Spark, we need to handle y separately
                 print('fitting done')
                 pred_train = pipeline.predict_proba((X_train, None))
                 pred_test = pipeline.predict_proba((X_test, None))
-                
-                train_metrics = _numpy_binary_metrics(y_train, pred_train.probabilities)
-                test_metrics = _numpy_binary_metrics(y_test, pred_test.probabilities)
-                
+
+                train_metrics = _numpy_binary_metrics(y_train, pred_train.probabilities, threshold=optimal_threshold)
+                test_metrics = _numpy_binary_metrics(y_test, pred_test.probabilities, threshold=optimal_threshold)
+
                 valid_metrics = None
                 if valid_df is not None:
                     pred_valid = pipeline.predict_proba( (X_val, None))
-                    valid_metrics = _numpy_binary_metrics(y_val, pred_valid.probabilities)
+                    valid_metrics = _numpy_binary_metrics(y_val, pred_valid.probabilities, threshold=optimal_threshold)
             
             # Build run name
             rn = rn_base
@@ -428,7 +503,9 @@ def run_experiments(
                 mlflow.log_param("data_yaml", data_yaml)
                 mlflow.log_param("model_yaml", model_yaml)
                 mlflow.log_param("device", pipeline.device_config.device_type.value)
-                
+                mlflow.log_param("threshold", optimal_threshold)
+                mlflow.log_param("threshold_tuned", threshold_config.get("enabled", False))
+
                 for k, v in samp_info.items():
                     mlflow.log_param(f"sampling_{k}", str(v))
                 

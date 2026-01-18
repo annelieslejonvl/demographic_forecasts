@@ -16,6 +16,10 @@ scaling:
   enabled: true
   type: standard    # standard or minmax
 
+# Categorical encoding (onehot is better for neural networks)
+categorical:
+  encoding: onehot
+
 dim_reduction:
   enabled: false
   k: 50             # Number of PCA components
@@ -35,6 +39,14 @@ model:
     epochs: 100
     batch_size: 256
     early_stopping_patience: 15
+
+# Threshold tuning
+threshold_tuning:
+  enabled: true
+  strategy: f1  # Options: 'f1', 'youden', 'precision_recall', 'custom'
+  beta: 1.0  # For F-beta score (1.0 = F1, 2.0 = F2 emphasizes recall)
+  min_precision: null  # For precision_recall strategy
+  min_recall: null  # For precision_recall strategy
 
 # Column configuration
 label_col: label

@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: demographic_forecasts
 Version: 0.5.0
 Requires-Python: >=3.9
@@ -12,3 +12,6 @@ Provides-Extra: spark
 Requires-Dist: pyspark>=3.3; extra == "spark"
 Provides-Extra: torch
 Requires-Dist: torch>=2.0; extra == "torch"
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python

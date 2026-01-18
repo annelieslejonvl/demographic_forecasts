@@ -81,105 +81,234 @@ class XGBoostDataLoader(BaseDataLoader):
 
 class XGBoostPreprocessor(BasePreprocessor):
     """Preprocessor for XGBoost backend.
-    
+
     Note: XGBoost handles missing values internally, so preprocessing
-    is often lighter than for neural networks.
+    is often lighter than for neural networks. Supports native categorical
+    handling (no one-hot) for tree-friendly splits.
     """
-    
+
     def __init__(
         self,
         scaling: str = "none",  # XGBoost doesn't need scaling typically
         handle_missing: str = "keep",  # "keep", "mean", "median"
+        categorical_encoding: str = "label",  # "label", "ordinal", "onehot", "native"
+        categorical_cols: Optional[List[str]] = None,
+        numeric_cols: Optional[List[str]] = None,
     ):
         self.scaling = scaling
         self.handle_missing = handle_missing
+        self.categorical_encoding = categorical_encoding
+        self.categorical_cols = categorical_cols or []
+        self.numeric_cols = numeric_cols or []
         self.scaler_ = None
         self.imputer_ = None
+        self.encoders_: Dict[str, Any] = {}  # Per-column encoders
         self.feature_cols_: Optional[List[str]] = None
+        self.categorical_categories_: Dict[str, List[str]] = {}
+        self.native_categorical_ = False
     
     def fit(
         self,
         data: Union[np.ndarray, Any],
         label_col: str,
         feature_cols: List[str],
+        categorical_cols: Optional[List[str]] = None,
+        numeric_cols: Optional[List[str]] = None,
     ) -> "XGBoostPreprocessor":
         """Fit preprocessing pipeline."""
-        from sklearn.preprocessing import StandardScaler, MinMaxScaler
+        import pandas as pd
+        from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, OrdinalEncoder, OneHotEncoder
         from sklearn.impute import SimpleImputer
-        
+
+        # Convert to DataFrame if needed
         if hasattr(data, "toPandas"):
-            X = data.select(feature_cols).toPandas().values
+            df = data.select(feature_cols).toPandas()
+        elif isinstance(data, np.ndarray):
+            df = pd.DataFrame(data, columns=feature_cols)
         else:
-            X = data
-        
+            df = data[feature_cols].copy()
+
         self.feature_cols_ = feature_cols
-        
-        # Imputation
-        if self.handle_missing in ("mean", "median"):
+        self.categorical_cols = categorical_cols or self.categorical_cols
+        self.numeric_cols = numeric_cols or self.numeric_cols
+        self.encoders_ = {}
+        self.categorical_categories_ = {}
+        self.native_categorical_ = False
+
+        # Auto-detect column types if not specified
+        if not self.categorical_cols and not self.numeric_cols:
+            for col in feature_cols:
+                if df[col].dtype == object or df[col].dtype.name == 'category':
+                    self.categorical_cols.append(col)
+                else:
+                    self.numeric_cols.append(col)
+
+        # Fit categorical encoders or capture categories for native handling
+        if self.categorical_encoding == "native":
+            self.native_categorical_ = True
+            for col in self.categorical_cols:
+                if col not in df.columns:
+                    continue
+                col_data = df[col].fillna("__missing__").astype(str)
+                categories = list(pd.Series(col_data).unique())
+                if "__missing__" not in categories:
+                    categories.append("__missing__")
+                self.categorical_categories_[col] = categories
+        else:
+            for col in self.categorical_cols:
+                if col not in df.columns:
+                    continue
+                if self.categorical_encoding in ("label", "ordinal"):
+                    encoder = LabelEncoder()
+                    # Handle missing values before encoding
+                    col_data = df[col].fillna("__missing__").astype(str)
+                    encoder.fit(col_data)
+                    self.encoders_[col] = encoder
+                elif self.categorical_encoding == "onehot":
+                    encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+                    col_data = df[[col]].fillna("__missing__").astype(str)
+                    encoder.fit(col_data)
+                    self.encoders_[col] = encoder
+
+        # Imputation for numeric columns
+        if self.handle_missing in ("mean", "median") and self.numeric_cols:
+            numeric_data = df[self.numeric_cols].values
             self.imputer_ = SimpleImputer(strategy=self.handle_missing)
-            X = self.imputer_.fit_transform(X)
-        
+            self.imputer_.fit(numeric_data)
+
         # Scaling (usually not needed for tree models)
-        if self.scaling == "standard":
-            self.scaler_ = StandardScaler()
-            self.scaler_.fit(X)
-        elif self.scaling == "minmax":
-            self.scaler_ = MinMaxScaler()
-            self.scaler_.fit(X)
-        
+        if self.scaling in ("standard", "minmax") and self.numeric_cols:
+            numeric_data = df[self.numeric_cols].values
+            if self.imputer_ is not None:
+                numeric_data = self.imputer_.transform(numeric_data)
+            if self.scaling == "standard":
+                self.scaler_ = StandardScaler()
+            else:
+                self.scaler_ = MinMaxScaler()
+            self.scaler_.fit(numeric_data)
+
         return self
     
-    def transform(self, data: Union[np.ndarray, Any]) -> np.ndarray:
+    def transform(self, data: Union[np.ndarray, Any]) -> Any:
         """Transform data using fitted preprocessor."""
+        import pandas as pd
+
+        # Convert to DataFrame if needed
         if hasattr(data, "toPandas"):
-            X = data.select(self.feature_cols_).toPandas().values
+            df = data.select(self.feature_cols_).toPandas()
+        elif isinstance(data, np.ndarray):
+            df = pd.DataFrame(data, columns=self.feature_cols_)
         else:
-            X = data
-        
-        X = X.astype(np.float32)
-        
-        if self.imputer_ is not None:
-            X = self.imputer_.transform(X)
-        
-        if self.scaler_ is not None:
-            X = self.scaler_.transform(X)
-        
-        return X.astype(np.float32)
+            df = data[self.feature_cols_].copy()
+
+        if self.categorical_encoding == "native":
+            result_df = df.copy()
+
+            if self.numeric_cols:
+                numeric_data = result_df[self.numeric_cols].values.astype(np.float32)
+                if self.imputer_ is not None:
+                    numeric_data = self.imputer_.transform(numeric_data)
+                if self.scaler_ is not None:
+                    numeric_data = self.scaler_.transform(numeric_data)
+                result_df.loc[:, self.numeric_cols] = numeric_data.astype(np.float32)
+
+            for col in self.categorical_cols:
+                if col not in result_df.columns:
+                    continue
+                col_data = result_df[col].fillna("__missing__").astype(str)
+                categories = self.categorical_categories_.get(col, ["__missing__"])
+                cat_dtype = pd.CategoricalDtype(categories=categories)
+                col_cat = pd.Series(pd.Categorical(col_data, dtype=cat_dtype))
+                if "__missing__" in categories:
+                    col_cat = col_cat.fillna("__missing__")
+                result_df[col] = col_cat
+
+            return result_df
+
+        result_arrays = []
+
+        # Process categorical columns
+        for col in self.categorical_cols:
+            if col not in df.columns or col not in self.encoders_:
+                continue
+            encoder = self.encoders_[col]
+            col_data = df[col].fillna("__missing__").astype(str)
+
+            if self.categorical_encoding in ("label", "ordinal"):
+                # Handle unseen labels
+                known_classes = set(encoder.classes_)
+                col_data = col_data.apply(lambda x: x if x in known_classes else "__missing__")
+                encoded = encoder.transform(col_data).reshape(-1, 1)
+            else:  # onehot
+                encoded = encoder.transform(df[[col]].fillna("__missing__").astype(str))
+
+            result_arrays.append(encoded.astype(np.float32))
+
+        # Process numeric columns
+        if self.numeric_cols:
+            numeric_data = df[self.numeric_cols].values.astype(np.float32)
+
+            if self.imputer_ is not None:
+                numeric_data = self.imputer_.transform(numeric_data)
+
+            if self.scaler_ is not None:
+                numeric_data = self.scaler_.transform(numeric_data)
+
+            result_arrays.append(numeric_data.astype(np.float32))
+
+        if not result_arrays:
+            return df.values.astype(np.float32)
+
+        return np.hstack(result_arrays).astype(np.float32)
     
     def fit_transform(
         self,
         data: Union[np.ndarray, Any],
         label_col: str,
         feature_cols: List[str],
-    ) -> np.ndarray:
+        categorical_cols: Optional[List[str]] = None,
+        numeric_cols: Optional[List[str]] = None,
+    ) -> Any:
         """Fit and transform in one step."""
-        self.fit(data, label_col, feature_cols)
+        self.fit(data, label_col, feature_cols, categorical_cols, numeric_cols)
         return self.transform(data)
     
     def save(self, path: str) -> None:
         """Save preprocessor to disk."""
         import joblib
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(path, exist_ok=True)
         joblib.dump({
             "scaler": self.scaler_,
             "imputer": self.imputer_,
+            "encoders": self.encoders_,
             "feature_cols": self.feature_cols_,
+            "categorical_cols": self.categorical_cols,
+            "numeric_cols": self.numeric_cols,
             "scaling": self.scaling,
             "handle_missing": self.handle_missing,
-        }, path)
-    
+            "categorical_encoding": self.categorical_encoding,
+            "categorical_categories": self.categorical_categories_,
+            "native_categorical": self.native_categorical_,
+        }, os.path.join(path, "preprocessor.joblib"))
+
     @classmethod
     def load(cls, path: str) -> "XGBoostPreprocessor":
         """Load preprocessor from disk."""
         import joblib
-        data = joblib.load(path)
+        data = joblib.load(os.path.join(path, "preprocessor.joblib"))
         preprocessor = cls(
             scaling=data["scaling"],
             handle_missing=data["handle_missing"],
+            categorical_encoding=data.get("categorical_encoding", "label"),
+            categorical_cols=data.get("categorical_cols", []),
+            numeric_cols=data.get("numeric_cols", []),
         )
         preprocessor.scaler_ = data["scaler"]
         preprocessor.imputer_ = data["imputer"]
+        preprocessor.encoders_ = data.get("encoders", {})
         preprocessor.feature_cols_ = data["feature_cols"]
+        preprocessor.categorical_categories_ = data.get("categorical_categories", {})
+        preprocessor.native_categorical_ = data.get("native_categorical", False)
         return preprocessor
 
 
@@ -317,27 +446,115 @@ class XGBoostClassifier(BaseEstimator):
                 "evals_result": evals_result,
             },
         )
-    
+
+    def fit_incremental(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        sample_weight: Optional[np.ndarray] = None,
+        eval_set: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+        feature_names: Optional[List[str]] = None,
+        reset: bool = False,
+    ) -> TrainResult:
+        """
+        Incrementally train the XGBoost model on a batch of data.
+
+        Args:
+            X: Feature matrix for this batch
+            y: Labels for this batch
+            sample_weight: Optional sample weights
+            eval_set: Optional evaluation set (used only on first batch typically)
+            feature_names: Feature names
+            reset: If True, start fresh. If False, continue training existing model.
+
+        Returns:
+            TrainResult with updated model
+        """
+        import xgboost as xgb
+
+        device = self.get_device()
+
+        if reset or self.model_ is None:
+            logger.info(f"Starting incremental XGBoost training on device: {device}")
+            self.feature_names_ = feature_names
+            self.model_ = None  # Will be created on first batch
+
+        # Create DMatrix for this batch
+        dtrain = xgb.DMatrix(
+            X, label=y, weight=sample_weight,
+            feature_names=feature_names or self.feature_names_,
+        )
+
+        # Evaluation sets
+        evals = [(dtrain, "train")]
+        if eval_set:
+            for i, (X_eval, y_eval) in enumerate(eval_set):
+                deval = xgb.DMatrix(
+                    X_eval, label=y_eval,
+                    feature_names=feature_names or self.feature_names_,
+                )
+                evals.append((deval, f"eval_{i}"))
+
+        # Get params with device config
+        params = self._get_xgb_params()
+
+        # Number of rounds per batch (fewer than full training)
+        batch_rounds = max(10, self.n_estimators // 10)
+
+        # Train incrementally: pass existing model to continue training
+        evals_result = {}
+        self.model_ = xgb.train(
+            params,
+            dtrain,
+            num_boost_round=batch_rounds,
+            evals=evals,
+            xgb_model=self.model_,  # Continue from existing model
+            evals_result=evals_result,
+            verbose_eval=False,  # Less verbose for batch training
+        )
+
+        self.best_iteration_ = self.model_.num_boosted_rounds()
+        self._is_fitted = True
+
+        # Extract metrics
+        metrics = {}
+        for ds_name, ds_metrics in evals_result.items():
+            for metric_name, values in ds_metrics.items():
+                metrics[f"{ds_name}_{metric_name}"] = values[-1]
+
+        return TrainResult(
+            model=self.model_,
+            metrics=metrics,
+            metadata={"n_trees": self.best_iteration_},
+        )
+
     def predict(self, X: np.ndarray) -> PredictResult:
-        """Generate class predictions."""
+        """Generate class predictions using the current threshold."""
         proba = self.predict_proba(X)
-        predictions = (proba.probabilities[:, 1] >= 0.5).astype(int)
-        return PredictResult(predictions=predictions)
+        predictions = (proba.probabilities[:, 1] >= self._threshold).astype(int)
+        return PredictResult(
+            predictions=predictions,
+            metadata={'threshold': self._threshold}
+        )
     
     def predict_proba(self, X: np.ndarray) -> PredictResult:
         """Generate probability predictions."""
         import xgboost as xgb
-        
+
         dmatrix = xgb.DMatrix(X, feature_names=self.feature_names_)
-        
+
         # XGBoost binary classification returns P(y=1)
-        p1 = self.model_.predict(
-            dmatrix,
-            iteration_range=(0, self.best_iteration_),
-        )
-        
+        # Use all trees if best_iteration_ not set (incremental training)
+        if self.best_iteration_ is not None:
+            p1 = self.model_.predict(
+                dmatrix,
+                iteration_range=(0, self.best_iteration_),
+            )
+        else:
+            p1 = self.model_.predict(dmatrix)
+
         probas_2d = np.column_stack([1 - p1, p1])
-        
+
         return PredictResult(
             predictions=None,
             probabilities=probas_2d,
@@ -354,7 +571,7 @@ class XGBoostClassifier(BaseEstimator):
         """Save model to disk."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         self.model_.save_model(path)
-        
+
         # Save metadata separately
         import joblib
         meta_path = path + ".meta"
@@ -363,6 +580,8 @@ class XGBoostClassifier(BaseEstimator):
             "best_iteration": self.best_iteration_,
             "feature_names": self.feature_names_,
             "params": self.params,
+            "threshold": self._threshold,
+            "threshold_tuning_stats": self._threshold_tuning_stats,
         }, meta_path)
     
     @classmethod
@@ -385,8 +604,10 @@ class XGBoostClassifier(BaseEstimator):
         estimator.best_iteration_ = meta["best_iteration"]
         estimator.feature_names_ = meta["feature_names"]
         estimator.params = meta["params"]
+        estimator._threshold = meta.get("threshold", 0.5)
+        estimator._threshold_tuning_stats = meta.get("threshold_tuning_stats", None)
         estimator._is_fitted = True
-        
+
         return estimator
 
 

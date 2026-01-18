@@ -3,7 +3,7 @@ Preprocessing Module
 
 Supports:
 - Imputation (mean, median, mode, constant)
-- Categorical encoding (one-hot, label/string indexer, ordinal)
+- Categorical encoding (one-hot, label/string indexer, ordinal, native)
 - Scaling (standard, minmax, robust)
 - PCA dimensionality reduction
 """

@@ -208,7 +208,7 @@ class SparkPreprocessor(BasePreprocessor):
 
 class SparkLogisticRegression(BaseEstimator):
     """Spark ML Logistic Regression estimator."""
-    
+
     DEFAULT_PARAMS = {
         "maxIter": 100,
         "regParam": 0.01,
@@ -216,7 +216,7 @@ class SparkLogisticRegression(BaseEstimator):
         "tol": 1e-6,
         "threshold": 0.5,
     }
-    
+
     def __init__(
         self,
         model_config: Dict[str, Any],
@@ -228,7 +228,22 @@ class SparkLogisticRegression(BaseEstimator):
         self.model_ = None
         self.features_col_: str = "features"
         self.label_col_: str = "label"
-    
+
+    def _extract_probabilities(self, proba_result: PredictResult):
+        """Extract probabilities from Spark DataFrame."""
+        import numpy as np
+        spark_df = proba_result.predictions
+        probs = spark_df.select("probability").rdd.map(lambda row: float(row[0][1])).collect()
+        return np.array(probs)
+
+    def _extract_labels(self, y):
+        """Extract labels from Spark DataFrame or column."""
+        import numpy as np
+        if hasattr(y, 'select'):
+            labels = y.select(self.label_col_).rdd.map(lambda row: float(row[0])).collect()
+            return np.array(labels)
+        return np.asarray(y).ravel()
+
     def _get_gpu_device(self) -> str:
         return "gpu"
     
@@ -265,7 +280,10 @@ class SparkLogisticRegression(BaseEstimator):
         # Fit
         self.model_ = lr.fit(X)
         self._is_fitted = True
-        
+
+        # Update model threshold to match self._threshold
+        self.model_.setThreshold(self._threshold)
+
         # Training metrics
         summary = self.model_.summary
         metrics = {
@@ -284,18 +302,42 @@ class SparkLogisticRegression(BaseEstimator):
         )
     
     def predict(self, X: Any) -> PredictResult:
-        """Generate predictions."""
+        """Generate predictions using the current threshold."""
         predictions = self.model_.transform(X)
-        return PredictResult(predictions=predictions)
-    
+        return PredictResult(
+            predictions=predictions,
+            metadata={'threshold': self._threshold}
+        )
+
     def predict_proba(self, X: Any) -> PredictResult:
         """Generate probability predictions (same as predict for Spark)."""
         return self.predict(X)
-    
+
+    def tune_threshold(self, X_val: Any, y_val: Any = None, strategy: str = 'f1', **kwargs) -> float:
+        """Tune threshold and update Spark model."""
+        optimal_threshold = super().tune_threshold(X_val, y_val, strategy, **kwargs)
+        self.model_.setThreshold(optimal_threshold)
+        return optimal_threshold
+
+    def set_threshold(self, threshold: float) -> None:
+        """Set threshold on both base class and Spark model."""
+        super().set_threshold(threshold)
+        if self.model_ is not None:
+            self.model_.setThreshold(threshold)
+
     def save(self, path: str) -> None:
         """Save model to disk."""
         self.model_.write().overwrite().save(path)
-    
+
+        # Save threshold metadata
+        import json
+        meta_path = os.path.join(path, "threshold_metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump({
+                "threshold": self._threshold,
+                "threshold_tuning_stats": self._threshold_tuning_stats,
+            }, f)
+
     @classmethod
     def load(
         cls,
@@ -304,10 +346,21 @@ class SparkLogisticRegression(BaseEstimator):
     ) -> "SparkLogisticRegression":
         """Load model from disk."""
         from pyspark.ml.classification import LogisticRegressionModel
-        
+        import json
+
         estimator = cls({}, device_config)
         estimator.model_ = LogisticRegressionModel.load(path)
         estimator._is_fitted = True
+
+        # Load threshold metadata
+        meta_path = os.path.join(path, "threshold_metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+                estimator._threshold = meta.get("threshold", 0.5)
+                estimator._threshold_tuning_stats = meta.get("threshold_tuning_stats", None)
+                estimator.model_.setThreshold(estimator._threshold)
+
         return estimator
 
 
