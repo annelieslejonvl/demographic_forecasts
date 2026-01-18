@@ -17,6 +17,7 @@ class EncodingStrategy(Enum):
     LABEL = "label"
     TARGET = "target"
     ORDINAL = "ordinal"
+    NATIVE = "native"
     NONE = "none"
 
 

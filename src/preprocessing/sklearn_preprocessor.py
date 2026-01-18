@@ -160,7 +160,9 @@ class SklearnPreprocessor:
                     handle_unknown="ignore" if self.config.handle_unknown == "keep" else "error",
                 )
                 categorical_steps.append(("encoder", encoder))
-            elif encoding in (EncodingStrategy.ORDINAL, EncodingStrategy.LABEL):
+            elif encoding in (EncodingStrategy.ORDINAL, EncodingStrategy.LABEL, EncodingStrategy.NATIVE):
+                if encoding == EncodingStrategy.NATIVE:
+                    logger.warning("Native categorical encoding is not supported in sklearn; using ordinal encoding.")
                 encoder = OrdinalEncoder(
                     handle_unknown="use_encoded_value",
                     unknown_value=-1,

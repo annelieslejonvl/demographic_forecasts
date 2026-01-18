@@ -97,12 +97,20 @@ class PyTorchPreprocessor(BasePreprocessor):
     def __init__(
         self,
         scaling: str = "standard",  # "standard", "minmax", "none"
+        categorical_encoding: str = "onehot",  # "onehot", "label", "ordinal", "native"
+        categorical_cols: Optional[List[str]] = None,
+        numeric_cols: Optional[List[str]] = None,
         dim_reduction: Optional[Dict[str, Any]] = None,
     ):
         self.scaling = scaling
+        self.categorical_encoding = categorical_encoding
+        self.effective_categorical_encoding_ = categorical_encoding
+        self.categorical_cols = categorical_cols or []
+        self.numeric_cols = numeric_cols or []
         self.dim_reduction = dim_reduction or {}
         self.scaler_ = None
         self.pca_ = None
+        self.encoders_: Dict[str, Any] = {}
         self.feature_cols_: Optional[List[str]] = None
 
     def fit(
@@ -110,88 +118,154 @@ class PyTorchPreprocessor(BasePreprocessor):
         data: Union[np.ndarray, Any],
         label_col: str,
         feature_cols: List[str],
+        categorical_cols: Optional[List[str]] = None,
+        numeric_cols: Optional[List[str]] = None,
     ) -> "PyTorchPreprocessor":
         """Fit preprocessing pipeline."""
-        from sklearn.preprocessing import StandardScaler, MinMaxScaler
+        import pandas as pd
+        from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder, OneHotEncoder
         from sklearn.decomposition import PCA
 
+        # Convert to DataFrame if needed
         if hasattr(data, "toPandas"):
-            X = data.select(feature_cols).toPandas().values
+            df = data.select(feature_cols).toPandas()
+        elif isinstance(data, np.ndarray):
+            df = pd.DataFrame(data, columns=feature_cols)
         else:
-            X = np.asarray(data)
+            df = data[feature_cols].copy()
 
         self.feature_cols_ = feature_cols
+        self.categorical_cols = categorical_cols or self.categorical_cols
+        self.numeric_cols = numeric_cols or self.numeric_cols
 
-        if self.scaling == "standard":
-            self.scaler_ = StandardScaler()
-            X = self.scaler_.fit_transform(X)
-        elif self.scaling == "minmax":
-            self.scaler_ = MinMaxScaler()
-            X = self.scaler_.fit_transform(X)
+        # Auto-detect column types if not specified
+        if not self.categorical_cols and not self.numeric_cols:
+            for col in feature_cols:
+                if df[col].dtype == object or df[col].dtype.name == 'category':
+                    self.categorical_cols.append(col)
+                else:
+                    self.numeric_cols.append(col)
 
+        if self.categorical_encoding == "native":
+            logger.warning("Native categorical encoding is not supported in PyTorch; using onehot encoding.")
+            self.effective_categorical_encoding_ = "onehot"
+        else:
+            self.effective_categorical_encoding_ = self.categorical_encoding
+
+        # Fit categorical encoders
+        for col in self.categorical_cols:
+            if col not in df.columns:
+                continue
+            if self.effective_categorical_encoding_ in ("label", "ordinal"):
+                encoder = LabelEncoder()
+                col_data = df[col].fillna("__missing__").astype(str)
+                encoder.fit(col_data)
+                self.encoders_[col] = encoder
+            elif self.effective_categorical_encoding_ == "onehot":
+                encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+                col_data = df[[col]].fillna("__missing__").astype(str)
+                encoder.fit(col_data)
+                self.encoders_[col] = encoder
+
+        # Process numeric columns for scaling
+        if self.numeric_cols:
+            numeric_data = df[self.numeric_cols].values.astype(np.float32)
+            if self.scaling == "standard":
+                self.scaler_ = StandardScaler()
+                self.scaler_.fit(numeric_data)
+            elif self.scaling == "minmax":
+                self.scaler_ = MinMaxScaler()
+                self.scaler_.fit(numeric_data)
+
+        # PCA on all transformed data
         if self.dim_reduction.get("enabled", False):
-            n_components = int(self.dim_reduction.get("k", min(50, X.shape[1])))
+            X_transformed = self._transform_impl(df)
+            n_components = int(self.dim_reduction.get("k", min(50, X_transformed.shape[1])))
             self.pca_ = PCA(n_components=n_components)
-            self.pca_.fit(X)
+            self.pca_.fit(X_transformed)
 
         return self
 
+    def _transform_impl(self, df) -> np.ndarray:
+        """Internal transform without PCA."""
+        result_arrays = []
+
+        # Process categorical columns
+        for col in self.categorical_cols:
+            if col not in df.columns or col not in self.encoders_:
+                continue
+            encoder = self.encoders_[col]
+            col_data = df[col].fillna("__missing__").astype(str)
+
+            if self.effective_categorical_encoding_ in ("label", "ordinal"):
+                known_classes = set(encoder.classes_)
+                col_data = col_data.apply(lambda x: x if x in known_classes else "__missing__")
+                encoded = encoder.transform(col_data).reshape(-1, 1)
+            else:  # onehot
+                encoded = encoder.transform(df[[col]].fillna("__missing__").astype(str))
+
+            result_arrays.append(encoded.astype(np.float32))
+
+        # Process numeric columns
+        if self.numeric_cols:
+            numeric_data = df[self.numeric_cols].values.astype(np.float32)
+            if self.scaler_ is not None:
+                numeric_data = self.scaler_.transform(numeric_data)
+            result_arrays.append(numeric_data.astype(np.float32))
+
+        if not result_arrays:
+            return df.values.astype(np.float32)
+
+        return np.hstack(result_arrays).astype(np.float32)
+
     def transform(self, data: Union[np.ndarray, Any]) -> np.ndarray:
         """Transform data using fitted preprocessor."""
+        import pandas as pd
+
+        # Convert to DataFrame if needed
         if hasattr(data, "toPandas"):
-            X = data.select(self.feature_cols_).toPandas().values
+            df = data.select(self.feature_cols_).toPandas()
+        elif isinstance(data, np.ndarray):
+            df = pd.DataFrame(data, columns=self.feature_cols_)
         else:
-            X = np.asarray(data)
+            df = data[self.feature_cols_].copy()
 
-        X = X.astype(np.float32)
-
-        if self.scaler_ is not None:
-            X = self.scaler_.transform(X)
+        X = self._transform_impl(df)
 
         if self.pca_ is not None:
             X = self.pca_.transform(X)
 
         return X.astype(np.float32)
 
-    def fit_transform(self, data, label_col: str, feature_cols: List[str]) -> np.ndarray:
-        if hasattr(data, "toPandas"):
-            X = data.select(feature_cols).toPandas().to_numpy(dtype=np.float32, copy=True)
-        else:
-            X = np.asarray(data, dtype=np.float32)
-
-        self.feature_cols_ = feature_cols
-
-        if self.scaling == "standard":
-            from sklearn.preprocessing import StandardScaler
-            self.scaler_ = StandardScaler()
-            X = self.scaler_.fit_transform(X).astype(np.float32, copy=False)
-        elif self.scaling == "minmax":
-            from sklearn.preprocessing import MinMaxScaler
-            self.scaler_ = MinMaxScaler()
-            X = self.scaler_.fit_transform(X).astype(np.float32, copy=False)
-
-        if self.dim_reduction.get("enabled", False):
-            from sklearn.decomposition import PCA
-            n_components = int(self.dim_reduction.get("k", min(50, X.shape[1])))
-            self.pca_ = PCA(n_components=n_components)
-            X = self.pca_.fit_transform(X).astype(np.float32, copy=False)
-
-        return X
+    def fit_transform(
+        self,
+        data,
+        label_col: str,
+        feature_cols: List[str],
+        categorical_cols: Optional[List[str]] = None,
+        numeric_cols: Optional[List[str]] = None,
+    ) -> np.ndarray:
+        self.fit(data, label_col, feature_cols, categorical_cols, numeric_cols)
+        return self.transform(data)
 
     def save(self, path: str) -> None:
         """Save preprocessor to disk."""
         import joblib
 
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(path, exist_ok=True)
         joblib.dump(
             {
                 "scaler": self.scaler_,
                 "pca": self.pca_,
+                "encoders": self.encoders_,
                 "feature_cols": self.feature_cols_,
+                "categorical_cols": self.categorical_cols,
+                "numeric_cols": self.numeric_cols,
                 "scaling": self.scaling,
+                "categorical_encoding": self.categorical_encoding,
                 "dim_reduction": self.dim_reduction,
             },
-            path,
+            os.path.join(path, "preprocessor.joblib"),
         )
 
     @classmethod
@@ -199,13 +273,21 @@ class PyTorchPreprocessor(BasePreprocessor):
         """Load preprocessor from disk."""
         import joblib
 
-        data = joblib.load(path)
+        data = joblib.load(os.path.join(path, "preprocessor.joblib"))
         preprocessor = cls(
             scaling=data["scaling"],
+            categorical_encoding=data.get("categorical_encoding", "onehot"),
+            categorical_cols=data.get("categorical_cols", []),
+            numeric_cols=data.get("numeric_cols", []),
             dim_reduction=data["dim_reduction"],
         )
+        if preprocessor.categorical_encoding == "native":
+            preprocessor.effective_categorical_encoding_ = "onehot"
+        else:
+            preprocessor.effective_categorical_encoding_ = preprocessor.categorical_encoding
         preprocessor.scaler_ = data["scaler"]
         preprocessor.pca_ = data["pca"]
+        preprocessor.encoders_ = data.get("encoders", {})
         preprocessor.feature_cols_ = data["feature_cols"]
         return preprocessor
 
@@ -473,9 +555,13 @@ class PyTorchMLPEstimator(BaseEstimator):
         )
 
     def predict(self, X: np.ndarray, device: Optional[str] = None) -> PredictResult:
+        """Generate class predictions using the current threshold."""
         proba = self.predict_proba(X, device=device)
-        preds = (proba.probabilities[:, 1] >= 0.5).astype(int)
-        return PredictResult(predictions=preds)
+        preds = (proba.probabilities[:, 1] >= self._threshold).astype(int)
+        return PredictResult(
+            predictions=preds,
+            metadata={'threshold': self._threshold}
+        )
 
     def predict_proba(self, X: np.ndarray, device: Optional[str] = None) -> PredictResult:
         import torch
@@ -505,6 +591,8 @@ class PyTorchMLPEstimator(BaseEstimator):
                 "model_state_dict": self.model_.state_dict(),
                 "model_config": self.model_config,
                 "input_dim": self.input_dim_,
+                "threshold": self._threshold,
+                "threshold_tuning_stats": self._threshold_tuning_stats,
             },
             path,
         )
@@ -531,6 +619,8 @@ class PyTorchMLPEstimator(BaseEstimator):
         )
         estimator.model_.load_state_dict(checkpoint["model_state_dict"])
         estimator.model_.to(torch.device(device))
+        estimator._threshold = checkpoint.get("threshold", 0.5)
+        estimator._threshold_tuning_stats = checkpoint.get("threshold_tuning_stats", None)
         estimator._is_fitted = True
         return estimator
 

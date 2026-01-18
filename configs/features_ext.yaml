@@ -57,13 +57,6 @@ num_cols:
   - birth2_duration_censored
   - years_since_last_divorce_cap
   - divorce_duration_censored
-  - "socio_niet_europese_niet_eu_herkomst_t_o_v_inwoners_2020"
-  - "socio_hooggeschoold_t_o_v_25_64_jarigen_2020"
-  - "socio_gemiddelde_huishoudensgrootte_2020"
-  - "socio_laaggeschoold_t_o_v_25_64_jarigen_2020"
-  - "socio_immigratie_vanuit_een_andere_belgische_gemeente_per_1_000_inwoners_2020"
-  - "socio_emigratie_naar_een_andere_belgische_gemeente_per_1_000_inwoners_2020"
-  - "socio_gemiddeld_netto_belastbaar_inkomen_per_inwoner_2020"
 
 # ==============================================================================
 # Auto-Detection Settings

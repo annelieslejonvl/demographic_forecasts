@@ -14,7 +14,7 @@ Supports data from:
 
 Preprocessing:
 - Imputation (mean, median, mode, constant)
-- Encoding (one-hot, label/string indexer, ordinal)
+- Encoding (one-hot, label/string indexer, ordinal, native)
 - Scaling (standard, minmax, robust)
 - PCA dimensionality reduction
 

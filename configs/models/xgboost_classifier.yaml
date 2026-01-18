@@ -6,7 +6,7 @@ model_type: classifier
 
 # Device configuration
 device:
-  type: auto        # auto, cpu, or gpu
+  type: cpu        # auto, cpu, or gpu
   gpu_id: null      # Specific GPU index
 
 # Preprocessing (XGBoost typically doesn't need scaling)
@@ -57,6 +57,14 @@ model:
     
     # Logging
     verbose_eval: 25
+
+# Threshold tuning
+threshold_tuning:
+  enabled: true
+  strategy: f1  # Options: 'f1', 'youden', 'precision_recall', 'custom'
+  beta: 1.0  # For F-beta score (1.0 = F1, 2.0 = F2 emphasizes recall)
+  min_precision: null  # For precision_recall strategy
+  min_recall: null  # For precision_recall strategy
 
 # Column configuration
 label_col: label

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
-
+import numpy as np
 logger = logging.getLogger(__name__)
 
 
@@ -99,6 +99,8 @@ class BaseEstimator(ABC):
         self.device_config = device_config or DeviceConfig()
         self.model_ = None
         self._is_fitted = False
+        self._threshold = 0.5  # Default threshold for binary classification
+        self._threshold_tuning_stats = None
     
     @property
     def is_fitted(self) -> bool:
@@ -152,6 +154,103 @@ class BaseEstimator(ABC):
     def _auto_detect_device(self) -> str:
         """Auto-detect best available device. Override per backend."""
         raise NotImplementedError
+
+    def tune_threshold(
+        self,
+        X_val: Any,
+        y_val: Any,
+        strategy: str = 'f1',
+        **kwargs
+    ) -> float:
+        """
+        Tune classification threshold using validation data.
+
+        Args:
+            X_val: Validation features
+            y_val: Validation labels
+            strategy: Tuning strategy ('f1', 'youden', 'precision_recall', 'custom')
+            **kwargs: Additional arguments for threshold tuning
+
+        Returns:
+            optimal_threshold: The tuned threshold value
+        """
+        from ..utils.threshold_tuning import tune_threshold
+
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before tuning threshold")
+
+        proba_result = self.predict_proba(X_val)
+        y_proba = self._extract_probabilities(proba_result)
+        y_val_array = self._extract_labels(y_val)
+
+        optimal_threshold, stats = tune_threshold(
+            y_val_array,
+            y_proba,
+            strategy=strategy,
+            **kwargs
+        )
+
+        self._threshold = optimal_threshold
+        self._threshold_tuning_stats = stats
+
+        logger.info(
+            f"Threshold tuned using {strategy} strategy: "
+            f"{optimal_threshold:.4f} (was 0.5)"
+        )
+
+        return optimal_threshold
+
+    def _extract_probabilities(self, proba_result: PredictResult) -> np.ndarray:
+        """
+        Extract probability array from PredictResult.
+        Override in subclasses if needed for backend-specific handling.
+        """
+        probs = proba_result.probabilities
+        if probs is None:
+            probs = proba_result.predictions
+
+        if hasattr(probs, 'numpy'):
+            probs = probs.numpy()
+
+        probs = np.asarray(probs)
+        if len(probs.shape) > 1:
+            probs = probs[:, 1] if probs.shape[1] == 2 else probs.ravel()
+
+        return probs
+
+    def _extract_labels(self, y: Any) -> np.ndarray:
+        """
+        Extract label array from various formats.
+        Override in subclasses if needed for backend-specific handling.
+        """
+        if hasattr(y, 'numpy'):
+            y = y.numpy()
+
+        y = np.asarray(y)
+        if len(y.shape) > 1:
+            y = y.ravel()
+
+        return y
+
+    def get_threshold(self) -> float:
+        """Get the current classification threshold."""
+        return self._threshold
+
+    def set_threshold(self, threshold: float) -> None:
+        """
+        Manually set the classification threshold.
+
+        Args:
+            threshold: Threshold value between 0 and 1
+        """
+        if not 0 <= threshold <= 1:
+            raise ValueError(f"Threshold must be between 0 and 1, got {threshold}")
+        self._threshold = threshold
+        logger.info(f"Threshold manually set to: {threshold:.4f}")
+
+    def get_threshold_tuning_stats(self) -> Optional[Dict]:
+        """Get statistics from threshold tuning process."""
+        return self._threshold_tuning_stats
 
 
 class BaseDataLoader(ABC):
