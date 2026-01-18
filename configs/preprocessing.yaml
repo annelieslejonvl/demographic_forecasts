@@ -9,8 +9,11 @@
 numeric_imputation: median    # mean, median, mode, constant, none
 numeric_scaling: standard     # standard, minmax, robust, none
 
-# Categorical column defaults  
-categorical_encoding: onehot  # onehot, label, ordinal, target, none
+# Categorical column defaults
+# NOTE: This default can be overridden per model in configs/models/*.yaml
+# - Neural networks (PyTorch): use onehot
+# - Tree models (XGBoost, Spark RF/GBT): use label
+categorical_encoding: native  # onehot, label, ordinal, target, native, none
 categorical_imputation: mode  # mode, constant, none
 
 # How to handle unknown categories at inference time
