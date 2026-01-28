@@ -125,26 +125,118 @@ class DatasetBuilder:
         self,
         train_df,
         sampling_cfg: Dict[str, Any],
+        hard_neg_cfg: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Any, Dict[str, Any]]:
         """
         Apply sampling strategy to training data.
-        
+
         Args:
             train_df: Training Spark DataFrame
             sampling_cfg: Sampling configuration dict
-        
+            hard_neg_cfg: Hard negative mining config (optional)
+
         Returns:
             (sampled_df, info_dict)
         """
         config = SamplingConfig.from_dict(sampling_cfg)
-        
+
         if config.strategy == SamplingStrategy.NONE:
             n_total = train_df.count()
             return train_df, {"strategy": "none", "n_total": n_total}
-        
+
         sampler = SparkSampler(config)
+
+        # Hard negative mining requires baseline model
+        if config.strategy == SamplingStrategy.HARD_NEGATIVE:
+            return self._sample_with_hard_negatives(
+                train_df, sampler, hard_neg_cfg or {}
+            )
+
         sampled_df, info = sampler.sample(train_df, self.label_col, self.key_cols)
-        
+    
+        return sampled_df, info
+
+    def _sample_with_hard_negatives(
+        self,
+        train_df,
+        sampler: SparkSampler,
+        hard_neg_cfg: Dict[str, Any],
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Sample using hard negative mining with a baseline model.
+
+        Trains a simple logistic regression to score negatives,
+        then selects the hardest (highest probability) negatives.
+        """
+        from pyspark.ml.classification import LogisticRegression
+        from pyspark.ml.feature import VectorAssembler
+        from pyspark.sql import functions as F
+
+        print("🔄 Hard negative mining: training baseline model...")
+
+        # Get baseline config
+        baseline_cfg = hard_neg_cfg.get("baseline", {})
+        sample_frac = baseline_cfg.get("sample_fraction", 0.1)
+        max_iter = baseline_cfg.get("params", {}).get("maxIter", 100)
+        reg_param = baseline_cfg.get("params", {}).get("regParam", 0.01)
+
+        # Get numeric columns for baseline (exclude label and keys)
+        exclude_cols = set([self.label_col] + self.key_cols + [self.year_col])
+        feature_cols = [
+            c for c in train_df.columns
+            if c not in exclude_cols
+            and train_df.schema[c].dataType.simpleString() in ('double', 'float', 'int', 'bigint')
+        ]
+
+        if not feature_cols:
+            raise ValueError("No numeric features found for baseline model")
+
+        print(f"   Using {len(feature_cols)} numeric features for baseline")
+
+        # Sample for baseline training
+        baseline_train = train_df.sample(fraction=sample_frac, seed=42)
+
+        # Assemble features
+        assembler = VectorAssembler(
+            inputCols=feature_cols,
+            outputCol="_baseline_features",
+            handleInvalid="skip"
+        )
+        baseline_train = assembler.transform(baseline_train)
+
+        # Train baseline logistic regression
+        lr = LogisticRegression(
+            featuresCol="_baseline_features",
+            labelCol=self.label_col,
+            maxIter=max_iter,
+            regParam=reg_param,
+        )
+        lr_model = lr.fit(baseline_train)
+        print(f"   ✓ Baseline model trained")
+
+        # Score all training data
+        print("   Scoring negatives...")
+        train_assembled = assembler.transform(train_df)
+        scored = lr_model.transform(train_assembled)
+
+        # Extract probability of positive class
+        from pyspark.ml.functions import vector_to_array
+        scores_df = scored.select(
+            *self.key_cols,
+            vector_to_array(F.col("probability"))[1].alias("score")
+        )
+
+        # Apply hard negative sampling
+        sampled_df, info = sampler.sample_with_hard_negatives(
+            train_df,
+            self.label_col,
+            scores_df,
+            self.key_cols,
+            score_col="score",
+        )
+
+        print(f"   ✓ Hard negative sampling complete: {info.get('n_hard_negatives', 0)} hard + {info.get('n_random_negatives', 0)} random negatives")
+
         return sampled_df, info
     
     def deduplicate(

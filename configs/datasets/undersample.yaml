@@ -31,7 +31,7 @@ tune:
 # ==============================================================================
 final:
   sampling:
-    type: none     # Use hard negative mining
+    type: undersample     # Use hard negative mining
     target_ratio: 0.3       # Final pos/neg ratio
     seed: 42
   

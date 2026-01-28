@@ -31,6 +31,7 @@ model:
     enable_categorical: true
     
     # Tree structure
+    tree_method: gpu_hist
     max_depth: 9
     min_child_weight: 2
     gamma: 0.1
@@ -50,10 +51,12 @@ model:
     early_stopping_rounds: 30
     
     # Class imbalance
-    scale_pos_weight: 1  # Set to n_negative/n_positive for imbalanced data
+    scale_pos_weight: 9  # Set to n_negative/n_positive for imbalanced data
     
     # Reproducibility
     seed: 42
+    max_cat_to_onehot: 16      # drempel: onder dit => one-hot splits, erboven => partition splits
+    max_cat_threshold: 64      # max categories per split (tegen overfitting), experimenteel
     
     # Logging
     verbose_eval: 25

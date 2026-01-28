@@ -3,6 +3,7 @@ Unified Pipeline Builder for multi-backend ML workflows.
 Orchestrates PyTorch, XGBoost, and Spark backends with consistent API.
 """
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
@@ -17,6 +18,7 @@ from .base import (
     TrainResult,
 )
 from ..utils.device import get_device_manager
+from ..utils.gpu_monitor import get_gpu_memory_usage, print_gpu_usage, estimate_batch_size_for_gpu
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +205,7 @@ class UnifiedPipeline:
         else:
             # PyTorch/XGBoost need numpy arrays
             loader = BackendFactory.get_data_loader(self.config.backend)
-            
+
             if hasattr(data, "toPandas"):
                 # CRITICAL: Sample in Spark BEFORE converting to pandas
                 if fit and max_samples is not None:
@@ -212,10 +214,21 @@ class UnifiedPipeline:
                         sample_fraction = max_samples / n_rows
                         print(f"⚠️  Sampling {sample_fraction:.2%} ({max_samples:,}/{n_rows:,} rows) for fitting")
                         data = data.sample(fraction=sample_fraction, seed=42)
-                
-                # Now safe to convert
+
+                # Now safe to convert using Arrow (if enabled)
                 cols_to_select = feature_cols + [label_col]
-                pdf = data.select(cols_to_select).toPandas()
+
+                # Force Arrow conversion if available (10-100x faster)
+                try:
+                    # Check if Arrow is enabled
+                    spark = data.sparkSession
+                    arrow_enabled = spark.conf.get("spark.sql.execution.arrow.pyspark.enabled", "false") == "true"
+                    if not arrow_enabled:
+                        print("⚠️  Apache Arrow not enabled. Consider using spark_gpu_config.py for 10-100x faster conversion")
+                    pdf = data.select(cols_to_select).toPandas()
+                except Exception as e:
+                    print(f"⚠️  Arrow conversion failed, falling back to standard: {e}")
+                    pdf = data.select(cols_to_select).toPandas()
                 
                 print(f"Loaded {len(pdf):,} rows, {len(cols_to_select)} cols, "
                     f"~{pdf.memory_usage(deep=True).sum() / 1e6:.1f} MB")
@@ -245,11 +258,36 @@ class UnifiedPipeline:
         feature_cols: List[str] = None,
         sample_weight=None,
         use_batches: bool = None,  # Auto-detect
-        batch_size: int = 100_000,
+        batch_size: int = None,  # Auto-detect based on device
     ):
         """Fit the model."""
-        
-        # Auto-detect of we batches moeten gebruiken
+
+        # Auto-detect batch size based on device
+        if batch_size is None:
+            device = self._create_estimator().get_device()
+            if device.startswith("cuda"):
+                # GPU: Estimate optimal batch size based on available VRAM
+                try:
+                    gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+                    gpu_stats = get_gpu_memory_usage(gpu_id)
+                    n_features = len(feature_cols) if feature_cols else 30
+                    batch_size = estimate_batch_size_for_gpu(
+                        n_features=n_features,
+                        gpu_memory_gb=gpu_stats["total_mb"] / 1024,
+                        safety_factor=0.7,  # Use 70% of GPU memory
+                    )
+                    print(f"🚀 GPU detected! Optimized batch_size={batch_size:,}")
+                    print_gpu_usage(gpu_id, "   ")
+                except Exception as e:
+                    batch_size = 500_000
+                    print(f"⚠️  Could not estimate GPU batch size: {e}")
+                    print(f"   Using default batch_size={batch_size:,}")
+            else:
+                # CPU: Keep smaller to avoid memory issues
+                batch_size = 100_000
+                print(f"💻 CPU detected, batch_size={batch_size:,}")
+
+        # Auto-detect if we batches moeten gebruiken
         if use_batches is None and hasattr(train_data, "count"):
             n_rows = train_data.count()
             use_batches = n_rows > 1_000_000  # Gebruik batches voor >1M rijen
@@ -290,6 +328,9 @@ class UnifiedPipeline:
             self.estimator_.fit(X_train, features_col=features_col)
         else:
             # PyTorch/XGBoost use numpy arrays
+            # Before training, check:
+            print(f"Device detected: {self.estimator_.get_device()}")
+            print(f"XGBoost params: {self.estimator_._get_xgb_params()}")
             self.estimator_.fit(
                 X_train,
                 y_train,
@@ -307,7 +348,7 @@ class UnifiedPipeline:
         eval_data,
         feature_cols: List[str],
         batch_size: int,
-        label_col: str = 'y_moved',
+        label_col: str = None,
     ):
         """
         Fit using batch iterator for large datasets.
@@ -318,6 +359,10 @@ class UnifiedPipeline:
         from ..data.utils import create_batch_iterator_simple as create_batch_iterator
 
         self.feature_cols_ = feature_cols
+
+        # Use config label_col if not provided
+        if label_col is None:
+            label_col = self.config.label_col
 
         # Step 1: Fit preprocessor on first batch
         print("Step 1: Fitting preprocessor on sample batch...")
@@ -369,7 +414,25 @@ class UnifiedPipeline:
         """Incrementeel trainen van XGBoost per batch."""
         from ..data.utils import create_batch_iterator_simple as create_batch_iterator
 
-        print(f"Step 2: Training XGBoost incrementally (batch_size={batch_size:,})...")
+        device = self.estimator_.get_device()
+        params = self.estimator_._get_xgb_params()
+
+        print(f"\n{'='*60}")
+        print(f"XGBoost Incremental Training Configuration")
+        print(f"{'='*60}")
+        print(f"Device: {device}")
+        print(f"Tree method: {params.get('tree_method', 'N/A')}")
+        print(f"Batch size: {batch_size:,} samples")
+        print(f"Max bins: {params.get('max_bin', 256)}")
+        print(f"{'='*60}\n")
+
+        # Monitor GPU if using CUDA
+        is_gpu = device.startswith("cuda")
+        if is_gpu:
+            gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+            print("GPU status before training:")
+            print_gpu_usage(gpu_id, "  ")
+            print()
 
         batch_iter = create_batch_iterator(
             train_data,
@@ -398,10 +461,18 @@ class UnifiedPipeline:
                 reset=is_first_batch,
             )
 
-            print(f"  Batch {i+1}: trained on {len(y_batch):,} samples "
-                  f"(total: {total_samples:,})")
+            # Show progress with GPU monitoring every 5 batches
+            if is_gpu and (i + 1) % 5 == 0:
+                print(f"  Batch {i+1}: {len(y_batch):,} samples (total: {total_samples:,})")
+                print_gpu_usage(gpu_id, "    ")
+            elif not is_gpu:
+                print(f"  Batch {i+1}: trained on {len(y_batch):,} samples "
+                      f"(total: {total_samples:,})")
 
-        print(f"Step 3: Training complete. Total samples: {total_samples:,}")
+        print(f"\nStep 3: Training complete. Total samples: {total_samples:,}")
+        if is_gpu:
+            print("\nFinal GPU status:")
+            print_gpu_usage(gpu_id, "  ")
 
     def _fit_pytorch_batched(
         self,
@@ -460,14 +531,160 @@ class UnifiedPipeline:
         """Generate probability predictions."""
         if not self._is_fitted:
             raise RuntimeError("Pipeline must be fitted before predict_proba")
-        
+
         X, _ = self._prepare_data(data, self.feature_cols_, fit=False)
-        
+
         if self.config.backend == BackendType.SPARK:
             features_col = self.preprocessor_.get_output_col()
             X = X.select(features_col, self.config.label_col)
-        
+
         return self.estimator_.predict_proba(X)
+
+    def predict_proba_batched(
+        self,
+        spark_df: Any,
+        batch_size: int = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate probability predictions on a Spark DataFrame in batches.
+
+        This method is optimized for large datasets and avoids loading
+        the entire dataset into memory at once.
+
+        Args:
+            spark_df: Input Spark DataFrame
+            batch_size: Number of rows per batch (auto-detected if None)
+
+        Returns:
+            Tuple of (y_true, y_pred_proba) as numpy arrays
+        """
+        import time
+
+        if not self._is_fitted:
+            raise RuntimeError("Pipeline must be fitted before predict_proba_batched")
+
+        if self.config.backend == BackendType.SPARK:
+            # Spark backend doesn't need batching - it handles large data natively
+            raise NotImplementedError(
+                "Batched prediction is for PyTorch/XGBoost backends only. "
+                "Spark backend handles large datasets natively."
+            )
+
+        from src.data.utils import create_batch_iterator_simple
+
+        # Auto-detect optimal batch size
+        if batch_size is None:
+            device = self.estimator_.get_device()
+            if device.startswith("cuda"):
+                try:
+                    from src.utils.gpu_monitor import get_gpu_memory_usage, estimate_batch_size_for_gpu
+                    gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+                    gpu_stats = get_gpu_memory_usage(gpu_id)
+                    batch_size = estimate_batch_size_for_gpu(
+                        n_features=len(self.feature_cols_),
+                        gpu_memory_gb=gpu_stats["total_mb"] / 1024,
+                        safety_factor=0.6,
+                    )
+                    print(f"🚀 GPU-optimized batch_size={batch_size:,}")
+                except Exception:
+                    batch_size = 500_000
+                    print(f"💻 Using default batch_size={batch_size:,}")
+            else:
+                batch_size = 100_000
+                print(f"💻 CPU batch_size={batch_size:,}")
+
+        # Get total row count for progress tracking
+        print("📊 Counting total rows...")
+        total_rows = spark_df.count()
+        estimated_batches = (total_rows + batch_size - 1) // batch_size
+        print(f"📊 Dataset: {total_rows:,} rows → ~{estimated_batches} batches of {batch_size:,}")
+        print(f"{'='*60}")
+
+        batch_iter = create_batch_iterator_simple(
+            spark_df,
+            batch_size=batch_size,
+            feature_cols=self.feature_cols_,
+            label_col=self.config.label_col,
+        )
+
+        y_true_list = []
+        y_pred_list = []
+        batch_count = 0
+        total_preprocess_time = 0
+        total_predict_time = 0
+        start_time = time.time()
+
+        for batch_X, batch_y in batch_iter:
+            batch_count += 1
+            batch_start = time.time()
+
+            # Transform using fitted preprocessor
+            preprocess_start = time.time()
+            if self.config.categorical_encoding == "native":
+                X_transformed = self.preprocessor_.transform(batch_X[self.feature_cols_])
+            else:
+                X_transformed = self.preprocessor_.transform(batch_X[self.feature_cols_].values)
+            preprocess_time = time.time() - preprocess_start
+            total_preprocess_time += preprocess_time
+
+            y_batch = batch_y.values.astype(np.float32)
+
+            # Predict
+            predict_start = time.time()
+            pred_result = self.estimator_.predict_proba(X_transformed)
+            predict_time = time.time() - predict_start
+            total_predict_time += predict_time
+
+            y_true_list.append(y_batch)
+            y_pred_list.append(pred_result.probabilities)
+
+            batch_time = time.time() - batch_start
+            rows_processed = batch_count * batch_size
+
+            # Progress logging with timing details
+            if batch_count == 1 or batch_count % 5 == 0 or batch_count == estimated_batches:
+                progress_pct = min(100, (rows_processed / total_rows) * 100)
+                elapsed = time.time() - start_time
+                avg_batch_time = elapsed / batch_count
+                remaining_batches = estimated_batches - batch_count
+                eta_seconds = remaining_batches * avg_batch_time
+
+                # Format ETA
+                if eta_seconds < 60:
+                    eta_str = f"{eta_seconds:.0f}s"
+                elif eta_seconds < 3600:
+                    eta_str = f"{eta_seconds/60:.1f}min"
+                else:
+                    eta_str = f"{eta_seconds/3600:.1f}h"
+
+                rows_per_sec = rows_processed / elapsed if elapsed > 0 else 0
+
+                print(f"⏱️  Batch {batch_count}/{estimated_batches} ({progress_pct:.1f}%) | "
+                      f"{rows_processed:,}/{total_rows:,} rows | "
+                      f"{rows_per_sec:,.0f} rows/s | "
+                      f"ETA: {eta_str}")
+                print(f"   └─ Batch time: {batch_time:.2f}s "
+                      f"(preprocess: {preprocess_time:.2f}s, predict: {predict_time:.2f}s)")
+
+        # Concatenate all batches
+        print(f"\n{'='*60}")
+        print("🔗 Concatenating predictions...")
+        concat_start = time.time()
+        y_true = np.concatenate(y_true_list)
+        y_pred = np.concatenate(y_pred_list)
+        concat_time = time.time() - concat_start
+
+        total_time = time.time() - start_time
+        print(f"✅ Complete! Predicted {len(y_true):,} rows in {total_time:.1f}s")
+        print(f"   📈 Throughput: {len(y_true)/total_time:,.0f} rows/s")
+        print(f"   ⏱️  Breakdown:")
+        print(f"      • Preprocessing: {total_preprocess_time:.1f}s ({total_preprocess_time/total_time*100:.1f}%)")
+        print(f"      • Prediction: {total_predict_time:.1f}s ({total_predict_time/total_time*100:.1f}%)")
+        print(f"      • Concatenation: {concat_time:.1f}s ({concat_time/total_time*100:.1f}%)")
+        print(f"      • Other (I/O): {total_time - total_preprocess_time - total_predict_time - concat_time:.1f}s")
+        print(f"{'='*60}\n")
+
+        return y_true, y_pred
 
     def tune_threshold(
         self,

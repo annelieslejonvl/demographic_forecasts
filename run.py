@@ -207,6 +207,149 @@ def add_inverse_prevalence_weights(
     return df_weighted, {"n_pos": n_pos, "n_neg": n_neg, "pos_weight": pos_w}
 
 
+def predict_in_batches(
+    pipeline,
+    spark_df,
+    feature_cols: List[str],
+    label_col: str,
+    batch_size: int = None,
+) -> Tuple:
+    """
+    Predict on a Spark DataFrame in batches to avoid memory issues.
+
+    Args:
+        pipeline: Fitted pipeline with predict_proba method
+        spark_df: Input Spark DataFrame
+        feature_cols: List of feature column names
+        label_col: Label column name
+        batch_size: Number of rows per batch (auto-detected if None)
+
+    Returns:
+        Tuple of (y_true, y_pred_proba) as numpy arrays
+    """
+    import numpy as np
+    import time
+    from src.data.utils import create_batch_iterator_simple
+
+    # Auto-detect optimal batch size based on device
+    if batch_size is None:
+        device = pipeline.estimator_.get_device()
+        if device.startswith("cuda"):
+            # GPU: Use larger batches for efficiency
+            try:
+                from src.utils.gpu_monitor import get_gpu_memory_usage, estimate_batch_size_for_gpu
+                gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+                gpu_stats = get_gpu_memory_usage(gpu_id)
+                batch_size = estimate_batch_size_for_gpu(
+                    n_features=len(feature_cols),
+                    gpu_memory_gb=gpu_stats["total_mb"] / 1024,
+                    safety_factor=0.6,  # Conservative for inference
+                )
+                print(f"🚀 GPU-optimized batch_size={batch_size:,}")
+            except Exception as e:
+                batch_size = 500_000
+                print(f"⚠️  Could not estimate GPU batch size: {e}")
+                print(f"   Using default batch_size={batch_size:,}")
+        else:
+            # CPU: Keep moderate size
+            batch_size = 100_000
+            print(f"💻 CPU batch_size={batch_size:,}")
+
+    # Get total row count for progress tracking
+    print("📊 Counting total rows...")
+    total_rows = spark_df.count()
+    estimated_batches = (total_rows + batch_size - 1) // batch_size
+    print(f"📊 Dataset: {total_rows:,} rows → ~{estimated_batches} batches of {batch_size:,}")
+    print(f"{'='*60}")
+
+    y_true_list = []
+    y_pred_list = []
+
+    batch_count = 0
+    total_preprocess_time = 0
+    total_predict_time = 0
+    start_time = time.time()
+
+    batch_iter = create_batch_iterator_simple(
+        spark_df,
+        batch_size=batch_size,
+        feature_cols=feature_cols,
+        label_col=label_col,
+    )
+
+    for batch_X, batch_y in batch_iter:
+        batch_count += 1
+        batch_start = time.time()
+
+        # Transform using fitted preprocessor (CRITICAL!)
+        preprocess_start = time.time()
+        if pipeline.config.categorical_encoding == "native":
+            X_transformed = pipeline.preprocessor_.transform(batch_X[feature_cols])
+        else:
+            X_transformed = pipeline.preprocessor_.transform(batch_X[feature_cols].values)
+        preprocess_time = time.time() - preprocess_start
+        total_preprocess_time += preprocess_time
+
+        y_batch = batch_y.values.astype(np.float32)
+
+        # Predict directly on transformed data (skip pipeline._prepare_data)
+        predict_start = time.time()
+        pred_result = pipeline.estimator_.predict_proba(X_transformed)
+        predict_time = time.time() - predict_start
+        total_predict_time += predict_time
+
+        y_true_list.append(y_batch)
+        y_pred_list.append(pred_result.probabilities)
+
+        batch_time = time.time() - batch_start
+        rows_processed = batch_count * batch_size
+
+        # Progress logging with timing details
+        if batch_count == 1 or batch_count % 5 == 0 or batch_count == estimated_batches:
+            progress_pct = min(100, (rows_processed / total_rows) * 100)
+            elapsed = time.time() - start_time
+            avg_batch_time = elapsed / batch_count
+            remaining_batches = estimated_batches - batch_count
+            eta_seconds = remaining_batches * avg_batch_time
+
+            # Format ETA
+            if eta_seconds < 60:
+                eta_str = f"{eta_seconds:.0f}s"
+            elif eta_seconds < 3600:
+                eta_str = f"{eta_seconds/60:.1f}min"
+            else:
+                eta_str = f"{eta_seconds/3600:.1f}h"
+
+            rows_per_sec = rows_processed / elapsed if elapsed > 0 else 0
+
+            print(f"⏱️  Batch {batch_count}/{estimated_batches} ({progress_pct:.1f}%) | "
+                  f"{rows_processed:,}/{total_rows:,} rows | "
+                  f"{rows_per_sec:,.0f} rows/s | "
+                  f"ETA: {eta_str}")
+            print(f"   └─ Batch time: {batch_time:.2f}s "
+                  f"(preprocess: {preprocess_time:.2f}s, predict: {predict_time:.2f}s)")
+
+    # Concatenate all batches
+    print(f"\n{'='*60}")
+    print("🔗 Concatenating predictions...")
+    concat_start = time.time()
+    y_true = np.concatenate(y_true_list)
+    y_pred = np.concatenate(y_pred_list)
+    concat_time = time.time() - concat_start
+
+    total_time = time.time() - start_time
+    print(f"✅ Complete! Predicted {len(y_true):,} rows in {total_time:.1f}s")
+    print(f"   📈 Throughput: {len(y_true)/total_time:,.0f} rows/s")
+    print(f"   ⏱️  Breakdown:")
+    print(f"      • Preprocessing: {total_preprocess_time:.1f}s ({total_preprocess_time/total_time*100:.1f}%)")
+    print(f"      • Prediction: {total_predict_time:.1f}s ({total_predict_time/total_time*100:.1f}%)")
+    print(f"      • Concatenation: {concat_time:.1f}s ({concat_time/total_time*100:.1f}%)")
+    print(f"      • Other (I/O): {total_time - total_preprocess_time - total_predict_time - concat_time:.1f}s")
+    print(f"{'='*60}\n")
+
+    return y_true, y_pred
+
+
 def spark_to_numpy(
     spark_df,
     feature_cols: List[str],
@@ -216,29 +359,39 @@ def spark_to_numpy(
     sample_fraction: Optional[float] = None,  # 👈 Nieuwe optie
 ) -> Tuple:
     """Convert Spark DataFrame to numpy arrays for PyTorch/XGBoost.
-    
+
     WARNING: This loads data into memory. For large datasets, use
     create_batch_iterator() instead.
-    
+
     Args:
         limit_rows: Max rows to load (default 10k for safety)
         sample_fraction: Alternative to limit_rows, sample % of data
     """
     import numpy as np
-    
+
     cols = feature_cols + [label_col]
     if weight_col:
         cols.append(weight_col)
-    
+
     # Apply sampling/limiting
     if sample_fraction is not None:
         n_rows = spark_df.count()
         print(f"Sampling {sample_fraction:.2%} of {n_rows:,} rows")
         spark_df = spark_df.sample(fraction=sample_fraction, seed=42)
-        pdf = spark_df.select(cols).toPandas()
+
+        # Use Arrow if available for faster conversion
+        try:
+            pdf = spark_df.select(cols).toPandas()
+        except Exception as e:
+            print(f"⚠️  Arrow conversion failed: {e}")
+            pdf = spark_df.select(cols).toPandas()
     elif limit_rows is not None:
         print(f"Limiting to {limit_rows:,} rows")
-        pdf = spark_df.limit(limit_rows).select(cols).toPandas()
+        try:
+            pdf = spark_df.limit(limit_rows).select(cols).toPandas()
+        except Exception as e:
+            print(f"⚠️  Arrow conversion failed: {e}")
+            pdf = spark_df.limit(limit_rows).select(cols).toPandas()
     else:
         # Expliciete check - forceer gebruiker om bewust te zijn
         n_rows = spark_df.count()
@@ -248,15 +401,19 @@ def spark_to_numpy(
                 f"Use limit_rows= or sample_fraction= to avoid memory issues, "
                 f"or use create_batch_iterator() for streaming."
             )
-        pdf = spark_df.select(cols).toPandas()
-    
+        try:
+            pdf = spark_df.select(cols).toPandas()
+        except Exception as e:
+            print(f"⚠️  Arrow conversion failed: {e}")
+            pdf = spark_df.select(cols).toPandas()
+
     print(f"Loaded {len(pdf):,} rows, {len(cols)} cols, "
           f"~{pdf.memory_usage(deep=True).sum() / 1e6:.1f} MB")
-    
+
     X = pdf[feature_cols].values.astype(np.float32)
     y = pdf[label_col].values.astype(np.float32).ravel()
     w = pdf[weight_col].values.astype(np.float32) if weight_col else None
-    
+
     return X, y, w
 
 # =============================================================================
@@ -367,7 +524,10 @@ def run_experiments(
         # Apply mode-specific sampling
         mode_cfg = ds_spec.tune if mode == "tune" else ds_spec.final
         sampling_cfg = mode_cfg.get("sampling", {"type": "none"})
-        train_df_sampled, samp_info = ds_builder.sample_train(train_df, sampling_cfg)
+        hard_neg_cfg = mode_cfg.get("hard_negatives", {})
+        train_df_sampled, samp_info = ds_builder.sample_train(
+            train_df, sampling_cfg, hard_neg_cfg=hard_neg_cfg
+        )
         
         # Add weights if needed
         if model_cfg.get("weight_col"):
@@ -434,32 +594,43 @@ def run_experiments(
                     valid_metrics = _spark_binary_metrics(pred_valid, label_col, threshold=optimal_threshold)
             
             else:
-        
+                print(train_df_sampled.columns)
                 # PyTorch/XGBoost need numpy arrays
+                # Training set: can use sampling since we're just training
                 X_train, y_train, w_train = spark_to_numpy(
                     train_df_sampled, feature_cols, label_col,
                     model_cfg.get("weight_col"),  sample_fraction= 0.1
                 )
-                X_test, y_test, _ = spark_to_numpy(test_df, feature_cols, label_col, limit_rows=None, sample_fraction=0.1)
-                
+
+                # Validation set for training monitoring and threshold tuning (use sample)
                 eval_set = None
+                X_val_sample, y_val_sample = None, None
                 if valid_df is not None:
-                    X_val, y_val, _ = spark_to_numpy(valid_df, feature_cols, label_col, limit_rows=None, sample_fraction=0.1)
-                    eval_set = [(X_val, y_val)]
+                    X_val_sample, y_val_sample, _ = spark_to_numpy(
+                        valid_df, feature_cols, label_col,
+                        limit_rows=None, sample_fraction=0.2  # 20% sample for training monitoring and threshold tuning
+                    )
+                    eval_set = [(X_val_sample, y_val_sample)]
+
                 print('fitting')
                 if(fit  ==False):
                     print('preparing data')
                     X_train_prep, y_train_prep = pipeline._prepare_data((X_train, y_train), feature_cols, fit=True, max_samples=50_000)
-                    return (X_train_prep, y_train_prep), feature_cols , (X_val,y_val) if valid_df is not None else None
+                    # For non-fit mode, also prepare validation data
+                    val_data = None
+                    if valid_df is not None:
+                        val_data = (X_val_sample, y_val_sample)
+                    return (X_train_prep, y_train_prep), feature_cols, val_data
                 else:
+
                     train_result = pipeline.fit(
                         train_data = train_df_sampled,  # <-- TOEVOEGEN
                         feature_cols =feature_cols,
-                        eval_data=(X_val, y_val) if valid_df else None,
+                        eval_data=eval_set[0] if eval_set else None,
                         sample_weight=w_train,
                         )
 
-                # Threshold tuning on validation set
+                # Threshold tuning on validation sample (sufficient for threshold selection)
                 threshold_config = run_model_cfg.get("threshold_tuning", {})
                 if threshold_config.get("enabled", False) and valid_df is not None:
                     strategy = threshold_config.get("strategy", "f1")
@@ -472,24 +643,42 @@ def run_experiments(
                     if "min_recall" in threshold_config:
                         tuning_kwargs["min_recall"] = threshold_config["min_recall"]
 
-                    logger.info(f"Tuning threshold using {strategy} strategy on validation set")
-                    optimal_threshold = pipeline.tune_threshold((X_val, y_val), strategy=strategy, **tuning_kwargs)
+                    logger.info(f"Tuning threshold using {strategy} strategy on validation sample")
+                    optimal_threshold = pipeline.tune_threshold(
+                        (X_val_sample, y_val_sample), strategy=strategy, **tuning_kwargs
+                    )
                     logger.info(f"Optimal threshold: {optimal_threshold:.4f}")
                 else:
                     optimal_threshold = 0.5
 
-                # Note: For non-Spark, we need to handle y separately
-                print('fitting done')
+                # Evaluation: Use FULL datasets with batch processing for accurate metrics
+                print(f"\n{'='*60}")
+                print('📊 EVALUATION PHASE')
+                print(f"{'='*60}\n")
+
+                # Train metrics (on sample is fine)
+                print('📋 Train set (sample)...')
                 pred_train = pipeline.predict_proba((X_train, None))
-                pred_test = pipeline.predict_proba((X_test, None))
-
                 train_metrics = _numpy_binary_metrics(y_train, pred_train.probabilities, threshold=optimal_threshold)
-                test_metrics = _numpy_binary_metrics(y_test, pred_test.probabilities, threshold=optimal_threshold)
+                print(f"   ✓ Train metrics: AUC={train_metrics['auc_roc']:.4f}, F1={train_metrics['f1']:.4f}\n")
 
+                # Test metrics (FULL dataset with batches - NO SAMPLING)
+                print('📋 Test set (FULL dataset with batched evaluation)...')
+                y_test, pred_test = predict_in_batches(
+                    pipeline, test_df, feature_cols, label_col
+                )
+                test_metrics = _numpy_binary_metrics(y_test, pred_test, threshold=optimal_threshold)
+                print(f"   ✓ Test metrics: AUC={test_metrics['auc_roc']:.4f}, F1={test_metrics['f1']:.4f}\n")
+
+                # Validation metrics (FULL dataset with batches - NO SAMPLING)
                 valid_metrics = None
                 if valid_df is not None:
-                    pred_valid = pipeline.predict_proba( (X_val, None))
-                    valid_metrics = _numpy_binary_metrics(y_val, pred_valid.probabilities, threshold=optimal_threshold)
+                    print('📋 Validation set (FULL dataset with batched evaluation)...')
+                    y_val, pred_val = predict_in_batches(
+                        pipeline, valid_df, feature_cols, label_col
+                    )
+                    valid_metrics = _numpy_binary_metrics(y_val, pred_val, threshold=optimal_threshold)
+                    print(f"   ✓ Valid metrics: AUC={valid_metrics['auc_roc']:.4f}, F1={valid_metrics['f1']:.4f}\n")
             
             # Build run name
             rn = rn_base
@@ -539,7 +728,7 @@ def run_experiments(
             
             logger.info(f"Completed: {rn} | test_auc_roc={test_metrics['auc_roc']:.4f}")
     
-    return results
+    return results, pipeline, feature_cols
 
 
 # =============================================================================

@@ -31,12 +31,12 @@ tune:
 # ==============================================================================
 final:
   sampling:
-    type: none     # Use hard negative mining
+    type: hard_negative     # Use hard negative mining
     target_ratio: 0.3       # Final pos/neg ratio
     seed: 42
   
   hard_negatives:
-    enabled: false
+    enabled: true
     fraction: 0.6           # 60% hard negatives, 40% random
     method: top_prob        # top_prob, margin, entropy
     

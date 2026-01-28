@@ -334,6 +334,8 @@ class XGBoostClassifier(BaseEstimator):
         "reg_lambda": 1,
         "scale_pos_weight": 1,
         "seed": 42,
+        # GPU-friendly defaults
+        "grow_policy": "depthwise",  # Better for GPU
     }
     
     def __init__(
@@ -342,16 +344,19 @@ class XGBoostClassifier(BaseEstimator):
         device_config: Optional[DeviceConfig] = None,
     ):
         super().__init__(model_config, device_config)
-        
+
         # Merge default params with user config
         params = model_config.get("params", {})
         self.params = {**self.DEFAULT_PARAMS, **params}
-        
+
         # Training params
         self.early_stopping_rounds = self.params.pop("early_stopping_rounds", 20)
         self.n_estimators = self.params.pop("n_estimators", 100)
         self.verbose_eval = self.params.pop("verbose_eval", 10)
-        
+
+        # Extract enable_categorical for DMatrix (not a training param)
+        self.enable_categorical = self.params.pop("enable_categorical", False)
+
         self.model_ = None
         self.best_iteration_: Optional[int] = None
         self.feature_names_: Optional[List[str]] = None
@@ -372,16 +377,35 @@ class XGBoostClassifier(BaseEstimator):
     
     def _get_xgb_params(self) -> Dict[str, Any]:
         """Get XGBoost parameters with device configuration."""
+        import xgboost as xgb
+
         device = self.get_device()
         params = self.params.copy()
-        
+
+        # Ensure base_score is valid for logistic loss (must be in (0,1))
+        # Default to 0.5 if not set or invalid
+        if "base_score" not in params or params.get("base_score") is None:
+            params["base_score"] = 0.5
+
         if device.startswith("cuda"):
-            params["device"] = device
-            params["tree_method"] = "hist"
+            # Extract GPU ID from device string (e.g., "cuda:0" -> 0)
+            gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+
+            # XGBoost 2.0+ unified API: use device parameter instead of gpu_hist
+            params["device"] = f"cuda:{gpu_id}"
+            params["tree_method"] = "hist"  # Works for both CPU and GPU
+
+            # GPU-specific optimizations
+            if "max_bin" not in params:
+                params["max_bin"] = 256  # Higher bins = better quality on GPU
+
+            # XGBoost 3.0+ supports these GPU optimizations
+            if xgb.__version__ >= '3.0.0':
+                params["sampling_method"] = params.get("sampling_method", "gradient_based")
         else:
             params["device"] = "cpu"
             params["tree_method"] = "hist"
-        
+
         return params
     
     def fit(
@@ -404,13 +428,18 @@ class XGBoostClassifier(BaseEstimator):
         dtrain = xgb.DMatrix(
             X, label=y, weight=sample_weight,
             feature_names=feature_names,
+            enable_categorical=self.enable_categorical,
         )
         
         # Evaluation sets
         evals = [(dtrain, "train")]
         if eval_set:
             for i, (X_eval, y_eval) in enumerate(eval_set):
-                deval = xgb.DMatrix(X_eval, label=y_eval, feature_names=feature_names)
+                deval = xgb.DMatrix(
+                    X_eval, label=y_eval,
+                    feature_names=feature_names,
+                    enable_categorical=self.enable_categorical,
+                )
                 evals.append((deval, f"eval_{i}"))
         
         # Get params with device config
@@ -483,6 +512,7 @@ class XGBoostClassifier(BaseEstimator):
         dtrain = xgb.DMatrix(
             X, label=y, weight=sample_weight,
             feature_names=feature_names or self.feature_names_,
+            enable_categorical=self.enable_categorical,
         )
 
         # Evaluation sets
@@ -492,15 +522,27 @@ class XGBoostClassifier(BaseEstimator):
                 deval = xgb.DMatrix(
                     X_eval, label=y_eval,
                     feature_names=feature_names or self.feature_names_,
+                    enable_categorical=self.enable_categorical,
                 )
                 evals.append((deval, f"eval_{i}"))
 
         # Get params with device config
         params = self._get_xgb_params()
 
-        # Number of rounds per batch (fewer than full training)
-        batch_rounds = max(10, self.n_estimators // 10)
+        # IMPORTANT: Remove base_score when continuing training
+        # XGBoost stores base_score in the model, and passing it again causes conflicts
+        if self.model_ is not None:
+            params.pop("base_score", None)
 
+        # Number of rounds per batch (increase for better GPU utilization)
+        # GPU trains much faster, so we can afford more rounds per batch
+        device = self.get_device()
+        if device.startswith("cuda"):
+            # GPU: Use more trees per batch to saturate GPU compute
+            batch_rounds = max(200, self.n_estimators // 2)  # More trees on GPU
+        else:
+            # CPU: Keep lower to avoid long batch times
+            batch_rounds = max(100, self.n_estimators // 3)
         # Train incrementally: pass existing model to continue training
         evals_result = {}
         self.model_ = xgb.train(
@@ -541,7 +583,13 @@ class XGBoostClassifier(BaseEstimator):
         """Generate probability predictions."""
         import xgboost as xgb
 
-        dmatrix = xgb.DMatrix(X, feature_names=self.feature_names_)
+        # Optimization: DMatrix creation can be expensive for large datasets
+        # Consider using DMatrix.quantile_cut for very large datasets
+        dmatrix = xgb.DMatrix(
+            X,
+            feature_names=self.feature_names_,
+            enable_categorical=self.enable_categorical,
+        )
 
         # XGBoost binary classification returns P(y=1)
         # Use all trees if best_iteration_ not set (incremental training)
@@ -559,6 +607,72 @@ class XGBoostClassifier(BaseEstimator):
             predictions=None,
             probabilities=probas_2d,
         )
+
+    def predict_proba_batched(
+        self,
+        X: np.ndarray,
+        batch_size: int = 100_000,
+    ) -> PredictResult:
+        """
+        Generate probability predictions in batches for large datasets.
+
+        This method is more memory-efficient than predict_proba for large datasets,
+        as it processes data in batches to avoid creating one massive DMatrix.
+
+        Args:
+            X: Feature matrix (can be numpy array or pandas DataFrame)
+            batch_size: Number of samples per batch
+
+        Returns:
+            PredictResult with probabilities for all samples
+        """
+        import xgboost as xgb
+
+        n_samples = len(X)
+
+        # If dataset is small, use regular prediction
+        if n_samples <= batch_size:
+            return self.predict_proba(X)
+
+        # Process in batches
+        probabilities_list = []
+
+        for i in range(0, n_samples, batch_size):
+            end_idx = min(i + batch_size, n_samples)
+            X_batch = X[i:end_idx]
+
+            # Create DMatrix for this batch only
+            dmatrix = xgb.DMatrix(
+                X_batch,
+                feature_names=self.feature_names_,
+                enable_categorical=self.enable_categorical,
+            )
+
+            # Predict
+            if self.best_iteration_ is not None:
+                p1 = self.model_.predict(
+                    dmatrix,
+                    iteration_range=(0, self.best_iteration_),
+                )
+            else:
+                p1 = self.model_.predict(dmatrix)
+
+            probas_batch = np.column_stack([1 - p1, p1])
+            probabilities_list.append(probas_batch)
+
+        # Concatenate all batch predictions
+        all_probabilities = np.vstack(probabilities_list)
+
+        return PredictResult(
+            predictions=None,
+            probabilities=all_probabilities,
+        )
+    
+
+    def get_booster(self):
+        """Return the underlying XGBoost Booster object."""
+        return self.model_
+
     
     def get_feature_importance(
         self,
@@ -580,6 +694,7 @@ class XGBoostClassifier(BaseEstimator):
             "best_iteration": self.best_iteration_,
             "feature_names": self.feature_names_,
             "params": self.params,
+            "enable_categorical": self.enable_categorical,
             "threshold": self._threshold,
             "threshold_tuning_stats": self._threshold_tuning_stats,
         }, meta_path)
@@ -593,17 +708,18 @@ class XGBoostClassifier(BaseEstimator):
         """Load model from disk."""
         import xgboost as xgb
         import joblib
-        
+
         # Load metadata
         meta_path = path + ".meta"
         meta = joblib.load(meta_path)
-        
+
         estimator = cls(meta["model_config"], device_config)
         estimator.model_ = xgb.Booster()
         estimator.model_.load_model(path)
         estimator.best_iteration_ = meta["best_iteration"]
         estimator.feature_names_ = meta["feature_names"]
         estimator.params = meta["params"]
+        estimator.enable_categorical = meta.get("enable_categorical", False)
         estimator._threshold = meta.get("threshold", 0.5)
         estimator._threshold_tuning_stats = meta.get("threshold_tuning_stats", None)
         estimator._is_fitted = True
