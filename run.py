@@ -28,6 +28,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlflow
+import pandas as pd
 from pyspark.sql import functions as F
 from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.ml.functions import vector_to_array
@@ -175,6 +176,133 @@ def _spark_binary_metrics(
     }
 
 
+def _compute_fairness_metrics_batched(
+    spark_df,
+    pipeline,
+    feature_cols: List[str],
+    label_col: str,
+    subgroup_cols: List[str],
+    threshold: float,
+    split_name: str = "test",
+    sample_fraction: Optional[float] = None,
+    max_rows: Optional[int] = None,
+    seed: int = 42,
+):
+    """
+    Compute fairness metrics per subgroup using batched prediction.
+
+    Args:
+        spark_df: Spark DataFrame
+        pipeline: Trained pipeline
+        feature_cols: Feature column names
+        label_col: Label column name
+        subgroup_cols: Columns to group by for fairness analysis
+        threshold: Classification threshold
+        split_name: Name of split (train/valid/test) for logging
+    """
+    from sklearn.metrics import roc_auc_score, average_precision_score, precision_score, recall_score, f1_score
+
+    # Optionally downsample to avoid driver OOM
+    spark_eval_df = _prepare_eval_df(
+        spark_df,
+        sample_fraction=sample_fraction,
+        max_rows=max_rows,
+        seed=seed,
+    )
+
+    # Get predictions
+    y_true, y_pred_proba = predict_in_batches(
+        pipeline, spark_eval_df, feature_cols, label_col
+    )
+    y_pred = (y_pred_proba >= threshold).astype(int)
+
+    # Convert subgroup columns to pandas for grouping
+    # IMPORTANT: Limit to same number of rows as predictions to avoid mismatch
+    cols_to_select = subgroup_cols + [label_col]
+    subgroup_df = spark_eval_df.select(cols_to_select).limit(len(y_true)).toPandas()
+
+    # Validate row count
+    if len(subgroup_df) != len(y_true):
+        logger.warning(f"Row count mismatch in fairness evaluation: "
+                      f"subgroup_df={len(subgroup_df)}, predictions={len(y_true)}")
+        # Truncate to match
+        min_len = min(len(subgroup_df), len(y_true))
+        subgroup_df = subgroup_df.iloc[:min_len]
+        y_true = y_true[:min_len]
+        y_pred_proba = y_pred_proba[:min_len]
+        y_pred = y_pred[:min_len]
+
+    subgroup_df["y_pred_proba"] = y_pred_proba
+    subgroup_df["y_pred"] = y_pred
+
+    # Overall metrics
+    overall_metrics = {
+        "auc": float(roc_auc_score(y_true, y_pred_proba)),
+        "auc_pr": float(average_precision_score(y_true, y_pred_proba)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "n_samples": len(y_true),
+        "n_positive": int(y_true.sum()),
+    }
+
+    # Log overall metrics
+    for metric_name, value in overall_metrics.items():
+        mlflow.log_metric(f"{split_name}_overall_{metric_name}", value)
+
+    # Compute per-subgroup metrics
+    for col in subgroup_cols:
+        if col not in subgroup_df.columns:
+            logger.warning(f"Column {col} not in DataFrame, skipping fairness analysis")
+            continue
+
+        for group_value in subgroup_df[col].unique():
+            # Skip NaN
+            if pd.isna(group_value):
+                continue
+
+            # Filter to subgroup
+            mask = subgroup_df[col] == group_value
+            group_size = mask.sum()
+
+            if group_size < 100:  # Skip very small groups
+                continue
+
+            y_true_group = subgroup_df.loc[mask, label_col].values
+            y_pred_proba_group = subgroup_df.loc[mask, "y_pred_proba"].values
+            y_pred_group = subgroup_df.loc[mask, "y_pred"].values
+
+            # Compute metrics
+            try:
+                group_metrics = {
+                    "auc": float(roc_auc_score(y_true_group, y_pred_proba_group)),
+                    "auc_pr": float(average_precision_score(y_true_group, y_pred_proba_group)),
+                    "precision": float(precision_score(y_true_group, y_pred_group, zero_division=0)),
+                    "recall": float(recall_score(y_true_group, y_pred_group, zero_division=0)),
+                    "f1": float(f1_score(y_true_group, y_pred_group, zero_division=0)),
+                    "n_samples": int(group_size),
+                    "n_positive": int(y_true_group.sum()),
+                    "positive_rate": float(y_true_group.mean()),
+                }
+
+                # Log to MLflow with hierarchical naming
+                for metric_name, value in group_metrics.items():
+                    # Clean group_value for MLflow (remove special chars)
+                    clean_group = str(group_value).replace("/", "_").replace(" ", "_")
+                    mlflow.log_metric(f"{split_name}_fairness/{col}/{clean_group}/{metric_name}", value)
+
+                # Print summary for top groups
+                if group_size > 1000:  # Only print larger groups
+                    print(f"   {col}={group_value}: AUC={group_metrics['auc']:.4f}, "
+                          f"F1={group_metrics['f1']:.4f}, n={group_size:,}")
+
+            except Exception as e:
+                logger.warning(f"Failed to compute metrics for {col}={group_value}: {e}")
+                continue
+
+    return overall_metrics
+
+
 # =============================================================================
 # Data Preparation
 # =============================================================================
@@ -205,6 +333,22 @@ def add_inverse_prevalence_weights(
     )
     
     return df_weighted, {"n_pos": n_pos, "n_neg": n_neg, "pos_weight": pos_w}
+
+
+def _prepare_eval_df(
+    spark_df,
+    sample_fraction: Optional[float] = None,
+    max_rows: Optional[int] = None,
+    seed: int = 42,
+):
+    """Optionally downsample a Spark DataFrame for evaluation to avoid OOM."""
+    if sample_fraction:
+        return spark_df.sample(fraction=sample_fraction, seed=seed)
+    if max_rows:
+        total_rows = spark_df.count()
+        if total_rows > max_rows:
+            return spark_df.sample(fraction=max_rows / total_rows, seed=seed)
+    return spark_df
 
 
 def predict_in_batches(
@@ -283,7 +427,7 @@ def predict_in_batches(
 
         # Transform using fitted preprocessor (CRITICAL!)
         preprocess_start = time.time()
-        if pipeline.config.categorical_encoding == "native":
+        if pipeline.config.backend == BackendType.XGBOOST:
             X_transformed = pipeline.preprocessor_.transform(batch_X[feature_cols])
         else:
             X_transformed = pipeline.preprocessor_.transform(batch_X[feature_cols].values)
@@ -339,6 +483,18 @@ def predict_in_batches(
 
     total_time = time.time() - start_time
     print(f"✅ Complete! Predicted {len(y_true):,} rows in {total_time:.1f}s")
+
+    # Validate row count
+    if len(y_true) != total_rows:
+        rows_lost = total_rows - len(y_true)
+        pct_lost = (rows_lost / total_rows) * 100
+        print(f"⚠️  WARNING: Row count mismatch!")
+        print(f"   Expected: {total_rows:,} rows")
+        print(f"   Got:      {len(y_true):,} rows")
+        print(f"   Lost:     {rows_lost:,} rows ({pct_lost:.2f}%)")
+        if pct_lost > 1.0:
+            logger.error(f"More than 1% of rows lost during prediction! This may indicate a data processing issue.")
+
     print(f"   📈 Throughput: {len(y_true)/total_time:,.0f} rows/s")
     print(f"   ⏱️  Breakdown:")
     print(f"      • Preprocessing: {total_preprocess_time:.1f}s ({total_preprocess_time/total_time*100:.1f}%)")
@@ -466,10 +622,12 @@ def run_experiments(
     persist_features: bool = True,
     cache_clean_df: bool = False,
     fit= True,
+    enable_hyperparameter_tuning: bool = False,
+    n_tuning_trials: int = 50,
 ) -> List[Dict[str, Any]]:
     """
     Run ML experiments across multiple backends.
-    
+
     Args:
         df: Input Spark DataFrame
         experiment_name: MLflow experiment name
@@ -478,7 +636,10 @@ def run_experiments(
         override_params_list: List of parameter override dicts for hyperparameter search
         persist_features: Cache transformed features
         cache_clean_df: Cache cleaned DataFrame
-    
+        fit: Whether to fit model (True) or just prepare data (False)
+        enable_hyperparameter_tuning: Enable Optuna hyperparameter tuning (XGBoost only)
+        n_tuning_trials: Number of Optuna trials (default: 50)
+
     Returns:
         List of result dictionaries with metrics for each run
     """
@@ -536,9 +697,100 @@ def run_experiments(
             )
             samp_info.update(w_info)
         
+        # Hyperparameter tuning (if enabled)
+        tuning_results = None
+        if enable_hyperparameter_tuning and backend == BackendType.XGBOOST:
+            logger.info(f"\n{'='*80}")
+            logger.info("HYPERPARAMETER TUNING")
+            logger.info(f"{'='*80}")
+            logger.info(f"Running {n_tuning_trials} trials on sampled data...")
+
+            # Convert Spark DataFrames to numpy for efficient tuning
+            # This avoids loading from Spark 50 times
+            # Use reasonable sample for tuning (max 500k rows for training)
+            logger.info("Converting data to numpy for tuning...")
+
+            # Check train size and sample if needed
+            train_count = train_df_sampled.count()
+            logger.info(f"  Train set size: {train_count:,} rows")
+
+            if train_count > 500_000:
+                # Sample to max 500k for tuning (sufficient for finding good params)
+                train_sample_frac = 500_000 / train_count
+                logger.info(f"  Sampling {train_sample_frac:.2%} for tuning ({500_000:,} rows)")
+                X_train_tune, y_train_tune, _ = spark_to_numpy(
+                    train_df_sampled,
+                    feature_cols,
+                    label_col,
+                    limit_rows=None,
+                    sample_fraction=train_sample_frac,
+                )
+            else:
+                # Use all sampled data if it's already small enough
+                X_train_tune, y_train_tune, _ = spark_to_numpy(
+                    train_df_sampled,
+                    feature_cols,
+                    label_col,
+                    limit_rows=train_count,
+                    sample_fraction=None,
+                )
+
+            # Sample validation set for tuning (max 100k for speed)
+            val_count = valid_df.count()
+            logger.info(f"  Validation set size: {val_count:,} rows")
+
+            if val_count > 100_000:
+                val_sample_frac = 100_000 / val_count
+                logger.info(f"  Sampling {val_sample_frac:.2%} for tuning ({100_000:,} rows)")
+                X_val_tune, y_val_tune, _ = spark_to_numpy(
+                    valid_df,
+                    feature_cols,
+                    label_col,
+                    limit_rows=None,
+                    sample_fraction=val_sample_frac,
+                )
+            else:
+                X_val_tune, y_val_tune, _ = spark_to_numpy(
+                    valid_df,
+                    feature_cols,
+                    label_col,
+                    limit_rows=val_count,
+                    sample_fraction=None,
+                )
+
+            logger.info(f"  Training samples: {len(y_train_tune):,}")
+            logger.info(f"  Validation samples: {len(y_val_tune):,}")
+
+            from src.tuning import quick_tune
+
+            tuning_results, _ = quick_tune(
+                train_data=(X_train_tune, y_train_tune),  # Pass as numpy tuple
+                val_data=(X_val_tune, y_val_tune),        # Pass as numpy tuple
+                feature_cols=feature_cols,
+                categorical_cols=data_cfg.get('cat_cols', []),
+                numerical_cols=data_cfg.get('num_cols', []),
+                label_col=label_col,
+                n_trials=n_tuning_trials,
+                device=model_cfg.get("device", {}).get("type", "auto"),
+                objective_metric="auc_pr",  # Use AUC-PR for imbalanced migration data
+            )
+
+            logger.info(f"\nTuning complete! Best AUC: {tuning_results['best_value']:.4f}")
+            logger.info(f"Best parameters: {tuning_results['best_params']}")
+
+            # Clean up tuning data
+            del X_train_tune, y_train_tune, X_val_tune, y_val_tune
+            import gc
+            gc.collect()
+
+            # Override model params with tuned values
+            if not override_params_list:
+                override_params_list = [tuning_results['best_params']]
+                param_sets = override_params_list
+
         # Run for each parameter override
         rn_base = run_name_from_cfg(data_yaml, model_yaml, data_cfg, model_cfg)
-        
+
         for overrides in param_sets:
             # Merge overrides into model config
             run_model_cfg = copy.deepcopy(model_cfg)
@@ -548,6 +800,9 @@ def run_experiments(
             # Create pipeline
             pipeline_config = PipelineConfig.from_dict(run_model_cfg)
             pipeline_config.label_col = label_col
+            pipeline_config.cat_cols = data_cfg.get('cat_cols'  , [])
+            pipeline_config.num_cols = data_cfg.get('num_cols'  , [])
+            print(pipeline_config.cat_cols)
             pipeline = UnifiedPipeline(pipeline_config)
             
             # Prepare data based on backend
@@ -597,10 +852,11 @@ def run_experiments(
                 print(train_df_sampled.columns)
                 # PyTorch/XGBoost need numpy arrays
                 # Training set: can use sampling since we're just training
-                X_train, y_train, w_train = spark_to_numpy(
-                    train_df_sampled, feature_cols, label_col,
-                    model_cfg.get("weight_col"),  sample_fraction= 0.1
-                )
+                if(fit ==False):
+                    X_train, y_train, w_train = spark_to_numpy(
+                        train_df_sampled, feature_cols, label_col,
+                        model_cfg.get("weight_col"),  sample_fraction= 0.1
+                    )
 
                 # Validation set for training monitoring and threshold tuning (use sample)
                 eval_set = None
@@ -624,10 +880,11 @@ def run_experiments(
                 else:
 
                     train_result = pipeline.fit(
-                        train_data = train_df_sampled,  # <-- TOEVOEGEN
+                        train_data = train_df_sampled,
                         feature_cols =feature_cols,
-                        eval_data=eval_set[0] if eval_set else None,
-                        sample_weight=w_train,
+                        eval_data=valid_df if valid_df is not None else None,
+                        sample_weight=1 if model_cfg.get("weight_col") else None,
+                        use_batches=True, 
                         )
 
                 # Threshold tuning on validation sample (sufficient for threshold selection)
@@ -656,16 +913,35 @@ def run_experiments(
                 print('📊 EVALUATION PHASE')
                 print(f"{'='*60}\n")
 
+                eval_cfg = run_model_cfg.get("evaluation", {})
+                eval_sample_fraction = eval_cfg.get("sample_fraction")
+                eval_max_rows = eval_cfg.get("max_rows")
+                eval_seed = eval_cfg.get("seed", 42)
+
                 # Train metrics (on sample is fine)
                 print('📋 Train set (sample)...')
-                pred_train = pipeline.predict_proba((X_train, None))
-                train_metrics = _numpy_binary_metrics(y_train, pred_train.probabilities, threshold=optimal_threshold)
+                train_eval_df = _prepare_eval_df(
+                    train_df_sampled,
+                    sample_fraction=eval_sample_fraction,
+                    max_rows=eval_max_rows,
+                    seed=eval_seed,
+                )
+                y_train_eval, pred_train = predict_in_batches(
+                    pipeline, train_eval_df, feature_cols, label_col
+                )
+                train_metrics = _numpy_binary_metrics(y_train_eval, pred_train, threshold=optimal_threshold)
                 print(f"   ✓ Train metrics: AUC={train_metrics['auc_roc']:.4f}, F1={train_metrics['f1']:.4f}\n")
 
                 # Test metrics (FULL dataset with batches - NO SAMPLING)
-                print('📋 Test set (FULL dataset with batched evaluation)...')
+                print('📋 Test set (batched evaluation)...')
+                test_eval_df = _prepare_eval_df(
+                    test_df,
+                    sample_fraction=eval_sample_fraction,
+                    max_rows=eval_max_rows,
+                    seed=eval_seed,
+                )
                 y_test, pred_test = predict_in_batches(
-                    pipeline, test_df, feature_cols, label_col
+                    pipeline, test_eval_df, feature_cols, label_col
                 )
                 test_metrics = _numpy_binary_metrics(y_test, pred_test, threshold=optimal_threshold)
                 print(f"   ✓ Test metrics: AUC={test_metrics['auc_roc']:.4f}, F1={test_metrics['f1']:.4f}\n")
@@ -673,9 +949,15 @@ def run_experiments(
                 # Validation metrics (FULL dataset with batches - NO SAMPLING)
                 valid_metrics = None
                 if valid_df is not None:
-                    print('📋 Validation set (FULL dataset with batched evaluation)...')
+                    print('📋 Validation set (batched evaluation)...')
+                    valid_eval_df = _prepare_eval_df(
+                        valid_df,
+                        sample_fraction=eval_sample_fraction,
+                        max_rows=eval_max_rows,
+                        seed=eval_seed,
+                    )
                     y_val, pred_val = predict_in_batches(
-                        pipeline, valid_df, feature_cols, label_col
+                        pipeline, valid_eval_df, feature_cols, label_col
                     )
                     valid_metrics = _numpy_binary_metrics(y_val, pred_val, threshold=optimal_threshold)
                     print(f"   ✓ Valid metrics: AUC={valid_metrics['auc_roc']:.4f}, F1={valid_metrics['f1']:.4f}\n")
@@ -694,6 +976,14 @@ def run_experiments(
                 mlflow.log_param("device", pipeline.device_config.device_type.value)
                 mlflow.log_param("threshold", optimal_threshold)
                 mlflow.log_param("threshold_tuned", threshold_config.get("enabled", False))
+                mlflow.log_param("hyperparameter_tuned", enable_hyperparameter_tuning)
+
+                # Log tuning results if available
+                if tuning_results:
+                    mlflow.log_param("n_tuning_trials", n_tuning_trials)
+                    mlflow.log_metric("tuning_best_auc", tuning_results['best_value'])
+                    for param_name, param_value in tuning_results['best_params'].items():
+                        mlflow.log_param(f"tuned_{param_name}", param_value)
 
                 for k, v in samp_info.items():
                     mlflow.log_param(f"sampling_{k}", str(v))
@@ -710,7 +1000,51 @@ def run_experiments(
                 if valid_metrics:
                     for k, v in valid_metrics.items():
                         mlflow.log_metric(f"valid_{k}", v)
-            
+
+                # Fairness evaluation per subgroup
+                fairness_config = run_model_cfg.get("fairness_evaluation", {})
+                if fairness_config.get("enabled", False):
+                    subgroup_cols = fairness_config.get("subgroup_cols", [])
+                    if subgroup_cols:
+                        print(f"\n{'='*60}")
+                        print('⚖️  FAIRNESS EVALUATION')
+                        print(f"{'='*60}\n")
+                        print(f"Analyzing fairness across: {', '.join(subgroup_cols)}")
+                        fairness_sample_fraction = fairness_config.get("sample_fraction")
+                        fairness_max_rows = fairness_config.get("max_rows")
+                        fairness_seed = fairness_config.get("seed", 42)
+
+                        # Compute fairness metrics on test set
+                        fairness_results = _compute_fairness_metrics_batched(
+                            spark_df=test_df,
+                            pipeline=pipeline,
+                            feature_cols=feature_cols,
+                            label_col=label_col,
+                            subgroup_cols=subgroup_cols,
+                            threshold=optimal_threshold,
+                            split_name="test",
+                            sample_fraction=fairness_sample_fraction,
+                            max_rows=fairness_max_rows,
+                            seed=fairness_seed,
+                        )
+
+                        # Also on validation if available
+                        if valid_df is not None:
+                            _compute_fairness_metrics_batched(
+                                spark_df=valid_df,
+                                pipeline=pipeline,
+                                feature_cols=feature_cols,
+                                label_col=label_col,
+                                subgroup_cols=subgroup_cols,
+                                threshold=optimal_threshold,
+                                split_name="valid",
+                                sample_fraction=fairness_sample_fraction,
+                                max_rows=fairness_max_rows,
+                                seed=fairness_seed,
+                            )
+
+                        print(f"\n   ✓ Fairness metrics logged to MLflow")
+
             # Collect results
             result = {
                 "run_name": rn,
@@ -728,7 +1062,7 @@ def run_experiments(
             
             logger.info(f"Completed: {rn} | test_auc_roc={test_metrics['auc_roc']:.4f}")
     
-    return results, pipeline, feature_cols
+    return results, pipeline, feature_cols, train_df_sampled, valid_df, test_df
 
 
 # =============================================================================

@@ -1,0 +1,43 @@
+# Simplified XGBoost for when you have many features but limited data
+
+backend: xgboost
+label_col: y_moved
+
+model:
+  type: XGBClassifier
+
+  params:
+    # Simpler trees
+    booster: gbtree
+    max_depth: 4              # Shallower trees
+    min_child_weight: 10      # More conservative splits
+
+    # Stronger regularization
+    reg_alpha: 1.0            # L1 (feature selection)
+    reg_lambda: 10.0          # L2 (prevent overfitting)
+    gamma: 5.0                # Minimum loss reduction
+
+    # More aggressive sampling (reduce overfitting)
+    subsample: 0.6
+    colsample_bytree: 0.5     # Use only 50% of features per tree
+    colsample_bylevel: 0.6
+
+    # Learning
+    learning_rate: 0.05
+    n_estimators: 200         # Fewer trees
+    early_stopping_rounds: 20
+
+    # Class imbalance
+    scale_pos_weight: 15
+    max_delta_step: 1
+
+    # Hardware
+    tree_method: hist
+    device: cuda
+    objective: binary:logistic
+    eval_metric: aucpr
+
+    # Reproducibility
+    seed: 42
+    random_state: 42
+    verbose_eval: 10

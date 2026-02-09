@@ -21,6 +21,7 @@ class BackendType(Enum):
     SPARK = "spark"
     PYTORCH = "pytorch"
     XGBOOST = "xgboost"
+    SKLEARN = "sklearn"
 
 
 @dataclass

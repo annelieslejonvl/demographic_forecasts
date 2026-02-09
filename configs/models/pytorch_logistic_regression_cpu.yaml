@@ -1,0 +1,42 @@
+# PyTorch Logistic Regression - CPU Mode
+# Simple linear baseline without GPU dependencies
+
+backend: pytorch
+model_type: logistic_regression
+
+# Device configuration - FORCE CPU
+device:
+  type: cpu
+  gpu_id: null
+
+# Preprocessing
+scaling:
+  enabled: true
+  type: standard
+
+# Categorical encoding
+categorical:
+  encoding: label
+
+dim_reduction:
+  enabled: false
+
+# Model parameters
+model:
+  type: logistic_regression
+  params:
+    learning_rate: 0.01
+    weight_decay: 0.01
+    epochs: 20
+    batch_size: 1024
+    early_stopping_patience: 10
+    use_amp: false
+
+# Threshold tuning
+threshold_tuning:
+  enabled: true
+  strategy: f1
+  beta: 1.0
+
+# Column configuration
+label_col: y_moved

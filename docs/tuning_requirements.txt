@@ -1,0 +1,16 @@
+# Additional requirements for hyperparameter tuning
+
+# Core optimization
+optuna>=3.0.0
+
+# Visualization (optional but recommended)
+plotly>=5.0.0
+
+# For saving study results
+joblib>=1.0.0
+
+# Already required by main project:
+# xgboost>=2.0.0
+# scikit-learn>=1.0.0
+# numpy
+# pandas

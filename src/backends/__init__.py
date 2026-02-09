@@ -25,7 +25,7 @@ def initialize_backends():
     except ImportError as e:
         import logging
         logging.getLogger(__name__).warning(f"PyTorch backend not available: {e}")
-    
+
     # XGBoost
     try:
         from .xgboost.estimators import register_xgboost_backend
@@ -33,7 +33,15 @@ def initialize_backends():
     except ImportError as e:
         import logging
         logging.getLogger(__name__).warning(f"XGBoost backend not available: {e}")
-    
+
+    # Sklearn/cuML
+    try:
+        from .sklearn.estimators import register_sklearn_backend
+        register_sklearn_backend()
+    except ImportError as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Sklearn backend not available: {e}")
+
     # Spark
     try:
         from .spark.estimators import register_spark_backend

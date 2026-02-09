@@ -149,11 +149,18 @@ class XGBoostPreprocessor(BasePreprocessor):
             for col in self.categorical_cols:
                 if col not in df.columns:
                     continue
+
+                # Convert to string first to ensure XGBoost compatibility
+                # XGBoost requires categorical columns to be string or int, not float/bool
                 col_data = df[col].fillna("__missing__").astype(str)
+
+                # Get unique categories as strings
                 categories = list(pd.Series(col_data).unique())
                 if "__missing__" not in categories:
                     categories.append("__missing__")
+
                 self.categorical_categories_[col] = categories
+
         else:
             for col in self.categorical_cols:
                 if col not in df.columns:
@@ -162,7 +169,11 @@ class XGBoostPreprocessor(BasePreprocessor):
                     encoder = LabelEncoder()
                     # Handle missing values before encoding
                     col_data = df[col].fillna("__missing__").astype(str)
-                    encoder.fit(col_data)
+                    # Ensure "__missing__" is always in classes even if no NaN in training
+                    unique_values = list(col_data.unique())
+                    if "__missing__" not in unique_values:
+                        unique_values.append("__missing__")
+                    encoder.fit(unique_values)
                     self.encoders_[col] = encoder
                 elif self.categorical_encoding == "onehot":
                     encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
@@ -205,23 +216,37 @@ class XGBoostPreprocessor(BasePreprocessor):
             result_df = df.copy()
 
             if self.numeric_cols:
+                # Convert columns to float32 first to avoid dtype warning
+                for col in self.numeric_cols:
+                    if col in result_df.columns:
+                        result_df[col] = result_df[col].astype(np.float32)
+
                 numeric_data = result_df[self.numeric_cols].values.astype(np.float32)
                 if self.imputer_ is not None:
                     numeric_data = self.imputer_.transform(numeric_data)
                 if self.scaler_ is not None:
                     numeric_data = self.scaler_.transform(numeric_data)
-                result_df.loc[:, self.numeric_cols] = numeric_data.astype(np.float32)
 
+                # Now safe to assign - columns are already float32
+                result_df.loc[:, self.numeric_cols] = numeric_data
             for col in self.categorical_cols:
                 if col not in result_df.columns:
                     continue
+
+                # Convert to string first to avoid XGBoost floating point dtype error
+                # Fill NaN with placeholder before converting to string
                 col_data = result_df[col].fillna("__missing__").astype(str)
-                categories = self.categorical_categories_.get(col, ["__missing__"])
-                cat_dtype = pd.CategoricalDtype(categories=categories)
-                col_cat = pd.Series(pd.Categorical(col_data, dtype=cat_dtype))
-                if "__missing__" in categories:
-                    col_cat = col_cat.fillna("__missing__")
-                result_df[col] = col_cat
+
+                categories = self.categorical_categories_.get(col)
+                if categories is None:
+                    # fallback: infer from current data
+                    result_df[col] = col_data.astype("category")
+                    continue
+
+                # Create categorical with string categories
+                cat_dtype = pd.CategoricalDtype(categories=categories, ordered=False)
+                result_df[col] = pd.Categorical(col_data, dtype=cat_dtype)
+
 
             return result_df
 
@@ -322,7 +347,7 @@ class XGBoostClassifier(BaseEstimator):
     # Default parameters for binary classification
     DEFAULT_PARAMS = {
         "objective": "binary:logistic",
-        "eval_metric": ["logloss", "auc"],
+        "eval_metric": ["logloss", "auc", "aucpr"],  # Include AUC-PR for imbalanced data
         "max_depth": 6,
         "learning_rate": 0.1,
         "n_estimators": 100,

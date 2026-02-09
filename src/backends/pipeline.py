@@ -48,6 +48,8 @@ class PipelineConfig:
     label_col: str = "label"
     features_col: str = "features"
     weight_col: Optional[str] = None
+    cat_cols: Optional[List[str]] = None
+    num_cols : Optional[List[str]] = None
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "PipelineConfig":
@@ -65,6 +67,8 @@ class PipelineConfig:
             label_col=d.get("label_col", "label"),
             features_col=d.get("features_col", "features"),
             weight_col=d.get("weight_col"),
+            cat_cols=d.get("cat_cols"),
+            num_cols=d.get("num_cols"),
         )
     
     def to_dict(self) -> Dict[str, Any]:
@@ -90,6 +94,8 @@ class PipelineConfig:
             "label_col": self.label_col,
             "features_col": self.features_col,
             "weight_col": self.weight_col,
+            'cat_cols': self.cat_cols,
+            'num_cols': self.num_cols,
         }
 
 
@@ -117,6 +123,8 @@ class UnifiedPipeline:
         self.preprocessor_: Optional[BasePreprocessor] = None
         self.estimator_: Optional[BaseEstimator] = None
         self.feature_cols_: Optional[List[str]] = None
+        self.num_cols: Optional[List[str]] = getattr(self.config, 'num_cols') if hasattr(self.config, 'num_cols') else []
+        self.cat_cols: Optional[List[str]] = getattr(self.config, 'cat_cols')  if hasattr(self.config, 'cat_cols') else []
         self._is_fitted = False
     
     @property
@@ -151,6 +159,8 @@ class UnifiedPipeline:
                 scaling="none",  # XGBoost typically doesn't need scaling
                 handle_missing="keep",
                 categorical_encoding=self.config.categorical_encoding,
+                categorical_cols=self.cat_cols,
+                numeric_cols=self.num_cols,
             )
     
     def _create_estimator(self) -> BaseEstimator:
@@ -233,7 +243,8 @@ class UnifiedPipeline:
                 print(f"Loaded {len(pdf):,} rows, {len(cols_to_select)} cols, "
                     f"~{pdf.memory_usage(deep=True).sum() / 1e6:.1f} MB")
                 
-                if self.config.backend == BackendType.XGBOOST and self.config.categorical_encoding == "native":
+                if self.config.backend == BackendType.XGBOOST:
+                    # Keep pandas DataFrame for XGBoost preprocessing/feature handling
                     X = pdf[feature_cols]
                 else:
                     X = pdf[feature_cols].values
@@ -245,7 +256,17 @@ class UnifiedPipeline:
                 print('Creating preprocessor')
                 self.preprocessor_ = self._create_preprocessor()
                 print('Fitting and transforming data')
-                X = self.preprocessor_.fit_transform(X, label_col, feature_cols)
+                if self.config.backend == BackendType.XGBOOST:
+                    X_input = X[feature_cols] if hasattr(X, "columns") else X
+                    X = self.preprocessor_.fit_transform(
+                        X_input,
+                        label_col,
+                        feature_cols=feature_cols,
+                        numeric_cols=self.num_cols,
+                        categorical_cols=self.cat_cols,
+                    )
+                else:
+                    X = self.preprocessor_.fit_transform(X, label_col, feature_cols)
             else:
                 X = self.preprocessor_.transform(X)
             
@@ -258,7 +279,8 @@ class UnifiedPipeline:
         feature_cols: List[str] = None,
         sample_weight=None,
         use_batches: bool = None,  # Auto-detect
-        batch_size: int = None,  # Auto-detect based on device
+        batch_size: int = None, 
+         # Auto-detect based on device
     ):
         """Fit the model."""
 
@@ -375,11 +397,18 @@ class UnifiedPipeline:
         first_batch_X, first_batch_y = next(sample_iter)
 
         self.preprocessor_ = self._create_preprocessor()
-        if self.config.backend == BackendType.XGBOOST and self.config.categorical_encoding == "native":
+        if self.config.backend == BackendType.XGBOOST:
             X_sample = first_batch_X[feature_cols]
+            self.preprocessor_.fit(
+                X_sample,
+                self.config.label_col,
+                feature_cols,
+                categorical_cols=self.cat_cols,
+                numeric_cols=self.num_cols,
+            )
         else:
             X_sample = first_batch_X[feature_cols].values
-        self.preprocessor_.fit(X_sample, self.config.label_col, feature_cols)
+            self.preprocessor_.fit(X_sample, self.config.label_col, feature_cols)
 
         # Prepare eval set if provided
         eval_set = None
@@ -392,6 +421,10 @@ class UnifiedPipeline:
 
         if self.config.backend == BackendType.XGBOOST:
             self._fit_xgboost_incremental(
+                train_data, feature_cols, label_col, batch_size, eval_set
+            )
+        elif self.config.backend == BackendType.SKLEARN:
+            self._fit_sklearn_incremental(
                 train_data, feature_cols, label_col, batch_size, eval_set
             )
         else:
@@ -444,7 +477,7 @@ class UnifiedPipeline:
         total_samples = 0
         for i, (batch_X, batch_y) in enumerate(batch_iter):
             # Transform batch
-            if self.config.categorical_encoding == "native":
+            if self.config.backend == BackendType.XGBOOST:
                 X_batch = self.preprocessor_.transform(batch_X[feature_cols])
             else:
                 X_batch = self.preprocessor_.transform(batch_X[feature_cols].values)
@@ -474,7 +507,7 @@ class UnifiedPipeline:
             print("\nFinal GPU status:")
             print_gpu_usage(gpu_id, "  ")
 
-    def _fit_pytorch_batched(
+    def _fit_sklearn_incremental(
         self,
         train_data,
         feature_cols: List[str],
@@ -482,13 +515,16 @@ class UnifiedPipeline:
         batch_size: int,
         eval_set: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
     ):
-        """Batch training for PyTorch - collect and train with DataLoader."""
+        """Incremental training for sklearn using SGDClassifier."""
         from ..data.utils import create_batch_iterator_simple as create_batch_iterator
 
-        print(f"Step 2: Collecting batches for PyTorch training...")
-
-        X_batches = []
-        y_batches = []
+        print(f"\n{'='*60}")
+        print(f"Sklearn Incremental Training Configuration")
+        print(f"{'='*60}")
+        print(f"Backend: sklearn (CPU)")
+        print(f"Batch size: {batch_size:,} samples")
+        print(f"Algorithm: Stochastic Gradient Descent")
+        print(f"{'='*60}\n")
 
         batch_iter = create_batch_iterator(
             train_data,
@@ -497,20 +533,95 @@ class UnifiedPipeline:
             label_col=label_col,
         )
 
+        total_samples = 0
         for i, (batch_X, batch_y) in enumerate(batch_iter):
-            X_processed = self.preprocessor_.transform(batch_X[feature_cols].values)
-            X_batches.append(X_processed)
-            y_batches.append(batch_y.values)
+            # Transform batch
+            X_batch = self.preprocessor_.transform(batch_X[feature_cols].values)
+            y_batch = batch_y.values
+            total_samples += len(y_batch)
 
+            # Train incrementally
+            is_first_batch = (i == 0)
+            self.estimator_.fit_incremental(
+                X_batch,
+                y_batch,
+                eval_set=eval_set if is_first_batch else None,
+                feature_names=feature_cols,
+                reset=is_first_batch,
+            )
+
+            # Show progress
             if (i + 1) % 10 == 0:
-                mem = sum(x.nbytes for x in X_batches) / 1e9
-                print(f"  Collected {(i+1)*batch_size:,} rows (~{mem:.2f} GB)")
+                print(f"  Batch {i+1}: trained on {len(y_batch):,} samples "
+                      f"(total: {total_samples:,})")
 
-        X_train = np.vstack(X_batches)
-        y_train = np.concatenate(y_batches)
+        print(f"\nStep 3: Training complete. Total samples: {total_samples:,}")
 
-        print(f"Step 3: Training PyTorch model on {len(X_train):,} samples...")
-        self.estimator_.fit(X_train, y_train, eval_set=eval_set)
+    def _fit_pytorch_batched(
+        self,
+        train_data,
+        feature_cols: List[str],
+        label_col: str,
+        batch_size: int,
+        eval_set: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None,
+    ):
+        """
+        Batch training for PyTorch using incremental Spark loading.
+
+        For logistic regression: uses fit_incremental_spark to train directly from Spark.
+        For MLP: still collects batches (neural networks need multiple passes).
+        """
+
+        # Check if estimator supports incremental Spark training
+        if hasattr(self.estimator_, 'fit_incremental_spark'):
+            print(f"Step 2: Training PyTorch model incrementally from Spark...")
+            print(f"         Chunk size: {batch_size:,} rows")
+            print(f"         This avoids loading all data into RAM!")
+
+            # Use incremental training directly from Spark
+            # Preprocessor is already fitted on sample batch
+            self.estimator_.fit_incremental_spark(
+                spark_df=train_data,
+                label_col=label_col,
+                feature_cols=feature_cols,
+                preprocessor=self.preprocessor_,  # Pass fitted preprocessor
+                chunk_size=batch_size,
+                eval_spark_df=None,  # TODO: handle eval set for incremental
+            )
+
+            print(f"✓ Incremental training complete!")
+
+        else:
+            # Fallback: MLP or other models that need all data
+            print(f"Step 2: Collecting batches for PyTorch training...")
+            print(f"         (Model doesn't support incremental training)")
+
+            from ..data.utils import create_batch_iterator_simple as create_batch_iterator
+
+            X_batches = []
+            y_batches = []
+
+            batch_iter = create_batch_iterator(
+                train_data,
+                batch_size=batch_size,
+                feature_cols=feature_cols,
+                label_col=label_col,
+            )
+
+            for i, (batch_X, batch_y) in enumerate(batch_iter):
+                X_processed = self.preprocessor_.transform(batch_X[feature_cols].values)
+                X_batches.append(X_processed)
+                y_batches.append(batch_y.values)
+
+                if (i + 1) % 10 == 0:
+                    mem = sum(x.nbytes for x in X_batches) / 1e9
+                    print(f"  Collected {(i+1)*batch_size:,} rows (~{mem:.2f} GB)")
+
+            X_train = np.vstack(X_batches)
+            y_train = np.concatenate(y_batches)
+
+            print(f"Step 3: Training PyTorch model on {len(X_train):,} samples...")
+            self.estimator_.fit(X_train, y_train, eval_set=eval_set)
 
     
     def predict(self, data: Any) -> PredictResult:
@@ -620,7 +731,7 @@ class UnifiedPipeline:
 
             # Transform using fitted preprocessor
             preprocess_start = time.time()
-            if self.config.categorical_encoding == "native":
+            if self.config.backend == BackendType.XGBOOST:
                 X_transformed = self.preprocessor_.transform(batch_X[self.feature_cols_])
             else:
                 X_transformed = self.preprocessor_.transform(batch_X[self.feature_cols_].values)
