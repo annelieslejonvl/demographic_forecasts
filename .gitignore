@@ -10,3 +10,15 @@ mlflow.db
 demographic_forecasts.egg-info/SOURCES.txt
 *.png
 mlruns.db
+*.log
+checkpoints/
+*.md
+mlartifacts/
+notebooks/
+Shapefile/
+demographic_forecasts.egg-info/*
+*.ipynb
+examples/
+*.csv
+*.xlsx
+*.json

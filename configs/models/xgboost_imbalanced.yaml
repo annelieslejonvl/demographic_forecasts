@@ -1,0 +1,55 @@
+# XGBoost configuration optimized for IMBALANCED data
+# Use this when positive class is rare (5-10% of data)
+
+backend: xgboost
+label_col: y_moved
+
+model:
+  type: XGBClassifier
+
+  params:
+    # Tree structure
+    booster: gbtree
+    max_depth: 6
+    min_child_weight: 1
+
+    # Learning
+    learning_rate: 0.05
+    n_estimators: 500
+
+    # Regularization
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    gamma: 0.1
+    subsample: 0.8
+    colsample_bytree: 0.8
+
+    # Hardware
+    tree_method: hist
+    device: cuda
+
+    # Imbalanced data handling - KEY PARAMETERS!
+    scale_pos_weight: 13.3  # ratio of negative to positive (adjust based on your data)
+    max_delta_step: 1     # helps with extreme imbalance
+
+    # Objective
+    objective: binary:logistic
+    eval_metric: aucpr  # optimize for precision-recall
+
+    # Training
+    early_stopping_rounds: 30
+    random_state: 42
+    verbose_eval: 25
+
+# Explanation:
+# scale_pos_weight: Balances the positive and negative classes
+#   - If your data has 5% positive (move=1), set to ~19 (95/5)
+#   - If your data has 8% positive, set to ~11.5 (92/8)
+#   - If your data has 10% positive, set to ~9 (90/10)
+#
+# max_delta_step: Limits the max output margin change in each tree
+#   - Helps prevent overfitting on minority class
+#   - Values 1-5 work well for imbalanced data
+#
+# Higher max_depth (6 vs 5): Allows model to find complex patterns
+# Lower min_child_weight (1 vs 3): Allows smaller leaf nodes for rare patterns

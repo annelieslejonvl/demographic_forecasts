@@ -1,0 +1,67 @@
+# XGBoost Linear Model (acts like Logistic Regression)
+# Uses GPU, no RAPIDS needed
+
+backend: xgboost
+model_type: classifier
+
+# Device configuration
+device:
+  type: auto
+  gpu_id: null
+
+# Preprocessing
+scaling:
+  enabled: true
+  type: standard
+
+# Categorical encoding - gblinear only supports numeric
+categorical:
+  encoding: label
+
+dim_reduction:
+  enabled: false
+
+# Model parameters
+model:
+  type: classifier
+  params:
+    booster: gblinear
+    objective: binary:logistic
+    alpha: 1.28e-5
+    lambda: 1.24e-5
+    n_estimators: 400
+    learning_rate: 0.0718
+    device: cuda
+    eval_metric:
+      - logloss
+      - auc
+      - aucpr
+    early_stopping_rounds: 20
+    verbose_eval: 10
+    seed: 42
+    enable_categorical: false
+
+# Threshold tuning
+threshold_tuning:
+  enabled: true
+  strategy: f1
+  beta: 1.0
+
+# Fairness evaluation per demographic category
+fairness_evaluation:
+  enabled: true
+  subgroup_cols:
+    - eerste_nationaliteit
+    - year
+    - hh_pos
+    - income_quintile
+  sample_fraction: 0.01
+  seed: 42
+
+# Evaluation sampling to avoid driver OOM on very large datasets
+evaluation:
+  sample_fraction: 0.01
+  seed: 42
+
+# Column configuration
+label_col: y_moved

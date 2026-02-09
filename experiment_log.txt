@@ -1,0 +1,37 @@
+WARNING: Using incubator modules: jdk.incubator.vector
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+26/02/03 20:49:30 WARN Utils: Your hostname, mvdbussc-Legion-T7-34IMZ5, resolves to a loopback address: 127.0.1.1; using 192.168.1.38 instead (on interface wlo1)
+26/02/03 20:49:30 WARN Utils: Set SPARK_LOCAL_IP if you need to bind to another address
+Using Spark's default log4j profile: org/apache/spark/log4j2-defaults.properties
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/02/03 20:49:30 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+[Stage 5:>                                                        (0 + 16) / 18]                                                                                [Stage 11:>                                                       (0 + 16) / 18][Stage 11:===>                                                    (1 + 16) / 18][Stage 11:===============>                                        (5 + 13) / 18][Stage 11:====================================================>   (17 + 1) / 18][Stage 13:>                                                      (0 + 16) / 935][Stage 13:>                                                     (16 + 16) / 935][Stage 13:=>                                                    (18 + 16) / 935][Stage 13:=>                                                    (32 + 16) / 935][Stage 13:==>                                                   (44 + 16) / 935][Stage 13:===>                                                  (53 + 16) / 935][Stage 13:===>                                                  (67 + 17) / 935][Stage 13:=====>                                                (87 + 16) / 935][Stage 13:=====>                                               (105 + 16) / 935][Stage 13:======>                                              (122 + 16) / 935][Stage 13:=======>                                             (141 + 16) / 935][Stage 13:========>                                            (158 + 16) / 935][Stage 13:==========>                                          (179 + 16) / 935][Stage 13:===========>                                         (200 + 16) / 935][Stage 13:============>                                        (219 + 16) / 935][Stage 13:=============>                                       (240 + 17) / 935][Stage 13:===============>                                     (266 + 17) / 935][Stage 13:================>                                    (295 + 16) / 935][Stage 13:==================>                                  (326 + 16) / 935][Stage 13:====================>                                (357 + 16) / 935][Stage 13:======================>                              (389 + 16) / 935][Stage 13:=======================>                             (415 + 17) / 935][Stage 13:=========================>                           (448 + 16) / 935][Stage 13:===========================>                         (481 + 16) / 935][Stage 13:============================>                        (509 + 16) / 935][Stage 13:==============================>                      (537 + 17) / 935][Stage 13:================================>                    (569 + 16) / 935][Stage 13:==================================>                  (601 + 16) / 935][Stage 13:===================================>                 (633 + 16) / 935][Stage 13:=====================================>               (664 + 16) / 935][Stage 13:=======================================>             (696 + 16) / 935][Stage 13:=========================================>           (728 + 16) / 935][Stage 13:==========================================>          (756 + 17) / 935][Stage 13:============================================>        (790 + 16) / 935][Stage 13:==============================================>      (826 + 16) / 935][Stage 13:================================================>    (855 + 16) / 935][Stage 13:==================================================>  (890 + 16) / 935][Stage 13:====================================================>(925 + 10) / 935]                                                                                [Stage 17:=======================================>             (691 + 16) / 935]                                                                                [Stage 29:================================>                    (571 + 16) / 935][Stage 29:===============================================>     (832 + 16) / 935][Stage 31:>                                                       (0 + 16) / 17][Stage 31:=======================================>                (12 + 5) / 17]                                                                                2026/02/03 20:49:58 INFO alembic.runtime.plugins: setup plugin alembic.autogenerate.schemas
+2026/02/03 20:49:58 INFO alembic.runtime.plugins: setup plugin alembic.autogenerate.tables
+2026/02/03 20:49:58 INFO alembic.runtime.plugins: setup plugin alembic.autogenerate.types
+2026/02/03 20:49:58 INFO alembic.runtime.plugins: setup plugin alembic.autogenerate.constraints
+2026/02/03 20:49:58 INFO alembic.runtime.plugins: setup plugin alembic.autogenerate.defaults
+2026/02/03 20:49:58 INFO alembic.runtime.plugins: setup plugin alembic.autogenerate.comments
+2026/02/03 20:49:58 INFO mlflow.store.db.utils: Creating initial MLflow database tables...
+2026/02/03 20:49:58 INFO mlflow.store.db.utils: Updating database tables
+2026/02/03 20:49:58 INFO alembic.runtime.migration: Context impl SQLiteImpl.
+2026/02/03 20:49:58 INFO alembic.runtime.migration: Will assume non-transactional DDL.
+2026/02/03 20:49:58 INFO alembic.runtime.migration: Context impl SQLiteImpl.
+2026/02/03 20:49:58 INFO alembic.runtime.migration: Will assume non-transactional DDL.
+26/02/03 20:50:05 ERROR Utils: Aborting task
+java.net.SocketException: Connection reset
+	at java.base/sun.nio.ch.SocketChannelImpl.throwConnectionReset(SocketChannelImpl.java:401)
+	at java.base/sun.nio.ch.SocketChannelImpl.blockingRead(SocketChannelImpl.java:1349)
+	at java.base/sun.nio.ch.SocketInputStream.read(SocketInputStream.java:70)
+	at java.base/java.io.DataInputStream.readFully(DataInputStream.java:208)
+	at java.base/java.io.DataInputStream.readInt(DataInputStream.java:385)
+	at org.apache.spark.api.python.PythonRDD$.$anonfun$toLocalIteratorAndServe$2(PythonRDD.scala:257)
+	at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.scala:18)
+	at org.apache.spark.util.Utils$.tryWithSafeFinallyAndFailureCallbacks(Utils.scala:1337)
+	at org.apache.spark.api.python.PythonRDD$.$anonfun$toLocalIteratorAndServe$1(PythonRDD.scala:285)
+	at org.apache.spark.api.python.PythonRDD$.$anonfun$toLocalIteratorAndServe$1$adapted(PythonRDD.scala:236)
+	at org.apache.spark.security.SocketFuncServer.handleConnection(SocketAuthServer.scala:142)
+	at org.apache.spark.security.SocketFuncServer.handleConnection(SocketAuthServer.scala:136)
+	at org.apache.spark.security.SocketAuthServer$$anon$1.$anonfun$run$5(SocketAuthServer.scala:91)
+	at scala.util.Try$.apply(Try.scala:217)
+	at org.apache.spark.security.SocketAuthServer$$anon$1.run(SocketAuthServer.scala:91)

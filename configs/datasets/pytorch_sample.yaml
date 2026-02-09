@@ -1,0 +1,38 @@
+# Dataset Configuration for PyTorch
+# PyTorch needs in-memory data, so we use aggressive sampling
+
+# Key columns for deduplication and joining
+key_cols:
+  - sid
+  - year
+
+# Time-based split configuration
+split:
+  year_col: year
+  train_range: [2018, 2022]
+  valid_range: [2022, 2023]
+  test_range: [2023, 2025]
+
+# ==============================================================================
+# Tuning mode: Very aggressive sampling for fast iterations
+# ==============================================================================
+tune:
+  sampling:
+    type: random           # Random sampling
+    fraction: 0.01         # Use 1% of data (~885k rows)
+    seed: 42
+
+  hard_negatives:
+    enabled: false
+
+# ==============================================================================
+# Final mode: Still need sampling for PyTorch (in-memory limitation)
+# ==============================================================================
+final:
+  sampling:
+    type: random           # Random sampling
+    fraction: 0.1          # Use 10% of data (~8.85M rows)
+    seed: 42
+
+  hard_negatives:
+    enabled: false

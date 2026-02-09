@@ -30,8 +30,13 @@ LEAKY_PATTERNS = {
         'low_income_birth',
         'high_income_divorce',
         'low_income_divorce',
-        'family_break',
-        'constrained_young_family',
+        'family_break',  # LEAKY: uses current hh_pos which can change due to moving
+        'constrained_young_family',  # LEAKY: uses current hh_pos which can change due to moving
+    ],
+    'state_leaky': [
+        # These state variables can change as a result of the outcome (moving)
+        # and should always be lagged
+        'hh_pos',  # Household position can change when moving - use hh_pos_lag1 instead!
     ],
 }
 
@@ -39,7 +44,31 @@ LEAKY_PATTERNS = {
 SAFE_PATTERNS = {
     'lagged': ['_lag1', '_lag2', '_lag3'],
     'censored': ['_censored'],
-    'state': ['age', 'MS_ADI', 'coupled', 'eerste_nationaliteit', 'hh_pos'],
+    'state': ['age', 'MS_ADI', 'coupled', 'eerste_nationaliteit'],  # hh_pos removed - must be lagged!
+    'safe_derived': [
+        # These are safe versions of potentially leaky features
+        'family_break_safe',  # Uses hh_pos_lag1 instead of hh_pos
+        'constrained_young_family_safe',  # Uses hh_pos_lag1 instead of hh_pos
+        'hh_pos_changed',  # Derived from lagged values
+        'income_norm',
+        'income_quintile',
+        'recent_birth',
+        'new_family',
+        'family_expansion',
+        'recent_mover',
+        'frequent_mover',
+        'age_x_life_event',
+        'mobility_history',
+        'total_recent_events',
+        'multiple_events',
+        'coupled_x_birth',
+        'any_life_event_lag1',
+        'recent_move_x_life_event',
+        'age_norm',
+        'young_parent',
+        'older_parent',
+        'partnership_income',
+    ],
 }
 
 
@@ -74,6 +103,14 @@ def check_feature_leakage(feature: str) -> Dict[str, any]:
                 'reason': 'Cumulative history (safe)'
             }
 
+    # Check if it's a safe derived feature (must check before state!)
+    if feature in SAFE_PATTERNS['safe_derived']:
+        return {
+            'is_safe': True,
+            'category': 'safe_derived',
+            'reason': 'Safe derived feature (uses lagged values)'
+        }
+
     # Check if it's a state variable
     for pattern in SAFE_PATTERNS['state']:
         if pattern in feature:
@@ -82,6 +119,14 @@ def check_feature_leakage(feature: str) -> Dict[str, any]:
                 'category': 'state',
                 'reason': 'State variable (not event)'
             }
+
+    # Check for leaky state variables (must be lagged!)
+    if feature in LEAKY_PATTERNS['state_leaky']:
+        return {
+            'is_safe': False,
+            'category': 'state_leakage',
+            'reason': '⚠️  State variable that changes due to outcome - use lagged version!'
+        }
 
     # Check for known leaky event features
     if feature in LEAKY_PATTERNS['event']:
@@ -96,7 +141,7 @@ def check_feature_leakage(feature: str) -> Dict[str, any]:
         return {
             'is_safe': False,
             'category': 'interaction_leakage',
-            'reason': '⚠️  Interaction with year t event'
+            'reason': '⚠️  Interaction with year t event or state'
         }
 
     # Check if it contains 'event' but not a lag

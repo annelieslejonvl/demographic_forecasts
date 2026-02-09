@@ -1,0 +1,44 @@
+# Sklearn/cuML Logistic Regression Configuration
+# Automatically uses cuML (GPU) if available, otherwise sklearn (CPU)
+# Simple and memory efficient - works with large datasets
+
+backend: sklearn
+model_type: logistic_regression
+
+# Device configuration
+device:
+  type: auto
+  gpu_id: null
+
+# Preprocessing
+scaling:
+  enabled: true
+  type: standard
+
+# Categorical encoding
+categorical:
+  encoding: label
+
+dim_reduction:
+  enabled: false
+  k: 50
+
+# Model parameters
+model:
+  type: logistic_regression
+  params:
+    penalty: l2
+    C: 1.0
+    max_iter: 100
+    tol: 0.0001
+    solver: qn
+    random_state: 42
+
+# Threshold tuning
+threshold_tuning:
+  enabled: true
+  strategy: f1
+  beta: 1.0
+
+# Column configuration
+label_col: y_moved
