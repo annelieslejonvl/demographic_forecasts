@@ -768,7 +768,17 @@ def run_hyperparameter_tuning(parquet_path, total_rows, base_config=None, n_tria
     return best_model, final_metrics, study
 
 
-def main(reuse_processed=False, max_rows=None, config_path=None, tune=False, n_trials=50, feature_config_path=None):
+def main(
+    reuse_processed=False,
+    max_rows=None,
+    config_path=None,
+    tune=False,
+    n_trials=50,
+    feature_config_path=None,
+    rolling_importance=False,
+    rolling_importance_config: Optional[Dict[str, Any]] = None,
+    target_batch_rows=None,
+):
     """
     Main training pipeline.
 
@@ -822,12 +832,26 @@ def main(reuse_processed=False, max_rows=None, config_path=None, tune=False, n_t
 
         if use_incremental:
             print(f"  ✓ Using INCREMENTAL training")
-            model, metrics = train_incremental(output_path, total_rows, config, feature_config_path=feature_config_path)
+            model, metrics = train_incremental(
+                output_path,
+                total_rows,
+                config,
+                feature_config_path=feature_config_path,
+                target_batch_rows=target_batch_rows,
+                rolling_importance=rolling_importance,
+                rolling_importance_config=rolling_importance_config,
+            )
         else:
             print(f"  ✓ Using IN-MEMORY training")
             # Pandas can read Spark parquet directories directly
             df_pandas = pd.read_parquet(output_path)
-            model, metrics = train_in_memory(df_pandas, config, feature_config_path=feature_config_path)
+            model, metrics = train_in_memory(
+                df_pandas,
+                config,
+                feature_config_path=feature_config_path,
+                rolling_importance=rolling_importance,
+                rolling_importance_config=rolling_importance_config,
+            )
 
         return model, metrics
 
@@ -1022,7 +1046,15 @@ def main(reuse_processed=False, max_rows=None, config_path=None, tune=False, n_t
         print(f"  (This will take ~30-60 minutes)")
 
         use_incremental = True
-        model, metrics = train_incremental(output_path, total_rows, config, feature_config_path=feature_config_path)
+        model, metrics = train_incremental(
+            output_path,
+            total_rows,
+            config,
+            feature_config_path=feature_config_path,
+            target_batch_rows=target_batch_rows,
+            rolling_importance=rolling_importance,
+            rolling_importance_config=rolling_importance_config,
+        )
         return model, metrics
 
     elif total_rows > safe_in_memory_limit:
@@ -1043,7 +1075,13 @@ def main(reuse_processed=False, max_rows=None, config_path=None, tune=False, n_t
         print(f"✓ Loaded {len(df_pandas):,} rows as Pandas DataFrame")
 
     # Always use in-memory training (proven stable)
-    model, metrics = train_in_memory(df_pandas, config, feature_config_path=feature_config_path)
+    model, metrics = train_in_memory(
+        df_pandas,
+        config,
+        feature_config_path=feature_config_path,
+        rolling_importance=rolling_importance,
+        rolling_importance_config=rolling_importance_config,
+    )
 
     return model, metrics
 
@@ -1151,7 +1189,757 @@ def fix_dtypes(df_pandas, feature_cols, categorical_mappings=None):
     return df_pandas
 
 
-def train_in_memory(df_pandas, config: Optional[Dict[str, Any]] = None, feature_config_path: Optional[str] = None):
+def rolling_window_feature_importance(
+    df_pandas,
+    feature_cols,
+    model_params,
+    time_col="year",
+    label_col="y_moved",
+    train_years=8,
+    test_years=1,
+    step_years=1,
+    min_train_rows=20000,
+    min_test_rows=5000,
+    sample_fraction=None,
+    max_windows=None,
+    importance_types=None,
+    random_state=42,
+    output_dir=None,
+    stream_write=False,
+):
+    """
+    Train models on rolling time windows and aggregate feature importances.
+    """
+    from xgboost import XGBClassifier
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    import pandas as pd
+    import numpy as np
+    import os
+
+    if time_col not in df_pandas.columns:
+        print(f"⚠️  Rolling window importance skipped: no '{time_col}' column")
+        return None
+
+    years = sorted(df_pandas[time_col].dropna().unique())
+    window_span = train_years + test_years
+    if len(years) < window_span:
+        print("⚠️  Rolling window importance skipped: not enough years for window span")
+        return None
+
+    if importance_types is None:
+        importance_types = ["gain", "weight", "cover"]
+
+    importance_rows = []
+    metrics_rows = []
+    windows_run = 0
+    detail_path = None
+    metrics_path = None
+    detail_header_written = False
+    metrics_header_written = False
+    summary_stats = {}
+    trend_stats = {}
+
+    if stream_write and output_dir:
+        detail_path = os.path.join(output_dir, "feature_importance_rolling_detail.csv")
+        metrics_path = os.path.join(output_dir, "feature_importance_rolling_metrics.csv")
+
+    for window_index, start_idx in enumerate(range(0, len(years) - window_span + 1, step_years), start=1):
+        train_years_list = years[start_idx:start_idx + train_years]
+        test_years_list = years[start_idx + train_years:start_idx + window_span]
+
+        train_df = df_pandas[df_pandas[time_col].isin(train_years_list)]
+        test_df = df_pandas[df_pandas[time_col].isin(test_years_list)]
+
+        if sample_fraction and sample_fraction < 1.0:
+            train_df = train_df.sample(frac=sample_fraction, random_state=random_state)
+            test_df = test_df.sample(frac=sample_fraction, random_state=random_state)
+
+        if len(train_df) < min_train_rows or len(test_df) < min_test_rows:
+            continue
+
+        if train_df[label_col].nunique() < 2 or test_df[label_col].nunique() < 2:
+            continue
+
+        X_train = train_df[feature_cols]
+        y_train = train_df[label_col]
+        X_test = test_df[feature_cols]
+        y_test = test_df[label_col]
+
+        model = XGBClassifier(**model_params)
+        fit_kwargs = {"verbose": False}
+        if model_params.get("early_stopping_rounds"):
+            fit_kwargs["eval_set"] = [(X_test, y_test)]
+
+        model.fit(X_train, y_train, **fit_kwargs)
+
+        y_pred = model.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(y_test, y_pred)
+        auc_pr = average_precision_score(y_test, y_pred)
+
+        window_id = (
+            f"{train_years_list[0]}-{train_years_list[-1]}__"
+            f"{test_years_list[0]}-{test_years_list[-1]}"
+        )
+        metrics_row = {
+            "window_id": window_id,
+            "window_index": window_index,
+            "train_years": f"{train_years_list[0]}-{train_years_list[-1]}",
+            "test_years": f"{test_years_list[0]}-{test_years_list[-1]}",
+            "train_start_year": int(train_years_list[0]),
+            "train_end_year": int(train_years_list[-1]),
+            "test_start_year": int(test_years_list[0]),
+            "test_end_year": int(test_years_list[-1]),
+            "train_rows": len(train_df),
+            "test_rows": len(test_df),
+            "auc_roc": float(auc),
+            "auc_pr": float(auc_pr),
+        }
+        if stream_write and metrics_path:
+            pd.DataFrame([metrics_row]).to_csv(
+                metrics_path, mode="a", header=not metrics_header_written, index=False
+            )
+            metrics_header_written = True
+        else:
+            metrics_rows.append(metrics_row)
+
+        for imp_type in importance_types:
+            importance = model.get_booster().get_score(importance_type=imp_type)
+            for feature in feature_cols:
+                importance_value = float(importance.get(feature, 0.0))
+                detail_row = {
+                    "window_id": window_id,
+                    "window_index": window_index,
+                    "importance_type": imp_type,
+                    "feature": feature,
+                    "importance": importance_value,
+                }
+                if stream_write and detail_path:
+                    pd.DataFrame([detail_row]).to_csv(
+                        detail_path, mode="a", header=not detail_header_written, index=False
+                    )
+                    detail_header_written = True
+                else:
+                    importance_rows.append(detail_row)
+
+                key = (imp_type, feature)
+                stats = summary_stats.get(key, {"count": 0, "sum": 0.0, "sumsq": 0.0})
+                stats["count"] += 1
+                stats["sum"] += importance_value
+                stats["sumsq"] += importance_value * importance_value
+                summary_stats[key] = stats
+
+                trend = trend_stats.get(key, {
+                    "count": 0, "sumx": 0.0, "sumy": 0.0, "sumxy": 0.0, "sumx2": 0.0,
+                    "last_importance": 0.0,
+                })
+                trend["count"] += 1
+                trend["sumx"] += window_index
+                trend["sumy"] += importance_value
+                trend["sumxy"] += window_index * importance_value
+                trend["sumx2"] += window_index * window_index
+                trend["last_importance"] = importance_value
+                trend_stats[key] = trend
+
+        windows_run += 1
+        if max_windows and windows_run >= max_windows:
+            break
+
+    if windows_run == 0:
+        print("⚠️  Rolling window importance skipped: no valid windows")
+        return None
+
+    importance_df = pd.DataFrame(importance_rows) if importance_rows else None
+    metrics_df = pd.DataFrame(metrics_rows)
+    summary_rows = []
+    for (imp_type, feature), stats in summary_stats.items():
+        count = stats["count"]
+        mean = stats["sum"] / count if count else 0.0
+        variance = (stats["sumsq"] / count) - (mean * mean) if count else 0.0
+        std = float(np.sqrt(max(variance, 0.0)))
+        summary_rows.append({
+            "importance_type": imp_type,
+            "feature": feature,
+            "importance_mean": float(mean),
+            "importance_std": std,
+            "windows": int(count),
+        })
+    summary_df = pd.DataFrame(summary_rows)
+
+    trend_rows = []
+    for (imp_type, feature), trend in trend_stats.items():
+        count = trend["count"]
+        if count < 2:
+            continue
+        denom = (count * trend["sumx2"]) - (trend["sumx"] * trend["sumx"])
+        slope = 0.0
+        if denom != 0:
+            slope = ((count * trend["sumxy"]) - (trend["sumx"] * trend["sumy"])) / denom
+        trend_rows.append({
+            "importance_type": imp_type,
+            "feature": feature,
+            "slope": slope,
+            "last_importance": float(trend["last_importance"]),
+            "mean_importance": float(trend["sumy"] / count),
+            "windows": int(count),
+        })
+    trend_df = pd.DataFrame(trend_rows)
+
+    return {
+        "importance_detail": importance_df,
+        "importance_summary": summary_df,
+        "window_metrics": metrics_df,
+        "importance_trend": trend_df,
+        "windows": windows_run,
+        "stream_write": bool(stream_write and output_dir),
+    }
+
+
+def rolling_window_feature_importance_from_parquet(
+    parquet_path,
+    feature_cols,
+    model_params,
+    time_col="year",
+    label_col="y_moved",
+    train_years=8,
+    test_years=1,
+    step_years=1,
+    min_train_rows=20000,
+    min_test_rows=5000,
+    sample_fraction=None,
+    max_windows=None,
+    importance_types=None,
+    random_state=42,
+    output_dir=None,
+    stream_write=False,
+    external_memory=False,
+    external_memory_dir=None,
+):
+    """
+    Rolling window feature importance with refit per window using parquet filters.
+    """
+    from xgboost import XGBClassifier
+    import xgboost as xgb
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    import pandas as pd
+    import numpy as np
+    import pyarrow.dataset as ds
+    import os
+
+    dataset = ds.dataset(parquet_path, format="parquet")
+    years_set = set()
+    for batch in dataset.to_batches(columns=[time_col], batch_size=1_000_000):
+        years_set.update(batch.column(0).to_pylist())
+    years = sorted(y for y in years_set if y is not None)
+
+    window_span = train_years + test_years
+    if len(years) < window_span:
+        print("⚠️  Rolling window importance skipped: not enough years for window span")
+        return None
+
+    if external_memory and sample_fraction is not None and sample_fraction < 1.0:
+        sample_fraction = 1.0
+
+    if importance_types is None:
+        importance_types = ["gain", "weight", "cover"]
+
+    importance_rows = []
+    metrics_rows = []
+    windows_run = 0
+    detail_path = None
+    metrics_path = None
+    detail_header_written = False
+    metrics_header_written = False
+    summary_stats = {}
+    trend_stats = {}
+
+    if stream_write and output_dir:
+        detail_path = os.path.join(output_dir, "feature_importance_rolling_detail.csv")
+        metrics_path = os.path.join(output_dir, "feature_importance_rolling_metrics.csv")
+
+    for window_index, start_idx in enumerate(range(0, len(years) - window_span + 1, step_years), start=1):
+        train_years_list = years[start_idx:start_idx + train_years]
+        test_years_list = years[start_idx + train_years:start_idx + window_span]
+
+        if external_memory:
+            def _scan_stats(years_list):
+                row_count = 0
+                label_values = set()
+                scanner = dataset.scanner(
+                    filter=ds.field(time_col).isin(years_list),
+                    columns=feature_cols + [label_col],
+                    batch_size=100_000,
+                )
+                for batch in scanner.to_batches():
+                    batch_df = batch.to_pandas()
+                    if sample_fraction and sample_fraction < 1.0:
+                        batch_df = batch_df.sample(frac=sample_fraction, random_state=random_state)
+                    if len(batch_df) == 0:
+                        continue
+                    labels = batch_df[label_col].to_numpy()
+                    label_values.update(set(labels.tolist()))
+                    row_count += len(batch_df)
+                return row_count, len(label_values)
+
+            train_rows, train_label_count = _scan_stats(train_years_list)
+            test_rows, test_label_count = _scan_stats(test_years_list)
+
+            if train_rows < min_train_rows or test_rows < min_test_rows:
+                continue
+            if train_label_count < 2 or test_label_count < 2:
+                continue
+
+            class ParquetDataIter(xgb.DataIter):
+                def __init__(self, years_list):
+                    super().__init__()
+                    self.years_list = years_list
+                    self._scanner = None
+                    self._batch_iter = None
+                    self._had_data = False
+
+                def reset(self):
+                    self._scanner = dataset.scanner(
+                        filter=ds.field(time_col).isin(self.years_list),
+                        columns=feature_cols + [label_col],
+                        batch_size=100_000,
+                    )
+                    self._batch_iter = iter(self._scanner.to_batches())
+                    self._had_data = False
+
+                def next(self, input_data):
+                    while True:
+                        try:
+                            batch = next(self._batch_iter)
+                        except StopIteration:
+                            if not self._had_data:
+                                raise ValueError("No data yielded for DataIter batch.")
+                            return 0
+                        batch_df = batch.to_pandas()
+                        if sample_fraction and sample_fraction < 1.0:
+                            batch_df = batch_df.sample(frac=sample_fraction, random_state=random_state)
+                        if len(batch_df) == 0:
+                            continue
+                        batch_df = fix_dtypes(batch_df, feature_cols)
+                        for col in feature_cols:
+                            if batch_df[col].isnull().any():
+                                batch_df[col] = batch_df[col].fillna(0)
+                        labels = batch_df[label_col].to_numpy().astype(np.float32)
+                        input_data(
+                            data=batch_df[feature_cols].to_numpy(),
+                            label=labels,
+                        )
+                        self._had_data = True
+                        return 1
+
+            dtrain_iter = ParquetDataIter(train_years_list)
+            dtest_iter = ParquetDataIter(test_years_list)
+
+            max_bin = model_params.get("max_bin", 256)
+            dtrain = xgb.QuantileDMatrix(dtrain_iter, max_bin=max_bin)
+            dtest = xgb.QuantileDMatrix(dtest_iter, max_bin=max_bin, ref=dtrain)
+
+            xgb_params = model_params.copy()
+            num_boost_round = int(xgb_params.pop("n_estimators", 200))
+            xgb_params.pop("early_stopping_rounds", None)
+            xgb_params.pop("verbose_eval", None)
+
+            model = xgb.train(
+                xgb_params,
+                dtrain,
+                num_boost_round=num_boost_round,
+                evals=[(dtest, "test")],
+                verbose_eval=False,
+            )
+            y_pred = model.predict(dtest)
+        else:
+            train_df = pd.read_parquet(parquet_path, filters=[(time_col, "in", train_years_list)])
+            test_df = pd.read_parquet(parquet_path, filters=[(time_col, "in", test_years_list)])
+
+            if sample_fraction and sample_fraction < 1.0:
+                train_df = train_df.sample(frac=sample_fraction, random_state=random_state)
+                test_df = test_df.sample(frac=sample_fraction, random_state=random_state)
+
+            if len(train_df) < min_train_rows or len(test_df) < min_test_rows:
+                continue
+
+            if train_df[label_col].nunique() < 2 or test_df[label_col].nunique() < 2:
+                continue
+
+            train_df = fix_dtypes(train_df, feature_cols)
+            test_df = fix_dtypes(test_df, feature_cols)
+
+            for col in feature_cols:
+                if train_df[col].isnull().any():
+                    if train_df[col].dtype in ['float32', 'float64', 'int32', 'int64']:
+                        median_val = train_df[col].median()
+                        train_df[col] = train_df[col].fillna(median_val)
+                    elif train_df[col].dtype == 'bool':
+                        train_df[col] = train_df[col].fillna(False)
+                if test_df[col].isnull().any():
+                    if test_df[col].dtype in ['float32', 'float64', 'int32', 'int64']:
+                        median_val = test_df[col].median()
+                        test_df[col] = test_df[col].fillna(median_val)
+                    elif test_df[col].dtype == 'bool':
+                        test_df[col] = test_df[col].fillna(False)
+
+            X_train = train_df[feature_cols]
+            y_train = train_df[label_col]
+            X_test = test_df[feature_cols]
+            y_test = test_df[label_col]
+
+            model = XGBClassifier(**model_params)
+            fit_kwargs = {"verbose": False}
+            if model_params.get("early_stopping_rounds"):
+                fit_kwargs["eval_set"] = [(X_test, y_test)]
+
+            model.fit(X_train, y_train, **fit_kwargs)
+
+            y_pred = model.predict_proba(X_test)[:, 1]
+        auc = roc_auc_score(y_test, y_pred)
+        auc_pr = average_precision_score(y_test, y_pred)
+
+        window_id = (
+            f"{train_years_list[0]}-{train_years_list[-1]}__"
+            f"{test_years_list[0]}-{test_years_list[-1]}"
+        )
+        metrics_row = {
+            "window_id": window_id,
+            "window_index": window_index,
+            "train_years": f"{train_years_list[0]}-{train_years_list[-1]}",
+            "test_years": f"{test_years_list[0]}-{test_years_list[-1]}",
+            "train_start_year": int(train_years_list[0]),
+            "train_end_year": int(train_years_list[-1]),
+            "test_start_year": int(test_years_list[0]),
+            "test_end_year": int(test_years_list[-1]),
+            "train_rows": len(train_df),
+            "test_rows": len(test_df),
+            "auc_roc": float(auc),
+            "auc_pr": float(auc_pr),
+        }
+        if stream_write and metrics_path:
+            pd.DataFrame([metrics_row]).to_csv(
+                metrics_path, mode="a", header=not metrics_header_written, index=False
+            )
+            metrics_header_written = True
+        else:
+            metrics_rows.append(metrics_row)
+
+        for imp_type in importance_types:
+            if external_memory:
+                importance = model.get_score(importance_type=imp_type)
+                for idx, feature in enumerate(feature_cols):
+                    importance_value = float(importance.get(f"f{idx}", 0.0))
+                    detail_row = {
+                        "window_id": window_id,
+                        "window_index": window_index,
+                        "importance_type": imp_type,
+                        "feature": feature,
+                        "importance": importance_value,
+                    }
+                    if stream_write and detail_path:
+                        pd.DataFrame([detail_row]).to_csv(
+                            detail_path, mode="a", header=not detail_header_written, index=False
+                        )
+                        detail_header_written = True
+                    else:
+                        importance_rows.append(detail_row)
+
+                    key = (imp_type, feature)
+                    stats = summary_stats.get(key, {"count": 0, "sum": 0.0, "sumsq": 0.0})
+                    stats["count"] += 1
+                    stats["sum"] += importance_value
+                    stats["sumsq"] += importance_value * importance_value
+                    summary_stats[key] = stats
+
+                    trend = trend_stats.get(key, {
+                        "count": 0, "sumx": 0.0, "sumy": 0.0, "sumxy": 0.0, "sumx2": 0.0,
+                        "last_importance": 0.0,
+                    })
+                    trend["count"] += 1
+                    trend["sumx"] += window_index
+                    trend["sumy"] += importance_value
+                    trend["sumxy"] += window_index * importance_value
+                    trend["sumx2"] += window_index * window_index
+                    trend["last_importance"] = importance_value
+                    trend_stats[key] = trend
+            else:
+                importance = model.get_booster().get_score(importance_type=imp_type)
+                for feature in feature_cols:
+                    importance_value = float(importance.get(feature, 0.0))
+                    detail_row = {
+                        "window_id": window_id,
+                        "window_index": window_index,
+                        "importance_type": imp_type,
+                        "feature": feature,
+                        "importance": importance_value,
+                    }
+                    if stream_write and detail_path:
+                        pd.DataFrame([detail_row]).to_csv(
+                            detail_path, mode="a", header=not detail_header_written, index=False
+                        )
+                        detail_header_written = True
+                    else:
+                        importance_rows.append(detail_row)
+
+                    key = (imp_type, feature)
+                    stats = summary_stats.get(key, {"count": 0, "sum": 0.0, "sumsq": 0.0})
+                    stats["count"] += 1
+                    stats["sum"] += importance_value
+                    stats["sumsq"] += importance_value * importance_value
+                    summary_stats[key] = stats
+
+                    trend = trend_stats.get(key, {
+                        "count": 0, "sumx": 0.0, "sumy": 0.0, "sumxy": 0.0, "sumx2": 0.0,
+                        "last_importance": 0.0,
+                    })
+                    trend["count"] += 1
+                    trend["sumx"] += window_index
+                    trend["sumy"] += importance_value
+                    trend["sumxy"] += window_index * importance_value
+                    trend["sumx2"] += window_index * window_index
+                    trend["last_importance"] = importance_value
+                    trend_stats[key] = trend
+
+        windows_run += 1
+        if max_windows and windows_run >= max_windows:
+            break
+
+    if windows_run == 0:
+        print("⚠️  Rolling window importance skipped: no valid windows")
+        return None
+
+    importance_df = pd.DataFrame(importance_rows) if importance_rows else None
+    metrics_df = pd.DataFrame(metrics_rows)
+    summary_rows = []
+    for (imp_type, feature), stats in summary_stats.items():
+        count = stats["count"]
+        mean = stats["sum"] / count if count else 0.0
+        variance = (stats["sumsq"] / count) - (mean * mean) if count else 0.0
+        std = float(np.sqrt(max(variance, 0.0)))
+        summary_rows.append({
+            "importance_type": imp_type,
+            "feature": feature,
+            "importance_mean": float(mean),
+            "importance_std": std,
+            "windows": int(count),
+        })
+    summary_df = pd.DataFrame(summary_rows)
+
+    trend_rows = []
+    for (imp_type, feature), trend in trend_stats.items():
+        count = trend["count"]
+        if count < 2:
+            continue
+        denom = (count * trend["sumx2"]) - (trend["sumx"] * trend["sumx"])
+        slope = 0.0
+        if denom != 0:
+            slope = ((count * trend["sumxy"]) - (trend["sumx"] * trend["sumy"])) / denom
+        trend_rows.append({
+            "importance_type": imp_type,
+            "feature": feature,
+            "slope": slope,
+            "last_importance": float(trend["last_importance"]),
+            "mean_importance": float(trend["sumy"] / count),
+            "windows": int(count),
+        })
+    trend_df = pd.DataFrame(trend_rows)
+
+    return {
+        "importance_detail": importance_df,
+        "importance_summary": summary_df,
+        "window_metrics": metrics_df,
+        "importance_trend": trend_df,
+        "windows": windows_run,
+        "stream_write": bool(stream_write and output_dir),
+    }
+
+
+def evaluate_transition_rates_by_group(
+    df_pandas,
+    y_true,
+    y_pred_proba,
+    group_cols,
+    min_group_size=100,
+    y_pred_binary=None,
+):
+    """
+    Evaluate transition rates by semi-aggregated groups.
+    """
+    import pandas as pd
+    import numpy as np
+
+    if not group_cols:
+        return None, None
+
+    eval_df = df_pandas[group_cols].copy()
+    eval_df["y_true"] = np.asarray(y_true)
+    eval_df["y_pred"] = np.asarray(y_pred_proba)
+    if y_pred_binary is not None:
+        eval_df["y_pred_binary"] = np.asarray(y_pred_binary)
+    eval_df = eval_df.dropna(subset=group_cols)
+
+    grouped = (
+        eval_df
+        .groupby(group_cols, dropna=True)
+        .agg(
+            count=("y_true", "size"),
+            actual_rate=("y_true", "mean"),
+            pred_rate=("y_pred", "mean"),
+        )
+        .reset_index()
+    )
+
+    if min_group_size:
+        grouped = grouped[grouped["count"] >= min_group_size]
+
+    if grouped.empty:
+        return grouped, None
+
+    grouped["abs_error"] = (grouped["pred_rate"] - grouped["actual_rate"]).abs()
+    grouped["sq_error"] = (grouped["pred_rate"] - grouped["actual_rate"]) ** 2
+    if "y_pred_binary" in eval_df.columns:
+        grouped_binary = (
+            eval_df
+            .groupby(group_cols, dropna=True)
+            .agg(pred_rate_thresholded=("y_pred_binary", "mean"))
+            .reset_index()
+        )
+        grouped = grouped.merge(grouped_binary, on=group_cols, how="left")
+        grouped["abs_error_thresholded"] = (
+            grouped["pred_rate_thresholded"] - grouped["actual_rate"]
+        ).abs()
+        grouped["sq_error_thresholded"] = (
+            grouped["pred_rate_thresholded"] - grouped["actual_rate"]
+        ) ** 2
+
+    weights = grouped["count"].to_numpy()
+    summary = {
+        "groups": int(len(grouped)),
+        "min_group_size": int(min_group_size),
+        "mae_weighted": float(np.average(grouped["abs_error"], weights=weights)),
+        "mse_weighted": float(np.average(grouped["sq_error"], weights=weights)),
+        "rmse_weighted": float(np.sqrt(np.average(grouped["sq_error"], weights=weights))),
+        "mae_unweighted": float(grouped["abs_error"].mean()),
+        "mse_unweighted": float(grouped["sq_error"].mean()),
+        "rmse_unweighted": float(np.sqrt(grouped["sq_error"].mean())),
+    }
+    if "sq_error_thresholded" in grouped.columns:
+        summary.update({
+            "mae_weighted_thresholded": float(np.average(grouped["abs_error_thresholded"], weights=weights)),
+            "mse_weighted_thresholded": float(np.average(grouped["sq_error_thresholded"], weights=weights)),
+            "rmse_weighted_thresholded": float(np.sqrt(np.average(grouped["sq_error_thresholded"], weights=weights))),
+            "mae_unweighted_thresholded": float(grouped["abs_error_thresholded"].mean()),
+            "mse_unweighted_thresholded": float(grouped["sq_error_thresholded"].mean()),
+            "rmse_unweighted_thresholded": float(np.sqrt(grouped["sq_error_thresholded"].mean())),
+        })
+
+    return grouped, summary
+
+
+def tune_thresholds_by_refnis(
+    df_pandas,
+    y_true,
+    y_pred_proba,
+    refnis_col="refnis",
+    subgroup_cols=None,
+    thresholds=None,
+    min_group_size=100,
+    default_threshold=0.5,
+):
+    """
+    Tune per-refnis thresholds to minimize mean squared error of group rates.
+    """
+    import numpy as np
+    import pandas as pd
+
+    if refnis_col not in df_pandas.columns:
+        return None
+
+    if thresholds is None:
+        thresholds = np.arange(0.01, 1.0, 0.01)
+
+    eval_df = df_pandas[[refnis_col]].copy()
+    eval_df["y_true"] = np.asarray(y_true)
+    eval_df["y_pred"] = np.asarray(y_pred_proba)
+    eval_df = eval_df.dropna(subset=[refnis_col])
+
+    rows = []
+    for refnis_value, group in eval_df.groupby(refnis_col, dropna=True):
+        if len(group) < min_group_size:
+            rows.append({
+                refnis_col: refnis_value,
+                "count": int(len(group)),
+                "best_threshold": float(default_threshold),
+                "actual_rate": float(group["y_true"].mean()),
+                "pred_rate": float((group["y_pred"] >= default_threshold).mean()),
+                "sq_error": float((group["y_true"].mean() - (group["y_pred"] >= default_threshold).mean()) ** 2),
+                "used_default": True,
+            })
+            continue
+
+        actual_rate = group["y_true"].mean()
+        best_threshold = default_threshold
+        best_pred_rate = (group["y_pred"] >= default_threshold).mean()
+        best_sq_error = (actual_rate - best_pred_rate) ** 2
+        best_score = None
+        best_msqe = None
+
+        for thr in thresholds:
+            pred_binary = (group["y_pred"] >= thr).astype(int)
+            pred_rate = pred_binary.mean()
+            sq_error = (actual_rate - pred_rate) ** 2
+            msqe = None
+
+            if subgroup_cols:
+                subgroup_df = group[[refnis_col]].copy()
+                for col in subgroup_cols:
+                    subgroup_df[col] = df_pandas.loc[group.index, col].values
+                subgroup_df["y_true"] = group["y_true"].values
+                subgroup_df["y_pred_binary"] = pred_binary
+                subgroup_df = subgroup_df.dropna(subset=subgroup_cols)
+                subgroup_stats = (
+                    subgroup_df
+                    .groupby(subgroup_cols, dropna=True)
+                    .agg(
+                        count=("y_true", "size"),
+                        actual_rate=("y_true", "mean"),
+                        pred_rate=("y_pred_binary", "mean"),
+                    )
+                    .reset_index()
+                )
+                if not subgroup_stats.empty:
+                    subgroup_stats["sq_error"] = (subgroup_stats["pred_rate"] - subgroup_stats["actual_rate"]) ** 2
+                    weights = subgroup_stats["count"].to_numpy()
+                    msqe = float(np.average(subgroup_stats["sq_error"], weights=weights))
+
+            score = msqe if msqe is not None else sq_error
+            if best_score is None or score < best_score:
+                best_score = score
+                best_sq_error = sq_error
+                best_threshold = thr
+                best_pred_rate = pred_rate
+                best_msqe = msqe
+
+        rows.append({
+            refnis_col: refnis_value,
+            "count": int(len(group)),
+            "best_threshold": float(best_threshold),
+            "actual_rate": float(actual_rate),
+            "pred_rate": float(best_pred_rate),
+            "sq_error": float(best_sq_error),
+            "msqe_weighted": float(best_msqe) if best_msqe is not None else None,
+            "used_default": False,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def train_in_memory(
+    df_pandas,
+    config: Optional[Dict[str, Any]] = None,
+    feature_config_path: Optional[str] = None,
+    rolling_importance: bool = False,
+    rolling_importance_config: Optional[Dict[str, Any]] = None,
+):
     """
     Train XGBoost on small dataset that fits in memory.
 
@@ -1312,6 +2100,10 @@ def train_in_memory(df_pandas, config: Optional[Dict[str, Any]] = None, feature_
             # Evaluate
             y_pred_proba = model.predict_proba(X_test)[:, 1]
 
+            group_eval_df = None
+            group_eval_summary = None
+            thresholds_by_refnis = None
+
             # Compute AUC metrics (threshold-independent)
             auc = roc_auc_score(y_test, y_pred_proba)
             auc_pr = average_precision_score(y_test, y_pred_proba)
@@ -1323,6 +2115,48 @@ def train_in_memory(df_pandas, config: Optional[Dict[str, Any]] = None, feature_
             )
             print(f"  ✓ Optimal threshold: {optimal_threshold:.3f}")
             print(f"  ✓ F1 score at optimal threshold: {best_f1:.4f}")
+
+            # Semi-aggregated evaluation: transition rates by (sex, age_group, municipality)
+            sex_col = "sex" if "sex" in test_df.columns else ("gender" if "gender" in test_df.columns else None)
+            age_col = "age_group" if "age_group" in test_df.columns else None
+            muni_col = "refnis" if "refnis" in test_df.columns else ("municipality" if "municipality" in test_df.columns else None)
+            group_cols = [col for col in [sex_col, age_col, muni_col] if col is not None]
+            if len(group_cols) == 3:
+                thresholds_by_refnis = tune_thresholds_by_refnis(
+                    df_pandas=test_df,
+                    y_true=y_test,
+                    y_pred_proba=y_pred_proba,
+                    refnis_col=muni_col,
+                    subgroup_cols=[sex_col, age_col],
+                    min_group_size=100,
+                    default_threshold=optimal_threshold,
+                )
+                if thresholds_by_refnis is not None and not thresholds_by_refnis.empty:
+                    threshold_map = thresholds_by_refnis.set_index(muni_col)["best_threshold"]
+                    thresholds_applied = test_df[muni_col].map(threshold_map).fillna(optimal_threshold)
+                    y_pred_binary_refnis = (y_pred_proba >= thresholds_applied).astype(int)
+                else:
+                    y_pred_binary_refnis = None
+
+                group_eval_df, group_eval_summary = evaluate_transition_rates_by_group(
+                    df_pandas=test_df,
+                    y_true=y_test,
+                    y_pred_proba=y_pred_proba,
+                    group_cols=group_cols,
+                    min_group_size=100,
+                    y_pred_binary=y_pred_binary_refnis,
+                )
+                if group_eval_summary:
+                    mlflow.log_metric("group_rate_msqe_weighted", group_eval_summary["mse_weighted"])
+                    if "mse_weighted_thresholded" in group_eval_summary:
+                        mlflow.log_metric("group_rate_msqe_weighted_thresholded", group_eval_summary["mse_weighted_thresholded"])
+                    if "rmse_weighted_thresholded" in group_eval_summary:
+                        mlflow.log_metric("group_rate_rmsqe_weighted_thresholded", group_eval_summary["rmse_weighted_thresholded"])
+                    if "mae_weighted_thresholded" in group_eval_summary:
+                        mlflow.log_metric("group_rate_mae_weighted_thresholded", group_eval_summary["mae_weighted_thresholded"])
+                    mlflow.log_metric("group_rate_mae_weighted", group_eval_summary["mae_weighted"])
+            else:
+                print("⚠️  Skipping semi-aggregated evaluation: required columns missing")
 
             # Compute metrics at optimal threshold
             y_pred_optimal = (y_pred_proba >= optimal_threshold).astype(int)
@@ -1391,6 +2225,95 @@ def train_in_memory(df_pandas, config: Optional[Dict[str, Any]] = None, feature_
                 except:
                     pass
 
+            # Save semi-aggregated transition rates
+            if group_eval_df is not None and not group_eval_df.empty:
+                group_eval_df.to_csv(
+                    os.path.join(checkpoint_path, "transition_rates_by_group.csv"),
+                    index=False
+                )
+            if thresholds_by_refnis is not None and not thresholds_by_refnis.empty:
+                thresholds_by_refnis.to_csv(
+                    os.path.join(checkpoint_path, "thresholds_by_refnis.csv"),
+                    index=False
+                )
+
+            # Rolling window feature importance for stability
+            rolling_summary = None
+            rolling_detail = None
+            rolling_metrics = None
+            rolling_windows = 0
+            if rolling_importance:
+                print("\n🧭 Rolling window feature importance...")
+                rolling_cfg = {
+                    "time_col": "year",
+                    "label_col": "y_moved",
+                    "train_years": 8,
+                    "test_years": 1,
+                    "step_years": 1,
+                    "min_train_rows": 20000,
+                    "min_test_rows": 5000,
+                    "sample_fraction": 0.5,
+                    "max_windows": None,
+                    "importance_types": ["gain", "weight", "cover"],
+                    "random_state": 42,
+                    "external_memory": False,
+                    "external_memory_dir": None,
+                    "device": None,
+                    "tree_method": None,
+                }
+                if rolling_importance_config:
+                    rolling_cfg.update(rolling_importance_config)
+
+                rolling_results = rolling_window_feature_importance(
+                    df_pandas=df_pandas,
+                    feature_cols=feature_cols,
+                    model_params=model_params,
+                    time_col=rolling_cfg["time_col"],
+                    label_col=rolling_cfg["label_col"],
+                    train_years=rolling_cfg["train_years"],
+                    test_years=rolling_cfg["test_years"],
+                    step_years=rolling_cfg["step_years"],
+                    min_train_rows=rolling_cfg["min_train_rows"],
+                    min_test_rows=rolling_cfg["min_test_rows"],
+                    sample_fraction=rolling_cfg["sample_fraction"],
+                    max_windows=rolling_cfg["max_windows"],
+                    importance_types=rolling_cfg["importance_types"],
+                    random_state=rolling_cfg["random_state"],
+                    output_dir=checkpoint_path,
+                    stream_write=True,
+                )
+
+                if rolling_results:
+                    rolling_summary = rolling_results["importance_summary"]
+                    rolling_detail = rolling_results["importance_detail"]
+                    rolling_metrics = rolling_results["window_metrics"]
+                    rolling_trend = rolling_results["importance_trend"]
+                    rolling_windows = rolling_results["windows"]
+
+                    rolling_summary.to_csv(
+                        os.path.join(checkpoint_path, "feature_importance_rolling_summary.csv"),
+                        index=False
+                    )
+                    if rolling_detail is not None and not rolling_results.get("stream_write"):
+                        rolling_detail.to_csv(
+                            os.path.join(checkpoint_path, "feature_importance_rolling_detail.csv"),
+                            index=False
+                        )
+                    if rolling_metrics is not None and not rolling_results.get("stream_write"):
+                        rolling_metrics.to_csv(
+                            os.path.join(checkpoint_path, "feature_importance_rolling_metrics.csv"),
+                            index=False
+                        )
+                    if rolling_trend is not None and not rolling_trend.empty:
+                        rolling_trend.to_csv(
+                            os.path.join(checkpoint_path, "feature_importance_rolling_trend.csv"),
+                            index=False
+                        )
+
+                    print(f"  ✓ Rolling windows: {rolling_windows}")
+                else:
+                    print("  ⚠️  Rolling window importance not produced")
+
             # Save metadata
             import json
             metadata = {
@@ -1413,7 +2336,16 @@ def train_in_memory(df_pandas, config: Optional[Dict[str, Any]] = None, feature_
                     'n_features': len(feature_cols),
                     'train_years': f"{train_df['year'].min()}-{train_df['year'].max()}" if 'year' in df_pandas.columns else 'N/A',
                     'test_years': f"{test_df['year'].min()}-{test_df['year'].max()}" if 'year' in df_pandas.columns else 'N/A'
-                }
+                },
+                'rolling_importance': {
+                    'enabled': bool(rolling_importance),
+                    'windows': int(rolling_windows),
+                },
+                'semi_aggregated_evaluation': {
+                    'enabled': bool(group_eval_summary),
+                    'group_cols': group_cols if len(group_cols) == 3 else [],
+                    'summary': group_eval_summary or {},
+                },
             }
             with open(os.path.join(checkpoint_path, "metadata.json"), 'w') as f:
                 json.dump(metadata, f, indent=2)
@@ -1438,7 +2370,15 @@ def train_in_memory(df_pandas, config: Optional[Dict[str, Any]] = None, feature_
             raise
 
 
-def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]] = None, feature_config_path: Optional[str] = None):
+def train_incremental(
+    parquet_path,
+    total_rows,
+    config: Optional[Dict[str, Any]] = None,
+    feature_config_path: Optional[str] = None,
+    target_batch_rows: Optional[int] = None,
+    rolling_importance: bool = False,
+    rolling_importance_config: Optional[Dict[str, Any]] = None,
+):
     """
     Train XGBoost incrementally on large dataset using batched loading.
 
@@ -1638,7 +2578,8 @@ def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]]
 
         # Batch size strategy based on dataset size
         rows_per_year = total_rows // 15  # Approximate rows per year
-        target_batch_rows = 10_000_000     # Target 3M rows per batch (safe for GPU)
+        if target_batch_rows is None:
+            target_batch_rows = 10_000_000  # Target rows per batch (safe for GPU)
         years_per_batch = max(1, int(target_batch_rows / rows_per_year))
 
         print(f"  Strategy: ~{rows_per_year:,} rows/year → {years_per_batch} year(s) per batch")
@@ -1750,6 +2691,10 @@ def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]]
         dtest = xgb.DMatrix(X_test)  # Using numeric codes, not categorical dtype
         y_pred_proba = model.predict(dtest)
 
+        group_eval_df = None
+        group_eval_summary = None
+        thresholds_by_refnis = None
+
         # Compute AUC metrics (threshold-independent)
         auc = roc_auc_score(y_test, y_pred_proba)
         auc_pr = average_precision_score(y_test, y_pred_proba)
@@ -1761,6 +2706,48 @@ def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]]
         )
         print(f"  ✓ Optimal threshold: {optimal_threshold:.3f}")
         print(f"  ✓ F1 score at optimal threshold: {best_f1:.4f}")
+
+        # Semi-aggregated evaluation: transition rates by (sex, age_group, municipality)
+        sex_col = "sex" if "sex" in test_df.columns else ("gender" if "gender" in test_df.columns else None)
+        age_col = "age_group" if "age_group" in test_df.columns else None
+        muni_col = "refnis" if "refnis" in test_df.columns else ("municipality" if "municipality" in test_df.columns else None)
+        group_cols = [col for col in [sex_col, age_col, muni_col] if col is not None]
+        if len(group_cols) == 3:
+            thresholds_by_refnis = tune_thresholds_by_refnis(
+                df_pandas=test_df,
+                y_true=y_test,
+                y_pred_proba=y_pred_proba,
+                refnis_col=muni_col,
+                subgroup_cols=[sex_col, age_col],
+                min_group_size=100,
+                default_threshold=optimal_threshold,
+            )
+            if thresholds_by_refnis is not None and not thresholds_by_refnis.empty:
+                threshold_map = thresholds_by_refnis.set_index(muni_col)["best_threshold"]
+                thresholds_applied = test_df[muni_col].map(threshold_map).fillna(optimal_threshold)
+                y_pred_binary_refnis = (y_pred_proba >= thresholds_applied).astype(int)
+            else:
+                y_pred_binary_refnis = None
+
+            group_eval_df, group_eval_summary = evaluate_transition_rates_by_group(
+                df_pandas=test_df,
+                y_true=y_test,
+                y_pred_proba=y_pred_proba,
+                group_cols=group_cols,
+                min_group_size=100,
+                y_pred_binary=y_pred_binary_refnis,
+            )
+            if group_eval_summary:
+                mlflow.log_metric("group_rate_msqe_weighted", group_eval_summary["mse_weighted"])
+                if "mse_weighted_thresholded" in group_eval_summary:
+                    mlflow.log_metric("group_rate_msqe_weighted_thresholded", group_eval_summary["mse_weighted_thresholded"])
+                if "rmse_weighted_thresholded" in group_eval_summary:
+                    mlflow.log_metric("group_rate_rmsqe_weighted_thresholded", group_eval_summary["rmse_weighted_thresholded"])
+                if "mae_weighted_thresholded" in group_eval_summary:
+                    mlflow.log_metric("group_rate_mae_weighted_thresholded", group_eval_summary["mae_weighted_thresholded"])
+                mlflow.log_metric("group_rate_mae_weighted", group_eval_summary["mae_weighted"])
+        else:
+            print("⚠️  Skipping semi-aggregated evaluation: required columns missing")
 
         # Compute metrics at optimal threshold
         y_pred_optimal = (y_pred_proba >= optimal_threshold).astype(int)
@@ -1779,7 +2766,11 @@ def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]]
         print(f"    Precision: {prec_default:.4f} | Recall: {recall_default:.4f} | F1: {f1_default:.4f}")
         print(f"  Optimal threshold ({optimal_threshold:.3f}):")
         print(f"    Precision: {prec_optimal:.4f} | Recall: {recall_optimal:.4f} | F1: {f1_optimal:.4f}")
-        print(f"  F1 improvement: {(f1_optimal - f1_default) / f1_default * 100:+.1f}%")
+        try:
+            f1_improvement = (f1_optimal - f1_default) / f1_default * 100
+            print(f"  F1 improvement: {f1_improvement:+.1f}%")
+        except ZeroDivisionError:
+            print("  F1 improvement: N/A (default F1 is 0)")
 
         # Log final metrics to MLflow (using optimal threshold)
         mlflow.log_metric("final_auc_roc", auc)
@@ -1828,6 +2819,119 @@ def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]]
             except:
                 pass
 
+        # Save semi-aggregated transition rates
+        if group_eval_df is not None and not group_eval_df.empty:
+            group_eval_df.to_csv(
+                os.path.join(checkpoint_path, "transition_rates_by_group.csv"),
+                index=False
+            )
+        if thresholds_by_refnis is not None and not thresholds_by_refnis.empty:
+            thresholds_by_refnis.to_csv(
+                os.path.join(checkpoint_path, "thresholds_by_refnis.csv"),
+                index=False
+            )
+
+        # Rolling window feature importance for stability
+        rolling_summary = None
+        rolling_detail = None
+        rolling_metrics = None
+        rolling_trend = None
+        rolling_windows = 0
+        if rolling_importance:
+            print("\n🧭 Rolling window feature importance...")
+            rolling_cfg = {
+                "time_col": "year",
+                "label_col": "y_moved",
+                "train_years": 8,
+                "test_years": 1,
+                "step_years": 1,
+                "min_train_rows": 20000,
+                "min_test_rows": 5000,
+                "sample_fraction": 0.5,
+                "max_windows": None,
+                "importance_types": ["gain", "weight", "cover"],
+                "random_state": 42,
+                "external_memory": False,
+                "external_memory_dir": None,
+                "device": None,
+                "tree_method": None,
+            }
+            if config is not None:
+                rolling_model_params = config['model']['params'].copy()
+                rolling_model_params.pop('verbose_eval', None)
+                if "n_estimators" not in rolling_model_params:
+                    rolling_model_params["n_estimators"] = 200
+            else:
+                rolling_model_params = {
+                    'max_depth': 5,
+                    'learning_rate': 0.05,
+                    'n_estimators': 200,
+                    'tree_method': 'hist',
+                    'device': 'cuda',
+                    'objective': 'binary:logistic',
+                    'eval_metric': ['aucpr', 'logloss'],
+                    'random_state': 42
+                }
+            if rolling_importance_config:
+                rolling_cfg.update(rolling_importance_config)
+
+            if rolling_cfg.get("device"):
+                rolling_model_params["device"] = rolling_cfg["device"]
+            if rolling_cfg.get("tree_method"):
+                rolling_model_params["tree_method"] = rolling_cfg["tree_method"]
+
+            rolling_results = rolling_window_feature_importance_from_parquet(
+                parquet_path=parquet_path,
+                feature_cols=feature_cols,
+                model_params=rolling_model_params,
+                time_col=rolling_cfg["time_col"],
+                label_col=rolling_cfg["label_col"],
+                train_years=rolling_cfg["train_years"],
+                test_years=rolling_cfg["test_years"],
+                step_years=rolling_cfg["step_years"],
+                min_train_rows=rolling_cfg["min_train_rows"],
+                min_test_rows=rolling_cfg["min_test_rows"],
+                sample_fraction=rolling_cfg["sample_fraction"],
+                max_windows=rolling_cfg["max_windows"],
+                importance_types=rolling_cfg["importance_types"],
+                random_state=rolling_cfg["random_state"],
+                output_dir=checkpoint_path,
+                stream_write=True,
+                external_memory=rolling_cfg["external_memory"],
+                external_memory_dir=rolling_cfg["external_memory_dir"],
+            )
+
+            if rolling_results:
+                rolling_summary = rolling_results["importance_summary"]
+                rolling_detail = rolling_results["importance_detail"]
+                rolling_metrics = rolling_results["window_metrics"]
+                rolling_trend = rolling_results["importance_trend"]
+                rolling_windows = rolling_results["windows"]
+
+                rolling_summary.to_csv(
+                    os.path.join(checkpoint_path, "feature_importance_rolling_summary.csv"),
+                    index=False
+                )
+                if rolling_detail is not None and not rolling_results.get("stream_write"):
+                    rolling_detail.to_csv(
+                        os.path.join(checkpoint_path, "feature_importance_rolling_detail.csv"),
+                        index=False
+                    )
+                if rolling_metrics is not None and not rolling_results.get("stream_write"):
+                    rolling_metrics.to_csv(
+                        os.path.join(checkpoint_path, "feature_importance_rolling_metrics.csv"),
+                        index=False
+                    )
+                if rolling_trend is not None and not rolling_trend.empty:
+                    rolling_trend.to_csv(
+                        os.path.join(checkpoint_path, "feature_importance_rolling_trend.csv"),
+                        index=False
+                    )
+
+                print(f"  ✓ Rolling windows: {rolling_windows}")
+            else:
+                print("  ⚠️  Rolling window importance not produced")
+
         # Save metadata
         import json
         metadata = {
@@ -1848,7 +2952,16 @@ def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]]
                 'total_trees': int(model.num_boosted_rounds()),
                 'train_years': '2011-2023',
                 'test_years': '2024-2025'
-            }
+            },
+            'semi_aggregated_evaluation': {
+                'enabled': bool(group_eval_summary),
+                'group_cols': group_cols if len(group_cols) == 3 else [],
+                'summary': group_eval_summary or {},
+            },
+            'rolling_importance': {
+                'enabled': bool(rolling_importance),
+                'windows': int(rolling_windows),
+            },
         }
         with open(os.path.join(checkpoint_path, "metadata.json"), 'w') as f:
             json.dump(metadata, f, indent=2)
@@ -1874,7 +2987,7 @@ def train_incremental(parquet_path, total_rows, config: Optional[Dict[str, Any]]
 if __name__ == "__main__":
     import sys
 
-    argparser=argparse.ArgumentParser(description="Run feature engineering and model training pipeline with optional hyperparameter tuning.")   
+    argparser=argparse.ArgumentParser(description="Run feature engineering and model training pipeline with optional hyperparameter tuning.")
 
     # Show help
     if "--help" in sys.argv or "-h" in sys.argv:
@@ -1889,6 +3002,19 @@ Options:
   --features=PATH       Load feature selection config from YAML (e.g., configs/data/features_mixed.yaml)
   --tune                Run hyperparameter tuning with Optuna
   --n-trials=N          Number of tuning trials (default: 50)
+  --rolling-importance  Enable rolling window feature importance (stable importance)
+  --rolling-train-years=N    Rolling train window size (default: 8)
+  --rolling-test-years=N     Rolling test window size (default: 1)
+  --rolling-step-years=N     Rolling step size (default: 1)
+  --rolling-sample-fraction=F Rolling sample fraction (default: 0.5)
+  --rolling-max-windows=N    Max rolling windows (default: no limit)
+  --rolling-min-train-rows=N Minimum rows in rolling train window (default: 20000)
+  --rolling-min-test-rows=N  Minimum rows in rolling test window (default: 5000)
+  --rolling-external-memory  Use external-memory (disk) for rolling windows
+  --rolling-external-memory-dir=PATH  Directory for rolling window cache files
+  --rolling-device=DEVICE    Device for rolling models (cpu or cuda)
+  --rolling-tree-method=METHOD Tree method for rolling models (e.g., hist)
+  --target-batch-rows=N Target rows per incremental batch (default: 10000000)
   --help, -h            Show this help message
 
 Training Strategies:
@@ -1930,6 +3056,9 @@ Workflow:
     # Parse command line arguments
     reuse = "--reuse" in sys.argv or "-r" in sys.argv
     tune = "--tune" in sys.argv
+    rolling_importance = "--rolling-importance" in sys.argv
+    target_batch_rows = None
+    rolling_importance_config = {}
     max_rows = None
     config_path = None
     feature_config_path = None
@@ -1947,6 +3076,30 @@ Workflow:
             feature_config_path = arg.split("=", 1)[1]
         elif arg.startswith("--n-trials="):
             n_trials = int(arg.split("=")[1])
+        elif arg.startswith("--target-batch-rows="):
+            target_batch_rows = int(arg.split("=")[1])
+        elif arg.startswith("--rolling-train-years="):
+            rolling_importance_config["train_years"] = int(arg.split("=")[1])
+        elif arg.startswith("--rolling-test-years="):
+            rolling_importance_config["test_years"] = int(arg.split("=")[1])
+        elif arg.startswith("--rolling-step-years="):
+            rolling_importance_config["step_years"] = int(arg.split("=")[1])
+        elif arg.startswith("--rolling-sample-fraction="):
+            rolling_importance_config["sample_fraction"] = float(arg.split("=")[1])
+        elif arg.startswith("--rolling-max-windows="):
+            rolling_importance_config["max_windows"] = int(arg.split("=")[1])
+        elif arg.startswith("--rolling-min-train-rows="):
+            rolling_importance_config["min_train_rows"] = int(arg.split("=")[1])
+        elif arg.startswith("--rolling-min-test-rows="):
+            rolling_importance_config["min_test_rows"] = int(arg.split("=")[1])
+        elif arg == "--rolling-external-memory":
+            rolling_importance_config["external_memory"] = True
+        elif arg.startswith("--rolling-external-memory-dir="):
+            rolling_importance_config["external_memory_dir"] = arg.split("=", 1)[1]
+        elif arg.startswith("--rolling-device="):
+            rolling_importance_config["device"] = arg.split("=", 1)[1]
+        elif arg.startswith("--rolling-tree-method="):
+            rolling_importance_config["tree_method"] = arg.split("=", 1)[1]
 
     # Run main
     if reuse:
@@ -1963,5 +3116,21 @@ Workflow:
 
     if tune:
         print(f"🔍 Tuning mode enabled ({n_trials} trials)")
+    if rolling_importance:
+        print("🧭 Rolling window feature importance enabled")
+    if target_batch_rows:
+        print(f"📦 Target batch rows: {target_batch_rows:,}")
+    if rolling_importance and rolling_importance_config:
+        print(f"🧭 Rolling config: {rolling_importance_config}")
 
-    main(reuse_processed=reuse, max_rows=max_rows, config_path=config_path, tune=tune, n_trials=n_trials, feature_config_path=feature_config_path)
+    main(
+        reuse_processed=reuse,
+        max_rows=max_rows,
+        config_path=config_path,
+        tune=tune,
+        n_trials=n_trials,
+        feature_config_path=feature_config_path,
+        rolling_importance=rolling_importance,
+        rolling_importance_config=rolling_importance_config or None,
+        target_batch_rows=target_batch_rows,
+    )

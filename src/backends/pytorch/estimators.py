@@ -1077,4 +1077,15 @@ def register_pytorch_backend():
     BackendFactory.register_estimator(BackendType.PYTORCH, "mlp", PyTorchMLPEstimator)
     BackendFactory.register_estimator(BackendType.PYTORCH, "logistic_regression", PyTorchLogisticRegression)
     BackendFactory.register_data_loader(BackendType.PYTORCH, PyTorchDataLoader)
+
+    # Register sequence model backends (LSTM, GRU, Transformer)
+    try:
+        from ...sequence.estimator import PyTorchSequenceEstimator
+        BackendFactory.register_estimator(BackendType.PYTORCH, "seq_lstm", PyTorchSequenceEstimator)
+        BackendFactory.register_estimator(BackendType.PYTORCH, "seq_gru", PyTorchSequenceEstimator)
+        BackendFactory.register_estimator(BackendType.PYTORCH, "seq_transformer", PyTorchSequenceEstimator)
+        logger.info("Sequence model backends registered (seq_lstm, seq_gru, seq_transformer)")
+    except ImportError as e:
+        logger.warning(f"Sequence model backend not available: {e}")
+
     logger.info("PyTorch backend registered")

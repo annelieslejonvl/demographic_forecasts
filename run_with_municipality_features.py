@@ -47,7 +47,17 @@ import mlflow
 global window_spec
 
 
-def main_with_municipality(reuse_processed=False, max_rows=None, config_path=None, tune=False, n_trials=50, feature_config_path=None):
+def main_with_municipality(
+    reuse_processed=False,
+    max_rows=None,
+    config_path=None,
+    tune=False,
+    n_trials=50,
+    feature_config_path=None,
+    rolling_importance=False,
+    target_batch_rows=None,
+    rolling_importance_config: Optional[Dict[str, Any]] = None,
+):
     """
     Main training pipeline with MUNICIPALITY features.
 
@@ -113,13 +123,26 @@ def main_with_municipality(reuse_processed=False, max_rows=None, config_path=Non
         if use_incremental:
             log_stage_start("Incremental Training (Reuse)")
             print(f"  ✓ Using INCREMENTAL training")
-            model, metrics = train_incremental(output_path, total_rows, config, feature_config_path=feature_config_path)
+            model, metrics = train_incremental(
+                output_path,
+                total_rows,
+                config,
+                feature_config_path=feature_config_path,
+                target_batch_rows=target_batch_rows,
+                rolling_importance=rolling_importance,
+                rolling_importance_config=rolling_importance_config,
+            )
             log_stage_complete("Incremental Training (Reuse)")
         else:
             log_stage_start("In-Memory Training (Reuse)")
             print(f"  ✓ Using IN-MEMORY training")
             df_pandas = pd.read_parquet(output_path)
-            model, metrics = train_in_memory(df_pandas, config, feature_config_path=feature_config_path)
+            model, metrics = train_in_memory(
+                df_pandas,
+                config,
+                feature_config_path=feature_config_path,
+                rolling_importance=rolling_importance,
+            )
             log_stage_complete("In-Memory Training (Reuse)")
 
         print("\n" + "="*80)
@@ -565,7 +588,13 @@ def main_with_municipality(reuse_processed=False, max_rows=None, config_path=Non
         log_memory_usage()
 
     log_stage_start("Model Training (In-Memory)")
-    model, metrics = train_in_memory(df_pandas, config, feature_config_path=feature_config_path)
+    model, metrics = train_in_memory(
+        df_pandas,
+        config,
+        feature_config_path=feature_config_path,
+        rolling_importance=rolling_importance,
+        rolling_importance_config=rolling_importance_config,
+    )
     log_stage_complete("Model Training (In-Memory)")
     print("\n" + "="*80)
     print("✅ PIPELINE COMPLETED SUCCESSFULLY")
@@ -581,6 +610,19 @@ if __name__ == "__main__":
     parser.add_argument('--features', type=str, help='Path to feature selection config YAML (e.g., configs/data/features_mixed.yaml)')
     parser.add_argument('--tune', action='store_true', help='Run hyperparameter tuning')
     parser.add_argument('--n-trials', type=int, default=50, help='Number of tuning trials')
+    parser.add_argument('--rolling-importance', action='store_true', help='Enable rolling window feature importance (stable importance)')
+    parser.add_argument('--target-batch-rows', type=int, help='Target rows per incremental batch (default: 10000000)')
+    parser.add_argument('--rolling-train-years', type=int, help='Rolling train window size (default: 8)')
+    parser.add_argument('--rolling-test-years', type=int, help='Rolling test window size (default: 1)')
+    parser.add_argument('--rolling-step-years', type=int, help='Rolling step size (default: 1)')
+    parser.add_argument('--rolling-sample-fraction', type=float, help='Rolling sample fraction (default: 0.5)')
+    parser.add_argument('--rolling-max-windows', type=int, help='Max rolling windows (default: no limit)')
+    parser.add_argument('--rolling-min-train-rows', type=int, help='Minimum rows in rolling train window (default: 20000)')
+    parser.add_argument('--rolling-min-test-rows', type=int, help='Minimum rows in rolling test window (default: 5000)')
+    parser.add_argument('--rolling-external-memory', action='store_true', help='Use external-memory (disk) for rolling windows')
+    parser.add_argument('--rolling-external-memory-dir', type=str, help='Directory for rolling window cache files')
+    parser.add_argument('--rolling-device', type=str, help='Device for rolling models (cpu or cuda)')
+    parser.add_argument('--rolling-tree-method', type=str, help='Tree method for rolling models (e.g., hist)')
 
     args = parser.parse_args()
 
@@ -597,6 +639,35 @@ if __name__ == "__main__":
         print(f"🎯 Feature selection: {args.features}")
     if args.tune:
         print(f"🔍 Tuning: {args.n_trials} trials")
+    if args.rolling_importance:
+        print("🧭 Rolling window feature importance enabled")
+    if args.target_batch_rows:
+        print(f"📦 Target batch rows: {args.target_batch_rows:,}")
+    rolling_importance_config = {}
+    if args.rolling_train_years is not None:
+        rolling_importance_config["train_years"] = args.rolling_train_years
+    if args.rolling_test_years is not None:
+        rolling_importance_config["test_years"] = args.rolling_test_years
+    if args.rolling_step_years is not None:
+        rolling_importance_config["step_years"] = args.rolling_step_years
+    if args.rolling_sample_fraction is not None:
+        rolling_importance_config["sample_fraction"] = args.rolling_sample_fraction
+    if args.rolling_max_windows is not None:
+        rolling_importance_config["max_windows"] = args.rolling_max_windows
+    if args.rolling_min_train_rows is not None:
+        rolling_importance_config["min_train_rows"] = args.rolling_min_train_rows
+    if args.rolling_min_test_rows is not None:
+        rolling_importance_config["min_test_rows"] = args.rolling_min_test_rows
+    if args.rolling_external_memory:
+        rolling_importance_config["external_memory"] = True
+    if args.rolling_external_memory_dir:
+        rolling_importance_config["external_memory_dir"] = args.rolling_external_memory_dir
+    if args.rolling_device:
+        rolling_importance_config["device"] = args.rolling_device
+    if args.rolling_tree_method:
+        rolling_importance_config["tree_method"] = args.rolling_tree_method
+    if args.rolling_importance and rolling_importance_config:
+        print(f"🧭 Rolling config: {rolling_importance_config}")
     print("="*60)
     print()
 
@@ -606,5 +677,8 @@ if __name__ == "__main__":
         config_path=args.config,
         feature_config_path=args.features,
         tune=args.tune,
-        n_trials=args.n_trials
+        n_trials=args.n_trials,
+        rolling_importance=args.rolling_importance,
+        target_batch_rows=args.target_batch_rows,
+        rolling_importance_config=rolling_importance_config or None,
     )

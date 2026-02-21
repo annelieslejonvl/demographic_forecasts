@@ -22,3 +22,5 @@ examples/
 *.csv
 *.xlsx
 *.json
+*.out
+*.sh

@@ -1,5 +1,5 @@
 # XGBoost Linear Model (acts like Logistic Regression)
-# Uses GPU, no RAPIDS needed
+# CPU-safe preset for large datasets
 
 backend: xgboost
 model_type: classifier
@@ -11,7 +11,7 @@ device:
 
 # Preprocessing
 scaling:
-  enabled: true
+  enabled: false
   type: standard
 
 # Categorical encoding - gblinear only supports numeric
@@ -29,9 +29,11 @@ model:
     objective: binary:logistic
     alpha: 0.0
     lambda: 1.0
+    reg_alpha: 1.0e-5
+    reg_lambda: 1.0e-5
     n_estimators: 50
-    learning_rate: 0.1
-    device: cuda
+    learning_rate: 0.05
+    device: cpu
     eval_metric:
       - logloss
       - auc

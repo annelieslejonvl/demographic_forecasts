@@ -1,0 +1,55 @@
+# PyTorch Sequence Model - LSTM Encoder
+# LLM-style approach: tokenized life-event sequences -> bidirectional LSTM
+
+backend: pytorch
+model_type: seq_lstm
+
+device:
+  type: auto
+  gpu_id: null
+
+model:
+  type: seq_lstm
+  params:
+    loss_type: aft
+    encoder_type: lstm
+    embed_dim: 32
+    max_seq_len: 96
+    pos_weight_max_samples: 20000
+
+    # LSTM encoder
+    encoder:
+      hidden_dim: 128
+      num_layers: 2
+      dropout: 0.4
+
+    # Prediction head
+    head_hidden_dims: [128, 64]
+    dropout: 0.4
+
+    # Training
+     # LR Finder - set to true to auto-find learning rate before training
+    lr_find: true
+    lr_find_config:
+      lr_min: 1.0e-7
+      lr_max: 1.0
+      num_steps: 2500
+      fraction: 0.3
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    epochs: 50
+    batch_size: 256
+    early_stopping_patience: 5
+    early_stopping_metric: composite  # composite|val_loss|val_mean_auc|val_mean_ap|val_mean_f1
+    use_amp: true
+
+# Events to predict
+events:
+  - y_moved
+  - birth1_event
+  - birth2_event
+  - divorce_event
+  - getalifeother_event
+
+# Prediction horizons (years)
+horizons: [1, 3, 5]

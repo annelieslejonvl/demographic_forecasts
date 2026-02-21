@@ -1,0 +1,47 @@
+# PyTorch Sequence Model - Transformer Encoder
+# LLM-style approach: tokenized life-event sequences -> Transformer self-attention
+
+backend: pytorch
+model_type: seq_transformer
+
+device:
+  type: auto
+  gpu_id: null
+
+model:
+  type: seq_transformer
+  params:
+    encoder_type: transformer
+    embed_dim: 128
+    max_seq_len: 96           # ~8 years of history (10-12 tokens/yr)
+
+    # Transformer encoder
+    encoder:
+      num_heads: 4
+      num_layers: 3
+      ff_dim: 512
+      dropout: 0.1
+
+    # Prediction head
+    head_hidden_dims: [128, 64]
+    dropout: 0.2
+
+    # Training (lower LR for transformer stability)
+    learning_rate: 0.0005
+    weight_decay: 0.0001
+    epochs: 50
+    batch_size: 64
+    early_stopping_patience: 10
+    early_stopping_metric: composite  # composite|val_loss|val_mean_auc|val_mean_ap|val_mean_f1
+    use_amp: true
+
+# Events to predict
+events:
+  - y_moved
+  - birth1_event
+  - birth2_event
+  - divorce_event
+  - getalifeother_event
+
+# Prediction horizons (years)
+horizons: [1, 3, 5]

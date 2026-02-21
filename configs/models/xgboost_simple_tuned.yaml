@@ -13,18 +13,18 @@ model:
     min_child_weight: 9      # More conservative splits
 
     # Stronger regularization
-    reg_alpha: 4.66e-08       # L1 (feature selection)
+    reg_alpha: 4.66e-06       # L1 (feature selection)
     reg_lambda: 2.5e-08      # L2 (prevent overfitting)
     gamma: 1.24               # Minimum loss reduction
 
     # More aggressive sampling (reduce overfitting)
-    subsample: 0.6
-    colsample_bytree: 0.5     # Use only 50% of features per tree
+    subsample: 0.61
+    colsample_bytree: 0.6385     # Use only 50% of features per tree
     colsample_bylevel: 0.6
 
     # Learning
     learning_rate: 0.0233
-    n_estimators: 200         # Fewer trees
+    n_estimators: 850         # Fewer trees
     early_stopping_rounds: 20
 
     # Class imbalance
