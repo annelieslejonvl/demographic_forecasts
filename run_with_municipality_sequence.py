@@ -40,7 +40,10 @@ from src.utils.logging_setup import (
 from run_test import load_model_config
 
 from src.sequence.vocabulary import LifeEventVocabulary, MUNICIPALITY_FEATURE_MAP
-from src.sequence.dataset import SequenceDataset, StreamingSequenceDataset, CachedSequenceDataset
+from src.sequence.dataset import (
+    SequenceDataset, StreamingSequenceDataset, CachedSequenceDataset,
+    CachedRollingWindowDataset,
+)
 from src.sequence.estimator import PyTorchSequenceEstimator
 from src.sequence.evaluation import evaluate_sequence_predictions
 
@@ -180,6 +183,45 @@ def _collect_valid_persons(
             df = batch.to_pandas()
             history.update(df.loc[df['year'] <= cutoff_year, 'sid'].unique().tolist())
             future.update(df.loc[df['year'] > cutoff_year, 'sid'].unique().tolist())
+            del df
+
+    return history & future
+
+
+def _scan_year_range(parquet_path: str, chunk_size: int = 500_000):
+    """Scan parquet to find min and max year in the dataset."""
+    dataset = pq.ParquetDataset(parquet_path)
+    min_year = float('inf')
+    max_year = float('-inf')
+    for fragment in dataset.fragments:
+        for batch in fragment.to_batches(batch_size=chunk_size, columns=['year']):
+            years = batch.to_pandas()['year']
+            min_year = min(min_year, int(years.min()))
+            max_year = max(max_year, int(years.max()))
+    return min_year, max_year
+
+
+def _collect_valid_persons_windowed(
+    parquet_path: str,
+    cutoff_year: int,
+    min_history_year: int,
+    max_horizon: int,
+    chunk_size: int = 500_000,
+) -> set:
+    """Find persons with history in (min_history_year, cutoff] AND future in (cutoff, cutoff+max_horizon]."""
+    dataset = pq.ParquetDataset(parquet_path)
+    history = set()
+    future = set()
+
+    for fragment in dataset.fragments:
+        for batch in fragment.to_batches(batch_size=chunk_size, columns=['sid', 'year']):
+            df = batch.to_pandas()
+            hist_mask = (df['year'] > min_history_year) & (df['year'] <= cutoff_year)
+            future_mask = (df['year'] > cutoff_year) & (df['year'] <= cutoff_year + max_horizon)
+            if hist_mask.any():
+                history.update(df.loc[hist_mask, 'sid'].unique().tolist())
+            if future_mask.any():
+                future.update(df.loc[future_mask, 'sid'].unique().tolist())
             del df
 
     return history & future
@@ -1147,20 +1189,18 @@ def _run_streaming_sequence_pipeline(
         loss_type = config.get('model', {}).get('params', {}).get('loss_type', 'bce') if config else 'bce'
         print(f"\n  [DEBUG] loss_type={loss_type}, test_dataset={'present' if test_dataset is not None else 'None'}")
 
-        if loss_type == 'aft':
+        if loss_type in ('aft', 'deephit'):
             aft_eval_dataset = test_dataset if test_dataset is not None else val_dataset
             aft_eval_label = "test" if test_dataset is not None else "val"
-            print(f"\n  Computing AFT metrics on {aft_eval_label} set ({len(aft_eval_dataset):,} persons)")
+            print(f"\n  Computing {loss_type.upper()} metrics on {aft_eval_label} set ({len(aft_eval_dataset):,} persons)")
 
-            log_stage_start("AFT Survival Metrics")
-            print("  Computing AFT-native survival metrics (C-index, CRPS, IBS, TD-AUC)...")
+            log_stage_start(f"{loss_type.upper()} Survival Metrics")
+            print(f"  Computing {loss_type}-native survival metrics (C-index, TD-AUC)...")
             try:
-                from src.sequence.evaluation import evaluate_aft_survival_metrics
+                from src.sequence.evaluation import evaluate_aft_survival_metrics, _targets_to_survival, _fast_c_index
                 from src.sequence.dataset import sequence_collate_fn as _collate
                 from torch.utils.data import DataLoader as _DL
-
-                aft_result = estimator.predict_aft_params(dataset=aft_eval_dataset)
-                print(f"  [DEBUG] AFT params shape: {aft_result.probabilities.shape}")
+                from sklearn.metrics import roc_auc_score as _roc_auc
 
                 _loader = _DL(
                     aft_eval_dataset, batch_size=estimator.batch_size * 2,
@@ -1170,66 +1210,116 @@ def _run_streaming_sequence_pipeline(
                 for _b in _loader:
                     _tgt.append(_b['targets'].numpy())
                 aft_targets = np.concatenate(_tgt, axis=0)
-                print(f"  [DEBUG] Targets shape: {aft_targets.shape}")
 
-                aft_surv_metrics = evaluate_aft_survival_metrics(
-                    aft_params=aft_result.probabilities,
-                    targets=aft_targets,
-                    events=events,
-                    horizons=horizons,
-                )
-                print(f"  [DEBUG] AFT metrics result keys: {list(aft_surv_metrics.keys()) if aft_surv_metrics else 'None'}")
+                if loss_type == 'aft':
+                    aft_result = estimator.predict_aft_params(dataset=aft_eval_dataset)
+                    aft_surv_metrics = evaluate_aft_survival_metrics(
+                        aft_params=aft_result.probabilities,
+                        targets=aft_targets,
+                        events=events,
+                        horizons=horizons,
+                    )
 
-                if aft_surv_metrics and 'per_event' in aft_surv_metrics:
-                    print(f"\n  AFT survival metrics ({aft_eval_label} set, distribution-native):")
-                    for event_name, ev_metrics in aft_surv_metrics['per_event'].items():
-                        metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in ev_metrics.items())
-                        print(f"    {event_name}: {metrics_str}")
-                        for k, v in ev_metrics.items():
-                            if isinstance(v, float) and not np.isnan(v):
-                                mlflow.log_metric(f"aft_{event_name}_{k}", v)
-                    aft_agg = aft_surv_metrics.get('aggregate', {})
-                    if aft_agg:
-                        print(f"\n  AFT aggregate: "
-                              f"C-index={aft_agg.get('mean_c_index', float('nan')):.4f}, "
-                              f"CRPS={aft_agg.get('mean_crps', float('nan')):.4f}, "
-                              f"IBS={aft_agg.get('mean_ibs', float('nan')):.4f}, "
-                              f"TD-AUC={aft_agg.get('mean_td_auc', float('nan')):.4f}")
-                        for k, v in aft_agg.items():
-                            if not np.isnan(v):
-                                mlflow.log_metric(f"aft_{k}", v)
-                else:
-                    print("  WARNING: evaluate_aft_survival_metrics returned empty results")
+                    if aft_surv_metrics and 'per_event' in aft_surv_metrics:
+                        print(f"\n  AFT survival metrics ({aft_eval_label} set, distribution-native):")
+                        for event_name, ev_metrics in aft_surv_metrics['per_event'].items():
+                            metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in ev_metrics.items())
+                            print(f"    {event_name}: {metrics_str}")
+                            for k, v in ev_metrics.items():
+                                if isinstance(v, float) and not np.isnan(v):
+                                    mlflow.log_metric(f"aft_{event_name}_{k}", v)
+                        aft_agg = aft_surv_metrics.get('aggregate', {})
+                        if aft_agg:
+                            print(f"\n  AFT aggregate: "
+                                  f"C-index={aft_agg.get('mean_c_index', float('nan')):.4f}, "
+                                  f"CRPS={aft_agg.get('mean_crps', float('nan')):.4f}, "
+                                  f"IBS={aft_agg.get('mean_ibs', float('nan')):.4f}, "
+                                  f"TD-AUC={aft_agg.get('mean_td_auc', float('nan')):.4f}")
+                            for k, v in aft_agg.items():
+                                if not np.isnan(v):
+                                    mlflow.log_metric(f"aft_{k}", v)
+                    else:
+                        print("  WARNING: evaluate_aft_survival_metrics returned empty results")
+
+                elif loss_type == 'deephit':
+                    # DeepHit: compute C-index and TD-AUC from learned CDF
+                    result = estimator.predict_proba(dataset=aft_eval_dataset)
+                    probs = result.probabilities  # (n, n_events * n_horizons)
+                    n_ev = len(events)
+                    n_h = len(horizons)
+                    probs_3d = probs.reshape(-1, n_ev, n_h)
+
+                    print(f"\n  DeepHit survival metrics ({aft_eval_label} set):")
+                    c_indices = []
+                    td_aucs = []
+                    for ei, event in enumerate(events):
+                        cols = [ei * n_h + hi for hi in range(n_h)]
+                        event_tgt = aft_targets[:, cols]
+                        duration, event_ind = _targets_to_survival(event_tgt, horizons)
+                        cdf_e = probs_3d[:, ei, :]
+
+                        n_pos = int(event_ind.sum())
+                        if n_pos < 5 or (len(event_ind) - n_pos) < 5:
+                            print(f"    {event}: skipped (too few events)")
+                            continue
+
+                        risk = cdf_e[:, -1]
+                        c_idx = _fast_c_index(event_ind, duration, risk)
+                        c_indices.append(c_idx)
+
+                        ev_td = []
+                        for hi, h in enumerate(horizons):
+                            y_h = event_tgt[:, hi]
+                            n_p = int(y_h.sum())
+                            if 0 < n_p < len(y_h):
+                                auc_h = float(_roc_auc(y_h, cdf_e[:, hi]))
+                                ev_td.append(auc_h)
+                                td_aucs.append(auc_h)
+                                mlflow.log_metric(f"deephit_td_auc_{event}_{h}yr", auc_h)
+
+                        td_str = ", ".join(f"{h}yr={a:.4f}" for h, a in zip(horizons, ev_td)) if ev_td else "N/A"
+                        print(f"    {event}: C-index={c_idx:.4f}, TD-AUC: {td_str}")
+                        mlflow.log_metric(f"deephit_{event}_c_index", c_idx)
+
+                    if c_indices:
+                        mean_c = float(np.mean(c_indices))
+                        mean_td = float(np.mean(td_aucs)) if td_aucs else float('nan')
+                        print(f"\n  DeepHit aggregate: C-index={mean_c:.4f}, TD-AUC={mean_td:.4f}")
+                        mlflow.log_metric("deephit_mean_c_index", mean_c)
+                        if not np.isnan(mean_td):
+                            mlflow.log_metric("deephit_mean_td_auc", mean_td)
+
             except Exception as e:
-                print(f"  AFT survival metrics FAILED: {e}")
+                print(f"  {loss_type.upper()} survival metrics FAILED: {e}")
                 import traceback; traceback.print_exc()
-            log_stage_complete("AFT Survival Metrics")
+            log_stage_complete(f"{loss_type.upper()} Survival Metrics")
 
-            log_stage_start("Prediction Intervals")
-            print("  Computing prediction intervals from AFT distribution...")
-            try:
-                prediction_intervals = estimator.predict_intervals(
-                    dataset=aft_eval_dataset,
-                    confidence_levels=[0.5, 0.8, 0.9],
-                )
-                for event_name in events:
-                    if event_name in prediction_intervals:
-                        ei = prediction_intervals[event_name]
-                        med = ei['median']
-                        ci80_lo = ei['ci_80_lower']
-                        ci80_hi = ei['ci_80_upper']
-                        print(f"    {event_name}: median={np.median(med):.2f}yr, "
-                              f"80%CI=[{np.median(ci80_lo):.2f}, {np.median(ci80_hi):.2f}]yr")
-                        mlflow.log_metric(f"aft_{event_name}_median_tte",
-                                          float(np.median(med)))
-                        mlflow.log_metric(f"aft_{event_name}_ci80_width",
-                                          float(np.median(ci80_hi - ci80_lo)))
-            except Exception as e:
-                print(f"  Prediction intervals FAILED: {e}")
-                import traceback; traceback.print_exc()
-            log_stage_complete("Prediction Intervals")
+            if loss_type == 'aft':
+                log_stage_start("Prediction Intervals")
+                print("  Computing prediction intervals from AFT distribution...")
+                try:
+                    prediction_intervals = estimator.predict_intervals(
+                        dataset=aft_eval_dataset,
+                        confidence_levels=[0.5, 0.8, 0.9],
+                    )
+                    for event_name in events:
+                        if event_name in prediction_intervals:
+                            ei = prediction_intervals[event_name]
+                            med = ei['median']
+                            ci80_lo = ei['ci_80_lower']
+                            ci80_hi = ei['ci_80_upper']
+                            print(f"    {event_name}: median={np.median(med):.2f}yr, "
+                                  f"80%CI=[{np.median(ci80_lo):.2f}, {np.median(ci80_hi):.2f}]yr")
+                            mlflow.log_metric(f"aft_{event_name}_median_tte",
+                                              float(np.median(med)))
+                            mlflow.log_metric(f"aft_{event_name}_ci80_width",
+                                              float(np.median(ci80_hi - ci80_lo)))
+                except Exception as e:
+                    print(f"  Prediction intervals FAILED: {e}")
+                    import traceback; traceback.print_exc()
+                log_stage_complete("Prediction Intervals")
         else:
-            print(f"  Skipping AFT metrics (loss_type={loss_type}, not 'aft')")
+            print(f"  Skipping survival metrics (loss_type={loss_type})")
 
         log_stage_start("Saving Artifacts")
 
@@ -1349,6 +1439,604 @@ def _run_streaming_sequence_pipeline(
     return estimator, metrics, pred_df
 
 
+def _run_rolling_window_pipeline(
+    output_path: str,
+    total_rows: int,
+    events: List[str],
+    horizons: List[int],
+    config: Optional[Dict[str, Any]],
+    encoder_type: str,
+    reuse_processed: bool,
+    config_path: Optional[str],
+    sample_fraction: Optional[float],
+    eval_fraction: Optional[float],
+    history_len: int = 5,
+    rolling_cutoffs: Optional[List[int]] = None,
+    train_cutoffs: Optional[List[int]] = None,
+    val_cutoff: Optional[int] = None,
+    test_cutoff: Optional[int] = None,
+    existing_cache: Optional[str] = None,
+):
+    """Run sequence model pipeline with rolling window validation.
+
+    Creates multiple training samples per person using different cutoff years.
+    Each window has `history_len` years of history and up to max(horizons)
+    years of future for targets.
+    """
+    max_horizon = max(horizons)
+    max_seq_len = config.get('model', {}).get('params', {}).get('max_seq_len', 256) if config else 256
+
+    # ================================================================
+    # Step 1: Determine cutoff years
+    # ================================================================
+    if rolling_cutoffs is None:
+        print("  Auto-detecting year range from data...")
+        min_year, max_year = _scan_year_range(output_path)
+        print(f"  Data year range: {min_year}-{max_year}")
+        first_cutoff = min_year + history_len
+        last_cutoff = max_year - max_horizon
+        rolling_cutoffs = list(range(first_cutoff, last_cutoff + 1))
+
+    if train_cutoffs is None:
+        train_cutoffs = rolling_cutoffs[:-2]
+    if val_cutoff is None:
+        val_cutoff = rolling_cutoffs[-2]
+    if test_cutoff is None:
+        test_cutoff = rolling_cutoffs[-1]
+
+    print(f"\n  Rolling window configuration:")
+    print(f"    History length: {history_len} years")
+    print(f"    All cutoffs: {rolling_cutoffs}")
+    print(f"    Train cutoffs: {train_cutoffs}")
+    print(f"    Val cutoff: {val_cutoff}")
+    print(f"    Test cutoff: {test_cutoff}")
+
+    for cutoff in rolling_cutoffs:
+        min_h = cutoff - history_len
+        max_f = cutoff + max_horizon
+        role = "TRAIN" if cutoff in train_cutoffs else ("VAL" if cutoff == val_cutoff else "TEST")
+        print(f"    W cutoff={cutoff} [{role}]: history ({min_h}, {cutoff}] -> targets ({cutoff}, {max_f}]")
+    print()
+
+    # ================================================================
+    # Step 2: Build vocabulary
+    # ================================================================
+    log_stage_start("Building Vocabulary")
+
+    vocab_path = "checkpoints/sequence_vocab.joblib"
+    os.makedirs("checkpoints", exist_ok=True)
+
+    if reuse_processed and os.path.exists(vocab_path):
+        print(f"  Loading existing vocabulary from {vocab_path}...")
+        vocabulary = LifeEventVocabulary.load(vocab_path)
+        missing_tokens = [
+            f"{prefix}_Q1"
+            for prefix in MUNICIPALITY_FEATURE_MAP.values()
+            if vocabulary.token_to_id(f"{prefix}_Q1") == vocabulary.UNK
+        ]
+        if missing_tokens:
+            print("  Vocabulary missing municipality tokens; rebuilding...")
+            vocabulary = _build_vocab_from_parquet(output_path, vocab_path)
+    else:
+        print("  Building vocabulary from parquet...")
+        vocabulary = _build_vocab_from_parquet(output_path, vocab_path)
+
+    print(f"  Vocabulary size: {vocabulary.vocab_size} tokens")
+    log_stage_complete("Building Vocabulary")
+
+    # ================================================================
+    # Step 3: Build/load per-window caches
+    # ================================================================
+    log_stage_start("Creating Rolling Window Datasets")
+
+    cache_dir = "checkpoints/sequence_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    sf_tag = f"_sf{sample_fraction}" if sample_fraction else ""
+
+    def _cache_path_for(cutoff):
+        return os.path.join(cache_dir, f"rolling_cut{cutoff}_h{history_len}{sf_tag}.pt")
+
+    def _cache_exists(cp):
+        return os.path.exists(cp) or os.path.isdir(cp.replace('.pt', '_chunks'))
+
+    # Build any missing caches
+    all_cutoffs = sorted(set(train_cutoffs + [val_cutoff, test_cutoff]))
+    missing_cutoffs = [c for c in all_cutoffs if not _cache_exists(_cache_path_for(c))]
+    for c in all_cutoffs:
+        if c not in missing_cutoffs:
+            print(f"  Cache exists for cutoff={c}")
+
+    if missing_cutoffs and existing_cache:
+        # Fast path: build all missing caches from existing shards
+        from build_sequence_cache import _build_rolling_from_existing_cache
+        print(f"  Building {len(missing_cutoffs)} missing caches from existing shards: {existing_cache}")
+        _build_rolling_from_existing_cache(
+            existing_cache_dir=existing_cache,
+            vocabulary=vocabulary,
+            max_seq_len=max_seq_len,
+            events=events,
+            horizons=horizons,
+            cutoff_years=missing_cutoffs,
+            history_len=history_len,
+            cache_dir=cache_dir,
+            sample_fraction=sample_fraction,
+        )
+    elif missing_cutoffs:
+        # Slow path: build from raw parquet one by one
+        for cutoff in missing_cutoffs:
+            cp = _cache_path_for(cutoff)
+            min_hist_year = cutoff - history_len
+            print(f"  Building cache for cutoff={cutoff} (history ({min_hist_year}, {cutoff}])...")
+
+            valid = _collect_valid_persons_windowed(
+                output_path, cutoff, min_hist_year, max_horizon,
+            )
+            print(f"    Valid persons: {len(valid):,}")
+
+            if sample_fraction is not None:
+                rng = np.random.RandomState(42 + cutoff)
+                n_sample = max(1, int(len(valid) * sample_fraction))
+                valid = set(rng.choice(list(valid), n_sample, replace=False))
+                print(f"    Subsampled to {sample_fraction:.2%}: {len(valid):,} persons")
+
+            CachedSequenceDataset(
+                parquet_path=output_path,
+                vocabulary=vocabulary,
+                max_seq_len=max_seq_len,
+                events=events,
+                horizons=horizons,
+                cutoff_year=cutoff,
+                allowed_sids=valid,
+                cache_path=cp,
+                min_history_year=min_hist_year,
+            )
+            print(f"    Cache built for cutoff={cutoff}")
+
+    # Create combined training dataset
+    train_cache_paths = [_cache_path_for(c) for c in train_cutoffs]
+    train_dataset = CachedRollingWindowDataset(
+        cache_paths=train_cache_paths,
+        cutoff_years=train_cutoffs,
+        max_seq_len=max_seq_len,
+        events=events,
+        horizons=horizons,
+    )
+    print(f"  Rolling train dataset: {len(train_dataset):,} samples from {len(train_cutoffs)} windows")
+
+    # Create single-window val and test datasets
+    val_cp = _cache_path_for(val_cutoff)
+    val_dataset = CachedSequenceDataset(
+        parquet_path=output_path,
+        vocabulary=vocabulary,
+        max_seq_len=max_seq_len,
+        events=events,
+        horizons=horizons,
+        cutoff_year=val_cutoff,
+        cache_path=val_cp,
+        min_history_year=val_cutoff - history_len,
+    )
+    print(f"  Val dataset: {len(val_dataset):,} persons (cutoff={val_cutoff})")
+
+    test_cp = _cache_path_for(test_cutoff)
+    test_dataset = CachedSequenceDataset(
+        parquet_path=output_path,
+        vocabulary=vocabulary,
+        max_seq_len=max_seq_len,
+        events=events,
+        horizons=horizons,
+        cutoff_year=test_cutoff,
+        return_ids=True,
+        cache_path=test_cp,
+        min_history_year=test_cutoff - history_len,
+    )
+    print(f"  Test dataset: {len(test_dataset):,} persons (cutoff={test_cutoff})")
+
+    log_stage_complete("Creating Rolling Window Datasets")
+    log_memory_usage()
+
+    # ================================================================
+    # Step 4: Train model
+    # ================================================================
+    log_stage_start("Model Training")
+
+    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    mlflow.set_experiment("demographic_forecasts_sequence_aft")
+
+    model_config = config.get('model', {}) if config else {
+        'type': 'seq_lstm',
+        'params': {'encoder_type': 'lstm', 'embed_dim': 128}
+    }
+
+    estimator = PyTorchSequenceEstimator(
+        model_config=model_config,
+        device_config=None,
+    )
+
+    with mlflow.start_run(run_name=f"rolling_{encoder_type}_h{history_len}_{'_'.join(events)}"):
+        mlflow.log_params({
+            'encoder_type': encoder_type,
+            'embed_dim': model_config.get('params', {}).get('embed_dim', 128),
+            'max_seq_len': max_seq_len,
+            'vocab_size': vocabulary.vocab_size,
+            'n_events': len(events),
+            'events': ','.join(events),
+            'horizons': str(horizons),
+            'training_mode': 'rolling_window',
+            'history_len': history_len,
+            'train_cutoffs': str(train_cutoffs),
+            'val_cutoff': val_cutoff,
+            'test_cutoff': test_cutoff,
+            'train_samples': len(train_dataset),
+            'val_persons': len(val_dataset),
+            'test_persons': len(test_dataset),
+        })
+
+        result = estimator.fit(
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            vocabulary=vocabulary,
+            lr_find_plot_path=os.path.join("checkpoints", "lr_finder_rolling.png"),
+        )
+
+        log_stage_complete("Model Training")
+        log_memory_usage()
+
+        # ================================================================
+        # Step 5: Evaluation on test window
+        # ================================================================
+        metrics = None
+        agg = None
+        all_predictions = None
+        sids = None
+        pred_df = None
+        group_eval_results = {}
+
+        log_stage_start("Prediction Generation")
+
+        proba_result = estimator.predict_proba(dataset=test_dataset)
+        probs = proba_result.probabilities
+        sids = proba_result.metadata.get('sids')
+        if sids is None and hasattr(test_dataset, '_sids'):
+            sids = test_dataset._sids
+
+        all_predictions = _build_predictions_from_probs(probs, events, horizons)
+
+        print(f"\n  Generated predictions for {len(events)} events "
+              f"at {len(horizons)} horizons (test cutoff={test_cutoff})")
+        for event in events:
+            if event in all_predictions:
+                for h in horizons:
+                    key = f'prob_{h}yr'
+                    if key in all_predictions[event]:
+                        event_probs = all_predictions[event][key]
+                        print(f"    {event} @{h}yr: mean={event_probs.mean():.4f}, "
+                              f"median={np.median(event_probs):.4f}, "
+                              f"P>0.5={(event_probs > 0.5).mean():.3%}")
+
+        log_stage_complete("Prediction Generation")
+
+        # Compute test labels
+        log_stage_start("Model Evaluation")
+        print("\n" + "=" * 60)
+        print("EVALUATION RESULTS (Rolling Window)")
+        print("=" * 60)
+
+        y_true = _compute_labels_streaming(
+            parquet_path=output_path,
+            sids=sids,
+            events=events,
+            horizons=horizons,
+            cutoff_year=test_cutoff,
+        )
+
+        metrics = _evaluate_from_arrays(
+            all_predictions=all_predictions,
+            y_true=y_true,
+            events=events,
+            horizons=horizons,
+        )
+
+        for event, event_metrics in metrics['per_event'].items():
+            print(f"\n--- {event} ---")
+            for horizon_key, h_metrics in event_metrics.items():
+                auc = h_metrics.get('auc', float('nan'))
+                ap = h_metrics.get('ap', float('nan'))
+                f1 = h_metrics.get('f1', float('nan'))
+                brier = h_metrics.get('brier', float('nan'))
+                prev = h_metrics.get('prevalence', 0)
+                print(f"  @{horizon_key}: AUC={auc:.4f}  AP={ap:.4f}  "
+                      f"F1={f1:.4f}  Brier={brier:.4f}  "
+                      f"prevalence={prev:.3%}")
+                if not np.isnan(auc):
+                    mlflow.log_metric(f"{event}_{horizon_key}_auc", auc)
+                if not np.isnan(ap):
+                    mlflow.log_metric(f"{event}_{horizon_key}_ap", ap)
+                if not np.isnan(f1):
+                    mlflow.log_metric(f"{event}_{horizon_key}_f1", f1)
+
+        agg = metrics['aggregate']
+        print(f"\n  Aggregate: mean_AUC={agg['mean_auc']:.4f}, "
+              f"mean_AP={agg['mean_ap']:.4f}")
+        mlflow.log_metric("aggregate_mean_auc", agg['mean_auc'])
+        mlflow.log_metric("aggregate_mean_ap", agg['mean_ap'])
+
+        log_stage_complete("Model Evaluation")
+
+        # ================================================================
+        # AFT survival metrics
+        # ================================================================
+        prediction_intervals = None
+        loss_type = config.get('model', {}).get('params', {}).get('loss_type', 'bce') if config else 'bce'
+
+        if loss_type in ('aft', 'deephit'):
+            log_stage_start(f"{loss_type.upper()} Survival Metrics")
+            print(f"\n  Computing {loss_type.upper()} metrics on test set ({len(test_dataset):,} persons)")
+            try:
+                from src.sequence.evaluation import evaluate_aft_survival_metrics, _targets_to_survival, _fast_c_index
+                from src.sequence.dataset import sequence_collate_fn as _collate
+                from torch.utils.data import DataLoader as _DL
+                from sklearn.metrics import roc_auc_score as _roc_auc
+
+                _loader = _DL(
+                    test_dataset, batch_size=estimator.batch_size * 2,
+                    shuffle=False, collate_fn=_collate, drop_last=False,
+                )
+                _tgt = []
+                for _b in _loader:
+                    _tgt.append(_b['targets'].numpy())
+                surv_targets = np.concatenate(_tgt, axis=0)
+
+                if loss_type == 'aft':
+                    aft_result = estimator.predict_aft_params(dataset=test_dataset)
+                    aft_surv_metrics = evaluate_aft_survival_metrics(
+                        aft_params=aft_result.probabilities,
+                        targets=surv_targets, events=events, horizons=horizons,
+                    )
+                    if aft_surv_metrics and 'per_event' in aft_surv_metrics:
+                        print(f"\n  AFT survival metrics (test set, cutoff={test_cutoff}):")
+                        for event_name, ev_metrics in aft_surv_metrics['per_event'].items():
+                            metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in ev_metrics.items())
+                            print(f"    {event_name}: {metrics_str}")
+                            for k, v in ev_metrics.items():
+                                if isinstance(v, float) and not np.isnan(v):
+                                    mlflow.log_metric(f"aft_{event_name}_{k}", v)
+                        aft_agg = aft_surv_metrics.get('aggregate', {})
+                        if aft_agg:
+                            print(f"\n  AFT aggregate: "
+                                  f"C-index={aft_agg.get('mean_c_index', float('nan')):.4f}, "
+                                  f"CRPS={aft_agg.get('mean_crps', float('nan')):.4f}, "
+                                  f"IBS={aft_agg.get('mean_ibs', float('nan')):.4f}, "
+                                  f"TD-AUC={aft_agg.get('mean_td_auc', float('nan')):.4f}")
+                            for k, v in aft_agg.items():
+                                if not np.isnan(v):
+                                    mlflow.log_metric(f"aft_{k}", v)
+
+                elif loss_type == 'deephit':
+                    result = estimator.predict_proba(dataset=test_dataset)
+                    probs = result.probabilities
+                    n_ev, n_h = len(events), len(horizons)
+                    probs_3d = probs.reshape(-1, n_ev, n_h)
+
+                    print(f"\n  DeepHit survival metrics (test set, cutoff={test_cutoff}):")
+                    c_indices, td_aucs = [], []
+                    for ei, event in enumerate(events):
+                        cols = [ei * n_h + hi for hi in range(n_h)]
+                        event_tgt = surv_targets[:, cols]
+                        duration, event_ind = _targets_to_survival(event_tgt, horizons)
+                        cdf_e = probs_3d[:, ei, :]
+                        n_pos = int(event_ind.sum())
+                        if n_pos < 5 or (len(event_ind) - n_pos) < 5:
+                            continue
+                        risk = cdf_e[:, -1]
+                        c_idx = _fast_c_index(event_ind, duration, risk)
+                        c_indices.append(c_idx)
+                        ev_td = []
+                        for hi, h in enumerate(horizons):
+                            y_h = event_tgt[:, hi]
+                            n_p = int(y_h.sum())
+                            if 0 < n_p < len(y_h):
+                                auc_h = float(_roc_auc(y_h, cdf_e[:, hi]))
+                                ev_td.append(auc_h)
+                                td_aucs.append(auc_h)
+                        td_str = ", ".join(f"{h}yr={a:.4f}" for h, a in zip(horizons, ev_td))
+                        print(f"    {event}: C-index={c_idx:.4f}, TD-AUC: {td_str}")
+                    if c_indices:
+                        print(f"\n  DeepHit aggregate: C-index={np.mean(c_indices):.4f}, "
+                              f"TD-AUC={np.mean(td_aucs):.4f}")
+
+            except Exception as e:
+                print(f"  {loss_type.upper()} survival metrics FAILED: {e}")
+                import traceback; traceback.print_exc()
+            log_stage_complete(f"{loss_type.upper()} Survival Metrics")
+
+            log_stage_start("Prediction Intervals")
+            try:
+                prediction_intervals = estimator.predict_intervals(
+                    dataset=test_dataset,
+                    confidence_levels=[0.5, 0.8, 0.9],
+                )
+                for event_name in events:
+                    if event_name in prediction_intervals:
+                        ei = prediction_intervals[event_name]
+                        med = ei['median']
+                        ci80_lo = ei['ci_80_lower']
+                        ci80_hi = ei['ci_80_upper']
+                        print(f"    {event_name}: median={np.median(med):.2f}yr, "
+                              f"80%CI=[{np.median(ci80_lo):.2f}, {np.median(ci80_hi):.2f}]yr")
+                        mlflow.log_metric(f"aft_{event_name}_median_tte",
+                                          float(np.median(med)))
+                        mlflow.log_metric(f"aft_{event_name}_ci80_width",
+                                          float(np.median(ci80_hi - ci80_lo)))
+            except Exception as e:
+                print(f"  Prediction intervals FAILED: {e}")
+                import traceback; traceback.print_exc()
+            log_stage_complete("Prediction Intervals")
+
+        # ================================================================
+        # Per-window evaluation (stability analysis)
+        # ================================================================
+        log_stage_start("Per-Window Stability Analysis")
+        print("\n  Evaluating model on each individual window:")
+        for cutoff in rolling_cutoffs:
+            cp = _cache_path_for(cutoff)
+            if not _cache_exists(cp):
+                continue
+            try:
+                window_ds = CachedSequenceDataset(
+                    parquet_path=output_path,
+                    vocabulary=vocabulary,
+                    max_seq_len=max_seq_len,
+                    events=events,
+                    horizons=horizons,
+                    cutoff_year=cutoff,
+                    cache_path=cp,
+                    min_history_year=cutoff - history_len,
+                    return_ids=True,
+                )
+                window_proba = estimator.predict_proba(dataset=window_ds)
+                window_preds = _build_predictions_from_probs(
+                    window_proba.probabilities, events, horizons,
+                )
+                window_sids = window_proba.metadata.get('sids')
+                if window_sids is None and hasattr(window_ds, '_sids') and window_ds._sids is not None:
+                    window_sids = window_ds._sids
+                if window_sids is None:
+                    raise ValueError(
+                        f"No sids available for cutoff={cutoff}. "
+                        f"Ensure the dataset is created with return_ids=True "
+                        f"and that cached chunks contain 'sids'."
+                    )
+
+                window_labels = _compute_labels_streaming(
+                    parquet_path=output_path,
+                    sids=window_sids,
+                    events=events,
+                    horizons=horizons,
+                    cutoff_year=cutoff,
+                )
+                window_metrics = _evaluate_from_arrays(
+                    all_predictions=window_preds,
+                    y_true=window_labels,
+                    events=events,
+                    horizons=horizons,
+                )
+                w_agg = window_metrics['aggregate']
+                role = "TRAIN" if cutoff in train_cutoffs else ("VAL" if cutoff == val_cutoff else "TEST")
+                print(f"    W cutoff={cutoff} [{role}]: mean_AUC={w_agg['mean_auc']:.4f}, "
+                      f"mean_AP={w_agg['mean_ap']:.4f}")
+                mlflow.log_metric(f"window_{cutoff}_mean_auc", w_agg['mean_auc'])
+                mlflow.log_metric(f"window_{cutoff}_mean_ap", w_agg['mean_ap'])
+                del window_ds, window_proba, window_preds, window_labels
+                gc.collect()
+            except Exception as e:
+                print(f"    W cutoff={cutoff}: FAILED ({e})")
+        log_stage_complete("Per-Window Stability Analysis")
+
+        # ================================================================
+        # Save artifacts
+        # ================================================================
+        log_stage_start("Saving Artifacts")
+
+        checkpoint_dir = "checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_path = os.path.join(
+            checkpoint_dir, f"rolling_{encoder_type}_{timestamp}"
+        )
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        estimator.save(checkpoint_path)
+        print(f"  Saved model: {checkpoint_path}")
+
+        if all_predictions is not None and sids is not None:
+            pred_records = []
+            for i, sid in enumerate(sids):
+                record = {'sid': sid}
+                for event in events:
+                    if event in all_predictions:
+                        for h in horizons:
+                            key = f'prob_{h}yr'
+                            if key in all_predictions[event]:
+                                record[f'{event}_prob_{h}yr'] = float(
+                                    all_predictions[event][key][i]
+                                )
+                    if prediction_intervals and event in prediction_intervals:
+                        ei = prediction_intervals[event]
+                        record[f'{event}_median_tte'] = float(ei['median'][i])
+                        for level in [50, 80, 90]:
+                            lo_key = f'ci_{level}_lower'
+                            hi_key = f'ci_{level}_upper'
+                            if lo_key in ei:
+                                record[f'{event}_ci{level}_lower'] = float(ei[lo_key][i])
+                                record[f'{event}_ci{level}_upper'] = float(ei[hi_key][i])
+                pred_records.append(record)
+
+            pred_df = pd.DataFrame(pred_records)
+            pred_path = os.path.join(checkpoint_path, "predictions.parquet")
+            pred_df.to_parquet(pred_path)
+            print(f"  Saved predictions: {pred_path}")
+
+        serializable_metrics = {}
+        if metrics is not None:
+            for event, em in metrics['per_event'].items():
+                serializable_metrics[event] = {}
+                for hk, hm in em.items():
+                    serializable_metrics[event][hk] = {
+                        k: float(v) if isinstance(v, (np.floating, float)) else v
+                        for k, v in hm.items()
+                    }
+
+        metadata = {
+            'timestamp': timestamp,
+            'model_type': 'sequence',
+            'encoder_type': encoder_type,
+            'events': events,
+            'horizons': horizons,
+            'training_mode': 'rolling_window',
+            'history_len': history_len,
+            'train_cutoffs': train_cutoffs,
+            'val_cutoff': val_cutoff,
+            'test_cutoff': test_cutoff,
+            'vocab_size': vocabulary.vocab_size,
+            'train_samples': len(train_dataset),
+            'val_persons': len(val_dataset),
+            'test_persons': len(test_dataset),
+            'epochs_trained': result.metadata.get('epochs_trained', 0),
+            'n_params': result.metadata.get('n_params', 0),
+            'metrics': serializable_metrics,
+            'aggregate': {
+                k: float(v) if isinstance(v, (np.floating, float)) else v
+                for k, v in agg.items()
+            } if agg else {},
+            'config_path': config_path,
+        }
+        with open(os.path.join(checkpoint_path, "metadata.json"), 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+
+        mlflow.log_artifacts(checkpoint_path, artifact_path="rolling_checkpoint")
+
+        log_stage_complete("Saving Artifacts")
+
+    print("\n" + "=" * 60)
+    print("ROLLING WINDOW PIPELINE COMPLETE")
+    print("=" * 60)
+    if metrics is not None:
+        for event in events:
+            if event in metrics['per_event']:
+                aucs = []
+                for hk, hm in metrics['per_event'][event].items():
+                    a = hm.get('auc', float('nan'))
+                    aucs.append(f"{hk}={a:.3f}" if not np.isnan(a) else f"{hk}=N/A")
+                print(f"  {event}: AUC: {', '.join(aucs)}")
+        print(f"\n  Aggregate: mean_AUC={agg['mean_auc']:.4f}")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print("=" * 60)
+
+    return estimator, metrics, pred_df
+
+
 def main_sequence(
     reuse_processed=False,
     max_rows=None,
@@ -1366,6 +2054,13 @@ def main_sequence(
     tuning_seed=42,
     tuning_workers=1,
     tuning_fraction=1.0,
+    rolling=False,
+    history_len=5,
+    rolling_cutoffs=None,
+    rolling_train_cutoffs=None,
+    rolling_val_cutoff=None,
+    rolling_test_cutoff=None,
+    existing_cache=None,
 ):
     """
     Main sequence model pipeline.
@@ -1381,6 +2076,12 @@ def main_sequence(
         streaming: Force streaming mode for large datasets.
         sample_fraction: Use a fraction of persons for faster prototyping.
         eval_fraction: Use a fraction of persons for evaluation/prediction.
+        rolling: Use rolling window validation.
+        history_len: History window length in years for rolling mode.
+        rolling_cutoffs: List of cutoff years for rolling windows.
+        rolling_train_cutoffs: Subset of cutoffs to use for training.
+        rolling_val_cutoff: Cutoff year for validation.
+        rolling_test_cutoff: Cutoff year for test.
     """
     log_file = setup_logging(
         log_file=f"sequence_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
@@ -1456,6 +2157,28 @@ def main_sequence(
             tuning_seed=tuning_seed,
             tuning_workers=tuning_workers,
             tuning_fraction=tuning_fraction,
+        )
+
+    # Rolling window branch
+    if rolling:
+        log_stage_complete("Loading Processed Features")
+        return _run_rolling_window_pipeline(
+            output_path=output_path,
+            total_rows=total_rows,
+            events=events,
+            horizons=horizons,
+            config=config,
+            encoder_type=encoder_type,
+            reuse_processed=reuse_processed,
+            config_path=config_path,
+            sample_fraction=sample_fraction,
+            eval_fraction=eval_fraction,
+            history_len=history_len,
+            rolling_cutoffs=rolling_cutoffs,
+            train_cutoffs=rolling_train_cutoffs,
+            val_cutoff=rolling_val_cutoff,
+            test_cutoff=rolling_test_cutoff,
+            existing_cache=existing_cache,
         )
 
     # Determine loading strategy
@@ -1843,7 +2566,7 @@ def main_sequence(
             test_targets_list.append(batch['targets'].numpy())
         test_targets = np.concatenate(test_targets_list, axis=0)
 
-        # AFT-native metrics: use raw (mu, sigma) for C-index, CRPS, IBS
+        # Survival metrics: AFT uses parametric distribution, DeepHit uses learned CDF
         loss_type = model_config.get('params', {}).get('loss_type', 'bce')
         if loss_type == 'aft':
             print("\n  Computing AFT-native survival metrics (C-index, CRPS, IBS, TD-AUC)...")
@@ -1882,6 +2605,71 @@ def main_sequence(
             except Exception as e:
                 print(f"  AFT survival metrics failed: {e}")
                 import traceback; traceback.print_exc()
+
+        elif loss_type == 'deephit':
+            print("\n  Computing DeepHit survival metrics (C-index, TD-AUC)...")
+            try:
+                import torch
+                from src.sequence.evaluation import evaluate_survival_metrics, _targets_to_survival, _fast_c_index
+
+                proba_result = estimator.predict_proba(dataset=test_dataset)
+                probs = proba_result.probabilities  # (N, n_events * n_horizons) CDF values
+
+                # Standard survival metrics (TD-AUC, IPCW-Brier)
+                surv_metrics = evaluate_survival_metrics(
+                    probabilities=probs,
+                    targets=test_targets,
+                    events=events,
+                    horizons=horizons,
+                )
+
+                # DeepHit C-index: use CDF at max horizon as risk score
+                n_events = len(events)
+                n_horizons = len(horizons)
+                probs_3d = probs.reshape(-1, n_events, n_horizons)  # (N, E, H)
+
+                dh_per_event = {}
+                c_indices = []
+                for ei, event in enumerate(events):
+                    risk_score = probs_3d[:, ei, -1]  # CDF at max horizon
+                    durations, event_obs = _targets_to_survival(
+                        test_targets[:, ei * n_horizons:(ei + 1) * n_horizons],
+                        horizons,
+                    )
+                    ci = _fast_c_index(event_obs, durations, risk_score)
+                    dh_per_event[event] = {'c_index': ci}
+                    if not np.isnan(ci):
+                        c_indices.append(ci)
+
+                # Merge with standard survival metrics
+                if surv_metrics and 'per_event' in surv_metrics:
+                    for event in events:
+                        if event in surv_metrics['per_event']:
+                            dh_per_event.setdefault(event, {}).update(surv_metrics['per_event'][event])
+
+                print("\n  DeepHit survival metrics:")
+                for event, ev_metrics in dh_per_event.items():
+                    metrics_str = ", ".join(f"{k}={v:.4f}" for k, v in ev_metrics.items())
+                    print(f"    {event}: {metrics_str}")
+                    for k, v in ev_metrics.items():
+                        if isinstance(v, float) and not np.isnan(v):
+                            mlflow.log_metric(f"dh_{event}_{k}", v)
+
+                mean_ci = np.mean(c_indices) if c_indices else float('nan')
+                surv_agg = surv_metrics.get('aggregate', {}) if surv_metrics else {}
+                print(f"\n  DeepHit aggregate: "
+                      f"C-index={mean_ci:.4f}, "
+                      f"mean_TD-AUC={surv_agg.get('mean_td_auc', float('nan')):.4f}")
+                if not np.isnan(mean_ci):
+                    mlflow.log_metric("dh_mean_c_index", mean_ci)
+                for k, v in surv_agg.items():
+                    if not np.isnan(v):
+                        mlflow.log_metric(f"dh_{k}", v)
+
+            except Exception as e:
+                print(f"  DeepHit survival metrics failed: {e}")
+                import traceback; traceback.print_exc()
+
         else:
             print("\n  Computing time-dependent survival metrics...")
             try:
@@ -1975,18 +2763,29 @@ def main_sequence(
             print("\n  Prediction intervals: skipped (requires loss_type='aft')")
 
         # ================================================================
-        # STAGE 6f: Event ordering evaluation (AFT only)
+        # STAGE 6f: Event ordering evaluation (AFT or DeepHit)
         # ================================================================
-        if loss_type == 'aft':
+        if loss_type in ('aft', 'deephit'):
             log_stage_start("Event Ordering")
             print("\n  Evaluating event ordering (pairwise, top-1/k, Kendall's tau)...")
             try:
                 from src.sequence.evaluation import evaluate_event_ordering
 
-                # aft_result was computed in stage 6b
-                aft_params = aft_result.probabilities
                 n_ev = len(events)
-                pred_mu = aft_params[:, :n_ev]
+                n_h = len(horizons)
+
+                if loss_type == 'aft':
+                    aft_params = aft_result.probabilities
+                    pred_mu = aft_params[:, :n_ev]
+                else:
+                    # DeepHit: derive pseudo-mu from learned CDF
+                    # Higher CDF at max horizon → event expected sooner → lower pseudo-mu
+                    if 'proba_result' not in dir():
+                        proba_result = estimator.predict_proba(dataset=test_dataset)
+                    probs_3d = proba_result.probabilities.reshape(-1, n_ev, n_h)
+                    cdf_max = probs_3d[:, :, -1]  # (N, E) CDF at max horizon
+                    # Negative log so higher CDF → lower mu (earlier event)
+                    pred_mu = -np.log(np.clip(cdf_max, 1e-7, 1.0))
 
                 ordering = evaluate_event_ordering(
                     predicted_mu=pred_mu,
@@ -2024,7 +2823,190 @@ def main_sequence(
                 import traceback; traceback.print_exc()
             log_stage_complete("Event Ordering")
         else:
-            print("\n  Event ordering: skipped (requires loss_type='aft')")
+            print("\n  Event ordering: skipped (requires loss_type='aft' or 'deephit')")
+
+        # ================================================================
+        # STAGE 6g: Language-model-style metrics (all loss types)
+        # ================================================================
+        log_stage_start("LM Metrics")
+        print("\n  Evaluating language-model-style metrics (next-event accuracy, perplexity, temporal)...")
+        try:
+            from src.sequence.evaluation import evaluate_lm_metrics
+
+            if 'proba_result' not in dir():
+                proba_result = estimator.predict_proba(dataset=test_dataset)
+
+            lm_results = evaluate_lm_metrics(
+                probabilities=proba_result.probabilities,
+                targets=test_targets,
+                events=events,
+                horizons=horizons,
+                top_k=3,
+            )
+
+            n_w = lm_results['n_with_events']
+            n_t = lm_results['n_total']
+            print(f"  Persons with events: {n_w} ({100*n_w/max(n_t,1):.1f}% of test set)")
+
+            if n_w > 0:
+                print(f"  Next-event top-1 accuracy:     {lm_results['next_event_top1_accuracy']:.4f}")
+                print(f"  Next-event top-3 accuracy:     {lm_results['next_event_topk_accuracy']:.4f}")
+                print(f"  Next-event MRR:                {lm_results['next_event_mrr']:.4f}")
+                print(f"  Event perplexity:              {lm_results['event_perplexity']:.4f}")
+                print(f"  Multi-label perplexity:        {lm_results['multi_label_perplexity']:.4f}")
+                print(f"  Temporal consistency:           {lm_results['temporal_consistency']:.4f}")
+                print(f"  Cross-horizon rank stability:  {lm_results['cross_horizon_rank_stability']:.4f}")
+
+                # Log scalar metrics to MLflow
+                for lm_key in ['next_event_top1_accuracy', 'next_event_topk_accuracy',
+                               'next_event_mrr', 'event_perplexity', 'multi_label_perplexity',
+                               'temporal_consistency', 'cross_horizon_rank_stability']:
+                    v = lm_results[lm_key]
+                    if isinstance(v, float) and not np.isnan(v):
+                        mlflow.log_metric(f"lm_{lm_key}", v)
+
+                # Per-horizon breakdown
+                print("\n  Per-horizon accuracy:")
+                for h_key, h_vals in lm_results['per_horizon'].items():
+                    h_n = h_vals['n_with_events']
+                    h_t1 = h_vals['top1_accuracy']
+                    h_tk = h_vals['topk_accuracy']
+                    if h_n > 0:
+                        print(f"    {h_key}: top1={h_t1:.4f}, top3={h_tk:.4f} (n={h_n})")
+                        mlflow.log_metric(f"lm_top1_{h_key}", h_t1)
+                        mlflow.log_metric(f"lm_top3_{h_key}", h_tk)
+
+                # Per-event recall/precision
+                print("\n  Per-event next-event recall / precision:")
+                for event in events:
+                    rec = lm_results['per_event_recall'].get(event, float('nan'))
+                    prec = lm_results['per_event_precision'].get(event, float('nan'))
+                    rec_s = f"{rec:.3f}" if not np.isnan(rec) else "n/a"
+                    prec_s = f"{prec:.3f}" if not np.isnan(prec) else "n/a"
+                    print(f"    {event}: recall={rec_s}, precision={prec_s}")
+                    if not np.isnan(rec):
+                        mlflow.log_metric(f"lm_recall_{event}", rec)
+                    if not np.isnan(prec):
+                        mlflow.log_metric(f"lm_precision_{event}", prec)
+            else:
+                print("  No persons with events — skipping LM metrics")
+        except Exception as e:
+            print(f"  LM metrics evaluation failed: {e}")
+            import traceback; traceback.print_exc()
+        log_stage_complete("LM Metrics")
+
+        # ================================================================
+        # STAGE 6h: Grouped evaluation (per age-group / municipality)
+        # ================================================================
+        log_stage_start("Grouped Evaluation")
+        print("\n  Evaluating metrics per demographic group (age, municipality)...")
+        try:
+            from src.sequence.evaluation import evaluate_grouped_metrics
+
+            if 'proba_result' not in dir():
+                proba_result = estimator.predict_proba(dataset=test_dataset)
+            sids_g = proba_result.metadata.get('sids')
+            if sids_g is None and hasattr(test_dataset, '_sids'):
+                sids_g = test_dataset._sids
+
+            # Detect available group columns
+            schema_cols = set(pq.ParquetDataset(output_path).schema.names)
+            available_group_cols = [c for c in ['age_group', 'refnis'] if c in schema_cols]
+
+            if available_group_cols and sids_g is not None:
+                group_features_df = _load_group_features_streaming(
+                    parquet_path=output_path,
+                    sids=sids_g,
+                    cutoff_year=test_cutoff,
+                    group_cols=available_group_cols,
+                )
+                print(f"  Loaded group features for {len(group_features_df):,} persons "
+                      f"({', '.join(available_group_cols)})")
+
+                for group_col in available_group_cols:
+                    if group_col not in group_features_df.columns:
+                        continue
+
+                    print(f"\n{'=' * 60}")
+                    print(f"GROUPED EVALUATION: {group_col}")
+                    print(f"{'=' * 60}")
+
+                    g_result = evaluate_grouped_metrics(
+                        probabilities=proba_result.probabilities,
+                        targets=test_targets,
+                        group_labels=group_features_df[group_col].values,
+                        events=events,
+                        horizons=horizons,
+                        group_name=group_col,
+                        min_group_size=50 if group_col == 'age_group' else 100,
+                        calibrate_thresholds=True,
+                    )
+
+                    gt = g_result['group_table']
+                    if gt.empty:
+                        print(f"  No groups with sufficient size — skipping")
+                        continue
+
+                    summary = g_result['summary']
+                    print(f"  {summary['n_groups']} groups, {summary['total_persons']:,} persons")
+
+                    # Print per-event MAE/RMSE summary
+                    print(f"\n  Rate MAE (predicted mean vs observed rate):")
+                    for ei, event in enumerate(events):
+                        for h in horizons:
+                            prefix = f'{event}_{h}yr'
+                            mae_w = summary.get(f'{prefix}_mae_weighted')
+                            cal_mae_w = summary.get(f'{prefix}_cal_mae_weighted')
+                            if mae_w is not None:
+                                line = f"    {prefix}: MAE={mae_w:.4f}"
+                                if cal_mae_w is not None:
+                                    line += f"  cal_MAE={cal_mae_w:.4f}"
+                                print(line)
+                                mlflow.log_metric(f"grp_{group_col}_{prefix}_mae", mae_w)
+                                if cal_mae_w is not None:
+                                    mlflow.log_metric(f"grp_{group_col}_{prefix}_cal_mae", cal_mae_w)
+
+                    # LM metrics per group
+                    lm_sum = g_result['lm_summary']
+                    if lm_sum:
+                        print(f"\n  LM metrics across {group_col} groups:")
+                        for lm_key in ['lm_top1_acc', 'lm_top3_acc', 'lm_mrr', 'lm_perplexity']:
+                            w = lm_sum.get(f'{lm_key}_weighted')
+                            s = lm_sum.get(f'{lm_key}_std')
+                            if w is not None:
+                                print(f"    {lm_key}: {w:.4f} (std={s:.4f})")
+                                mlflow.log_metric(f"grp_{group_col}_{lm_key}", w)
+
+                    # Print group table (top/bottom groups by LM top-1)
+                    if 'lm_top1_acc' in gt.columns and not gt['lm_top1_acc'].isna().all():
+                        sorted_gt = gt.dropna(subset=['lm_top1_acc']).sort_values('lm_top1_acc')
+                        n_show = min(5, len(sorted_gt))
+                        if n_show > 0:
+                            print(f"\n  Bottom {n_show} groups by LM top-1 accuracy:")
+                            for _, r in sorted_gt.head(n_show).iterrows():
+                                print(f"    {group_col}={r[group_col]}: n={int(r['count'])}, "
+                                      f"top1={r['lm_top1_acc']:.3f}, top3={r['lm_top3_acc']:.3f}, "
+                                      f"ppl={r['lm_perplexity']:.2f}")
+                            print(f"\n  Top {n_show} groups by LM top-1 accuracy:")
+                            for _, r in sorted_gt.tail(n_show).iterrows():
+                                print(f"    {group_col}={r[group_col]}: n={int(r['count'])}, "
+                                      f"top1={r['lm_top1_acc']:.3f}, top3={r['lm_top3_acc']:.3f}, "
+                                      f"ppl={r['lm_perplexity']:.2f}")
+
+                    # Save full group table as artifact
+                    group_table_path = f"checkpoints/grouped_metrics_{group_col}.csv"
+                    os.makedirs("checkpoints", exist_ok=True)
+                    gt.to_csv(group_table_path, index=False)
+                    mlflow.log_artifact(group_table_path)
+                    print(f"\n  Full group table saved to {group_table_path}")
+
+                del group_features_df
+            else:
+                print("  No group columns available or no sids — skipping grouped evaluation")
+        except Exception as e:
+            print(f"  Grouped evaluation failed: {e}")
+            import traceback; traceback.print_exc()
+        log_stage_complete("Grouped Evaluation")
 
         # ================================================================
         # STAGE 7: Save artifacts
@@ -2171,6 +3153,24 @@ if __name__ == "__main__":
                         help='Fraction of training data per tuning trial (default: 0.3). '
                              'Each trial gets a different random subset. Reduces GPU memory '
                              'and speeds up trials, enabling parallel workers.')
+    # Rolling window arguments
+    parser.add_argument('--rolling', action='store_true',
+                        help='Use rolling window validation (multiple cutoff years)')
+    parser.add_argument('--history-len', type=int, default=5,
+                        help='History window length in years for rolling mode (default: 5)')
+    parser.add_argument('--rolling-cutoffs', type=str,
+                        help='Comma-separated cutoff years for rolling windows. '
+                             'Auto-detected from data if not specified.')
+    parser.add_argument('--rolling-train-cutoffs', type=str,
+                        help='Comma-separated cutoffs for training (default: all except last 2)')
+    parser.add_argument('--rolling-val-cutoff', type=int,
+                        help='Cutoff year for validation window (default: second-to-last)')
+    parser.add_argument('--rolling-test-cutoff', type=int,
+                        help='Cutoff year for test window (default: last)')
+    parser.add_argument('--existing-cache', type=str,
+                        help='Path to existing single-cutoff cache directory with '
+                             'per-year shards. Reuses these to build rolling caches '
+                             'without re-reading raw parquet.')
 
     args = parser.parse_args()
 
@@ -2199,10 +3199,28 @@ if __name__ == "__main__":
         print(f"  Eval fraction: {args.eval_fraction:.2%}")
     if args.tune:
         print(f"  Tuning: {args.n_trials} trials, {args.tuning_epochs} epochs/trial, {args.search_space} space, seed={args.tuning_seed}, fraction={args.tuning_fraction:.0%}, workers={args.tuning_workers}")
+    if args.rolling:
+        print(f"  Rolling: history_len={args.history_len}")
+        if args.rolling_cutoffs:
+            print(f"  Rolling cutoffs: {args.rolling_cutoffs}")
+        if args.rolling_train_cutoffs:
+            print(f"  Train cutoffs: {args.rolling_train_cutoffs}")
+        if args.rolling_val_cutoff:
+            print(f"  Val cutoff: {args.rolling_val_cutoff}")
+        if args.rolling_test_cutoff:
+            print(f"  Test cutoff: {args.rolling_test_cutoff}")
     print(f"  Horizons: {horizons} years")
     print(f"  Cutoff year: {args.cutoff_year}")
     print("=" * 60)
     print()
+
+    # Parse rolling cutoff lists
+    rolling_cutoffs = None
+    if args.rolling_cutoffs:
+        rolling_cutoffs = sorted([int(c.strip()) for c in args.rolling_cutoffs.split(',')])
+    rolling_train_cutoffs = None
+    if args.rolling_train_cutoffs:
+        rolling_train_cutoffs = sorted([int(c.strip()) for c in args.rolling_train_cutoffs.split(',')])
 
     main_sequence(
         reuse_processed=args.reuse,
@@ -2221,4 +3239,11 @@ if __name__ == "__main__":
         tuning_seed=args.tuning_seed,
         tuning_workers=args.tuning_workers,
         tuning_fraction=args.tuning_fraction,
+        rolling=args.rolling,
+        history_len=args.history_len,
+        rolling_cutoffs=rolling_cutoffs,
+        rolling_train_cutoffs=rolling_train_cutoffs,
+        rolling_val_cutoff=args.rolling_val_cutoff,
+        rolling_test_cutoff=args.rolling_test_cutoff,
+        existing_cache=args.existing_cache,
     )

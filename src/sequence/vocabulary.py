@@ -274,6 +274,7 @@ class LifeEventVocabulary:
         person_df: pd.DataFrame,
         time_col: str = 'year',
         max_year: Optional[int] = None,
+        min_year: Optional[int] = None,
         **kwargs,
     ) -> List[int]:
         """
@@ -282,6 +283,7 @@ class LifeEventVocabulary:
         Args:
             person_df: DataFrame rows for a single person, sorted by year.
             max_year: Only include observations up to this year (inclusive).
+            min_year: Only include observations after this year (exclusive).
 
         Returns:
             [BOS, year1_tokens, SEP, year2_tokens, SEP, ..., EOS]
@@ -289,6 +291,8 @@ class LifeEventVocabulary:
         person_df = person_df.sort_values(time_col)
         if max_year is not None:
             person_df = person_df[person_df[time_col] <= max_year]
+        if min_year is not None:
+            person_df = person_df[person_df[time_col] > min_year]
 
         if len(person_df) == 0:
             return [self.BOS, self.EOS]

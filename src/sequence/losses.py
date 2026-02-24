@@ -105,6 +105,188 @@ class AFTLoss(nn.Module):
         return nll.mean()
 
 
+class DeepHitLoss(nn.Module):
+    """
+    DeepHit loss (Lee et al., 2018): NLL + ranking loss for competing risks.
+
+    Model output: (batch, n_events * n_horizons) raw logits.
+    Per event: softmax over (n_horizons + 1) bins to produce a valid PMF
+    (n_horizons interval bins + 1 censored/survived bin).
+
+    Loss = L_nll + alpha * L_rank
+
+    L_nll: Negative log-likelihood of the observed interval.
+    L_rank: Concordance ranking loss — for pairs (i, j) where i had an event
+    before j, encourage F(t_i | x_i) > F(t_j | x_j).
+
+    Targets: same binary cumulative format as other losses:
+        [1,0,0] → event in interval 0 (before h1)
+        [0,1,0] → event in interval 1 (h1 to h3)
+        [0,0,1] → event in interval 2 (h3 to h5)
+        [0,0,0] → right-censored (survived past h5)
+    """
+
+    def __init__(
+        self,
+        horizons: List[int],
+        n_events: int,
+        alpha: float = 0.1,
+        sigma_rank: float = 0.1,
+        n_rank_pairs: int = 128,
+        event_weights: Optional[torch.Tensor] = None,
+        horizon_weights: Optional[torch.Tensor] = None,
+        reduction: str = 'mean',
+    ):
+        super().__init__()
+        self.n_events = n_events
+        self.n_horizons = len(horizons)
+        self.alpha = alpha
+        self.sigma_rank = sigma_rank
+        self.n_rank_pairs = n_rank_pairs
+        self.reduction = reduction
+        self.register_buffer(
+            'horizons_t',
+            torch.tensor(horizons, dtype=torch.float32),
+        )
+        if event_weights is not None:
+            self.register_buffer('event_weights', event_weights)
+        else:
+            self.event_weights = None
+        if horizon_weights is not None:
+            padded = torch.cat([horizon_weights, torch.ones(1, device=horizon_weights.device)])
+            self.register_buffer('horizon_weights', padded)
+        else:
+            self.horizon_weights = None
+
+    def forward(
+        self,
+        output: torch.Tensor,
+        targets: torch.Tensor,
+        sample_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        batch = output.size(0)
+
+        # Reshape to (batch, n_events, n_horizons)
+        logits_3d = output.view(batch, self.n_events, self.n_horizons)
+
+        # Append implicit censored logit (0) → (batch, n_events, n_horizons+1)
+        censored_logit = torch.zeros(
+            batch, self.n_events, 1,
+            device=output.device, dtype=output.dtype,
+        )
+        logits_ext = torch.cat([logits_3d, censored_logit], dim=-1)
+
+        # Softmax → valid PMF per event
+        pmf = torch.softmax(logits_ext, dim=-1)  # (batch, n_events, n_horizons+1)
+
+        # Determine observed interval from binary cumulative targets
+        targets_3d = targets.view(batch, self.n_events, self.n_horizons)
+        any_event = targets_3d.any(dim=-1)  # (batch, n_events)
+        first_idx = targets_3d.long().argmax(dim=-1)  # (batch, n_events)
+        # Censored samples get index n_horizons (the last bin)
+        interval_idx = torch.where(
+            any_event, first_idx,
+            torch.full_like(first_idx, self.n_horizons),
+        )
+
+        # NLL: -log(pmf[observed_interval])
+        log_pmf = torch.log(pmf.clamp(min=1e-8))
+        nll = -log_pmf.gather(dim=-1, index=interval_idx.unsqueeze(-1)).squeeze(-1)
+
+        # Apply horizon-dependent weighting
+        if self.horizon_weights is not None:
+            hw = self.horizon_weights[interval_idx]
+            nll = nll * hw
+
+        if self.event_weights is not None:
+            nll = nll * self.event_weights.unsqueeze(0)
+
+        if sample_weights is not None:
+            nll = nll * sample_weights.unsqueeze(-1)
+
+        if self.reduction == 'per_event':
+            nll_loss = nll.mean(dim=0)  # (n_events,)
+        else:
+            nll_loss = nll.mean()
+
+        # Ranking loss (sampled within mini-batch)
+        if self.alpha > 0 and batch > 1:
+            rank_loss = self._ranking_loss(pmf, targets_3d, any_event, first_idx)
+            return nll_loss + self.alpha * rank_loss
+        return nll_loss
+
+    def _ranking_loss(self, pmf, targets_3d, any_event, first_idx):
+        """Concordance ranking loss sampled within the mini-batch.
+
+        For pairs (i, j) where person i had event at interval k_i and
+        person j either: (a) had event at later interval k_j > k_i, or
+        (b) was censored:
+            L_rank = exp(-(F(t_i|x_i) - F(t_j|x_i)) / sigma)
+        where F(t) is the cumulative probability at time t.
+        """
+        batch = pmf.size(0)
+        device = pmf.device
+
+        # CDF from PMF: cumulative sum over intervals (exclude censored bin)
+        cdf = pmf[:, :, :self.n_horizons].cumsum(dim=-1)  # (batch, n_events, n_horizons)
+
+        total_rank_loss = torch.tensor(0.0, device=device)
+        n_valid_pairs = 0
+
+        for ei in range(self.n_events):
+            event_mask = any_event[:, ei]  # (batch,) bool
+            event_indices = torch.where(event_mask)[0]
+            if len(event_indices) < 1:
+                continue
+
+            event_intervals = first_idx[event_indices, ei]  # interval index for each event person
+            cdf_ei = cdf[:, ei, :]  # (batch, n_horizons)
+
+            # Sample pairs: pick event persons as "i", random others as "j"
+            n_pairs = min(self.n_rank_pairs, len(event_indices) * (batch - 1))
+            if n_pairs == 0:
+                continue
+
+            # Sample i indices (persons with events)
+            i_local = torch.randint(0, len(event_indices), (n_pairs,), device=device)
+            i_idx = event_indices[i_local]
+            i_intervals = event_intervals[i_local]
+
+            # Sample j indices (any other person)
+            j_idx = torch.randint(0, batch - 1, (n_pairs,), device=device)
+            j_idx = torch.where(j_idx >= i_idx, j_idx + 1, j_idx)  # avoid self-pairs
+            j_idx = j_idx.clamp(0, batch - 1)
+
+            # j must have later event or be censored
+            j_has_event = any_event[j_idx, ei]
+            j_intervals = first_idx[j_idx, ei]
+            # Valid pair: j censored OR j_interval > i_interval
+            valid = (~j_has_event) | (j_intervals > i_intervals)
+            if not valid.any():
+                continue
+
+            i_idx = i_idx[valid]
+            i_intervals = i_intervals[valid]
+            j_idx = j_idx[valid]
+
+            # F(t_i | x_i) - cumulative probability at the event time of i
+            # for both person i and person j
+            f_i_at_ti = cdf_ei[i_idx].gather(1, i_intervals.unsqueeze(-1)).squeeze(-1)
+            f_j_at_ti = cdf_ei[j_idx].gather(1, i_intervals.unsqueeze(-1)).squeeze(-1)
+
+            # Ranking loss: should have f_i_at_ti > f_j_at_ti
+            # eta = exp(-(f_i - f_j) / sigma)
+            diff = f_i_at_ti - f_j_at_ti
+            pair_loss = torch.exp(-diff / self.sigma_rank)
+
+            total_rank_loss = total_rank_loss + pair_loss.sum()
+            n_valid_pairs += len(pair_loss)
+
+        if n_valid_pairs > 0:
+            return total_rank_loss / n_valid_pairs
+        return torch.tensor(0.0, device=device)
+
+
 class EventBCELoss(nn.Module):
     """
     BCE loss with per-event structure for event weighting.

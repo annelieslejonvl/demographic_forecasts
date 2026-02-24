@@ -161,6 +161,7 @@ class SequenceDataset(Dataset):
         cutoff_year: int = 2022,
         id_col: str = 'sid',
         time_col: str = 'year',
+        min_history_year: Optional[int] = None,
     ):
         self.vocabulary = vocabulary
         self.max_seq_len = max_seq_len
@@ -169,6 +170,7 @@ class SequenceDataset(Dataset):
         self.cutoff_year = cutoff_year
         self.id_col = id_col
         self.time_col = time_col
+        self.min_history_year = min_history_year
 
         self.n_events = len(self.events)
         self.n_horizons = len(self.horizons)
@@ -188,8 +190,10 @@ class SequenceDataset(Dataset):
 
         n_skipped = 0
         for sid, person_df in grouped:
-            # Input: history up to cutoff_year
+            # Input: history up to cutoff_year (and after min_history_year if set)
             history = person_df[person_df[self.time_col] <= self.cutoff_year]
+            if self.min_history_year is not None:
+                history = history[history[self.time_col] > self.min_history_year]
             if len(history) == 0:
                 n_skipped += 1
                 continue
@@ -199,6 +203,7 @@ class SequenceDataset(Dataset):
                 history,
                 time_col=self.time_col,
                 max_year=self.cutoff_year,
+                min_year=self.min_history_year,
             )
 
             # Build targets from future observations
@@ -313,6 +318,7 @@ class StreamingSequenceDataset(IterableDataset):
         allowed_sids: Optional[Set[Any]] = None,
         return_ids: bool = False,
         n_samples: Optional[int] = None,
+        min_history_year: Optional[int] = None,
     ):
         self.parquet_path = parquet_path
         self.vocabulary = vocabulary
@@ -326,6 +332,7 @@ class StreamingSequenceDataset(IterableDataset):
         self.allowed_sids = allowed_sids
         self.return_ids = return_ids
         self.n_samples = n_samples
+        self.min_history_year = min_history_year
         self.n_events = len(self.events)
         self.n_horizons = len(self.horizons)
         self.n_outputs = self.n_events * self.n_horizons
@@ -403,11 +410,14 @@ class StreamingSequenceDataset(IterableDataset):
     ) -> Optional[Dict[str, torch.Tensor]]:
         """Tokenize a person's history and build targets."""
         history = person_df[person_df[self.time_col] <= self.cutoff_year]
+        if self.min_history_year is not None:
+            history = history[history[self.time_col] > self.min_history_year]
         if len(history) == 0:
             return None
 
         tokens = self.vocabulary.tokenize_person_history(
             history, time_col=self.time_col, max_year=self.cutoff_year,
+            min_year=self.min_history_year,
         )
 
         future = person_df[person_df[self.time_col] > self.cutoff_year]
@@ -488,6 +498,7 @@ class CachedSequenceDataset(Dataset):
         allowed_sids: Optional[Set[Any]] = None,
         return_ids: bool = False,
         cache_path: Optional[str] = None,
+        min_history_year: Optional[int] = None,
     ):
         self.vocabulary = vocabulary
         self.max_seq_len = max_seq_len
@@ -498,6 +509,7 @@ class CachedSequenceDataset(Dataset):
         self.id_col = id_col
         self.time_col = time_col
         self.return_ids = return_ids
+        self.min_history_year = min_history_year
         self.n_events = len(self.events)
         self.n_horizons = len(self.horizons)
         self.n_outputs = self.n_events * self.n_horizons
@@ -756,16 +768,22 @@ class CachedSequenceDataset(Dataset):
             all_sids = []
             n_processed = 0
 
-            # Read in chunks and process by person
-            for chunk in pd.read_parquet(merged_path, chunksize=100000):
+            # Read merged parquet in batches via PyArrow
+            import pyarrow.parquet as pq_local
+            pf = pq_local.ParquetFile(merged_path)
+            for batch in pf.iter_batches(batch_size=100_000):
+                chunk = batch.to_pandas()
                 for sid, person_df in chunk.groupby(self.id_col):
                     person_df = person_df.sort_values(self.time_col)
                     history = person_df[person_df[self.time_col] <= self.cutoff_year]
+                    if self.min_history_year is not None:
+                        history = history[history[self.time_col] > self.min_history_year]
                     if len(history) == 0:
                         continue
 
                     tokens = self.vocabulary.tokenize_person_history(
                         history, time_col=self.time_col, max_year=self.cutoff_year,
+                        min_year=self.min_history_year,
                     )
                     future = person_df[person_df[self.time_col] > self.cutoff_year]
                     targets = self._build_targets(future)
@@ -993,3 +1011,381 @@ def sequence_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch
     if 'sample_weight' in batch[0]:
         output['sample_weight'] = torch.stack([b['sample_weight'] for b in batch])
     return output
+
+
+class RollingWindowDataset(Dataset):
+    """
+    In-memory dataset that creates multiple samples per person using
+    rolling cutoff windows. Each person appears once per valid window
+    (has both history and future data for that window).
+
+    Example with history_len=5, horizons=[1,3,5]:
+      Window 1: history 2011-2015, cutoff=2015, targets 2016-2020
+      Window 2: history 2012-2016, cutoff=2016, targets 2017-2021
+      ...
+
+    Args:
+        df: Panel DataFrame with columns sid, year, events, etc.
+        vocabulary: Built LifeEventVocabulary instance.
+        cutoff_years: List of cutoff years for rolling windows.
+        history_len: Number of years of history per window.
+        max_seq_len: Maximum sequence length (pad/truncate).
+        events: Event column names to predict.
+        horizons: Prediction horizons in years.
+        id_col: Person ID column.
+        time_col: Time column.
+    """
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        vocabulary: LifeEventVocabulary,
+        cutoff_years: List[int],
+        history_len: int = 5,
+        max_seq_len: int = 256,
+        events: Optional[List[str]] = None,
+        horizons: Optional[List[int]] = None,
+        id_col: str = 'sid',
+        time_col: str = 'year',
+    ):
+        self.vocabulary = vocabulary
+        self.cutoff_years = sorted(cutoff_years)
+        self.history_len = history_len
+        self.max_seq_len = max_seq_len
+        self.events = events or DEFAULT_EVENTS
+        self.horizons = horizons or DEFAULT_HORIZONS
+        self.id_col = id_col
+        self.time_col = time_col
+
+        self.n_events = len(self.events)
+        self.n_horizons = len(self.horizons)
+        self.n_outputs = self.n_events * self.n_horizons
+
+        self._prepare_rolling(df)
+
+    def _prepare_rolling(self, df: pd.DataFrame):
+        """Create one sample per person per valid rolling window."""
+        df = df.sort_values([self.id_col, self.time_col])
+        grouped = df.groupby(self.id_col)
+
+        self._person_ids = []
+        self._cutoff_labels = []
+        self._sequences = []
+        self._targets = []
+
+        max_horizon = max(self.horizons)
+        n_skipped = 0
+
+        for sid, person_df in grouped:
+            for cutoff in self.cutoff_years:
+                min_year = cutoff - self.history_len
+
+                # History: years in (min_year, cutoff]
+                history = person_df[
+                    (person_df[self.time_col] > min_year)
+                    & (person_df[self.time_col] <= cutoff)
+                ]
+                if len(history) == 0:
+                    n_skipped += 1
+                    continue
+
+                # Future: years in (cutoff, cutoff + max_horizon]
+                future = person_df[
+                    (person_df[self.time_col] > cutoff)
+                    & (person_df[self.time_col] <= cutoff + max_horizon)
+                ]
+                if len(future) == 0:
+                    n_skipped += 1
+                    continue
+
+                tokens = self.vocabulary.tokenize_person_history(
+                    history,
+                    time_col=self.time_col,
+                    max_year=cutoff,
+                    min_year=min_year,
+                )
+                targets = self._build_targets(future, cutoff_year=cutoff)
+
+                self._person_ids.append(sid)
+                self._cutoff_labels.append(cutoff)
+                self._sequences.append(tokens)
+                self._targets.append(targets)
+
+        if n_skipped > 0:
+            logger.info(f"Skipped {n_skipped} person-window pairs (no history or future)")
+
+        per_window = {}
+        for c in self._cutoff_labels:
+            per_window[c] = per_window.get(c, 0) + 1
+        window_str = ', '.join(f"{y}:{n:,}" for y, n in sorted(per_window.items()))
+
+        logger.info(
+            f"RollingWindowDataset: {len(self._person_ids):,} total samples "
+            f"from {len(self.cutoff_years)} windows [{window_str}]"
+        )
+
+    def _build_targets(
+        self, future_df: pd.DataFrame, cutoff_year: int,
+    ) -> np.ndarray:
+        targets = np.zeros(self.n_outputs, dtype=np.float32)
+        for ei, event_col in enumerate(self.events):
+            if event_col not in future_df.columns:
+                continue
+            for hi, horizon in enumerate(self.horizons):
+                max_year = cutoff_year + horizon
+                window = future_df[future_df[self.time_col] <= max_year]
+                if len(window) > 0 and window[event_col].astype(int).sum() > 0:
+                    targets[ei * self.n_horizons + hi] = 1.0
+        return targets
+
+    def _pad_or_truncate(self, tokens: List[int]) -> Tuple[np.ndarray, np.ndarray]:
+        seq_len = len(tokens)
+        if seq_len >= self.max_seq_len:
+            input_ids = np.array(tokens[-self.max_seq_len:], dtype=np.int64)
+            attention_mask = np.ones(self.max_seq_len, dtype=np.float32)
+        else:
+            input_ids = np.full(self.max_seq_len, self.vocabulary.PAD, dtype=np.int64)
+            input_ids[:seq_len] = tokens
+            attention_mask = np.zeros(self.max_seq_len, dtype=np.float32)
+            attention_mask[:seq_len] = 1.0
+        return input_ids, attention_mask
+
+    def __len__(self) -> int:
+        return len(self._person_ids)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        tokens = self._sequences[idx]
+        targets = self._targets[idx]
+        input_ids, attention_mask = self._pad_or_truncate(tokens)
+        return {
+            'input_ids': torch.from_numpy(input_ids),
+            'attention_mask': torch.from_numpy(attention_mask),
+            'targets': torch.from_numpy(targets),
+        }
+
+    def get_pos_weights(self, max_samples: Optional[int] = None) -> torch.Tensor:
+        all_targets = np.stack(self._targets)
+        if max_samples is not None:
+            all_targets = all_targets[:max_samples]
+        n_pos = all_targets.sum(axis=0).clip(min=1.0)
+        n_neg = (len(all_targets) - n_pos).clip(min=1.0)
+        pos_weight = n_neg / n_pos
+        return torch.from_numpy(pos_weight.astype(np.float32))
+
+
+class CachedRollingWindowDataset(Dataset):
+    """
+    Loads pre-built per-cutoff cache files and presents them as a single
+    dataset. Each cache is a .pt file (or _chunks directory) from one
+    rolling window cutoff year.
+
+    Reuses the chunked loading infrastructure from CachedSequenceDataset
+    for memory-efficient access to large datasets.
+
+    Args:
+        cache_paths: List of .pt cache file paths (one per cutoff).
+        cutoff_years: Corresponding cutoff years for each cache.
+        max_seq_len: Maximum sequence length.
+        events: Event column names.
+        horizons: Prediction horizons.
+    """
+
+    def __init__(
+        self,
+        cache_paths: List[str],
+        cutoff_years: List[int],
+        max_seq_len: int = 256,
+        events: Optional[List[str]] = None,
+        horizons: Optional[List[int]] = None,
+        return_ids: bool = False,
+    ):
+        self.max_seq_len = max_seq_len
+        self.events = events or DEFAULT_EVENTS
+        self.horizons = horizons or DEFAULT_HORIZONS
+        self.return_ids = return_ids
+        self.n_events = len(self.events)
+        self.n_horizons = len(self.horizons)
+        self.n_outputs = self.n_events * self.n_horizons
+        self.cutoff_years = cutoff_years
+
+        # Collect all chunk paths from all windows
+        self._chunk_paths = []
+        self._chunk_sizes = []
+        self._chunk_cutoffs = []  # which cutoff each chunk belongs to
+
+        for cache_path, cutoff in zip(cache_paths, cutoff_years):
+            chunk_dir = cache_path.replace('.pt', '_chunks')
+
+            if os.path.isdir(chunk_dir):
+                # Chunked cache: load manifest or scan chunks
+                self._load_window_chunks(chunk_dir, cutoff)
+            elif os.path.exists(cache_path):
+                # Single .pt file: treat as one chunk
+                cache = torch.load(cache_path, map_location='cpu', weights_only=False)
+                n = cache['input_ids'].shape[0]
+                self._chunk_paths.append(cache_path)
+                self._chunk_sizes.append(n)
+                self._chunk_cutoffs.append(cutoff)
+                del cache
+                logger.info(f"  Window cutoff={cutoff}: {n:,} samples (single file)")
+            else:
+                logger.warning(
+                    f"Cache not found for cutoff={cutoff}: {cache_path}. "
+                    f"Run build_sequence_cache.py --rolling first."
+                )
+
+        # Build offsets for global indexing
+        self._chunk_offsets = []
+        offset = 0
+        for size in self._chunk_sizes:
+            self._chunk_offsets.append(offset)
+            offset += size
+        self._chunk_offsets.append(offset)  # sentinel
+        self._total_len = offset
+
+        # LRU cache for chunk data
+        self._chunk_cache = {}
+        self._chunk_cache_order = []
+        self._chunk_cache_max = 3
+        self._using_chunks = True
+
+        per_window = {}
+        for ci, cutoff in enumerate(self._chunk_cutoffs):
+            per_window[cutoff] = per_window.get(cutoff, 0) + self._chunk_sizes[ci]
+        window_str = ', '.join(f"{y}:{n:,}" for y, n in sorted(per_window.items()))
+        logger.info(
+            f"CachedRollingWindowDataset: {self._total_len:,} total samples "
+            f"from {len(cutoff_years)} windows [{window_str}]"
+        )
+
+    def _load_window_chunks(self, chunk_dir: str, cutoff: int):
+        """Load chunk metadata from a single window's chunk directory."""
+        import json as _json
+
+        chunk_files = sorted([f for f in os.listdir(chunk_dir) if f.endswith('.pt')])
+        manifest_path = os.path.join(chunk_dir, 'manifest.json')
+
+        sizes = []
+        if os.path.exists(manifest_path):
+            with open(manifest_path) as f:
+                manifest = _json.load(f)
+            if manifest.get('chunk_files') == chunk_files:
+                sizes = manifest['chunk_sizes']
+
+        if not sizes:
+            for chunk_file in chunk_files:
+                chunk_path = os.path.join(chunk_dir, chunk_file)
+                chunk = torch.load(chunk_path, map_location='cpu', weights_only=False)
+                sizes.append(chunk['input_ids'].shape[0])
+                del chunk
+
+        total = sum(sizes)
+        for chunk_file, size in zip(chunk_files, sizes):
+            self._chunk_paths.append(os.path.join(chunk_dir, chunk_file))
+            self._chunk_sizes.append(size)
+            self._chunk_cutoffs.append(cutoff)
+
+        logger.info(f"  Window cutoff={cutoff}: {total:,} samples ({len(chunk_files)} chunks)")
+
+    def _get_chunk(self, chunk_idx: int):
+        """Get a chunk by index, using LRU cache."""
+        if chunk_idx in self._chunk_cache:
+            return self._chunk_cache[chunk_idx]
+
+        chunk = torch.load(self._chunk_paths[chunk_idx], map_location='cpu', weights_only=False)
+
+        while len(self._chunk_cache) >= self._chunk_cache_max:
+            oldest = self._chunk_cache_order.pop(0)
+            self._chunk_cache.pop(oldest, None)
+
+        self._chunk_cache[chunk_idx] = chunk
+        self._chunk_cache_order.append(chunk_idx)
+        return chunk
+
+    def _resolve_chunk(self, idx: int):
+        """Map global index to (chunk_data, local_index)."""
+        import bisect
+        chunk_idx = bisect.bisect_right(self._chunk_offsets, idx) - 1
+        local_idx = idx - self._chunk_offsets[chunk_idx]
+        return self._get_chunk(chunk_idx), local_idx
+
+    def __len__(self) -> int:
+        return self._total_len
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        chunk, local_idx = self._resolve_chunk(idx)
+        input_ids = chunk['input_ids'][local_idx]
+        attention_mask = chunk['attention_masks'][local_idx]
+
+        # Truncate if chunk was built with a larger max_seq_len
+        chunk_seq_len = input_ids.shape[0]
+        if chunk_seq_len > self.max_seq_len:
+            actual_len = int(attention_mask.sum().item())
+            if actual_len > self.max_seq_len:
+                start = actual_len - self.max_seq_len
+                input_ids = input_ids[start:actual_len].clone()
+                attention_mask = torch.ones(self.max_seq_len, dtype=attention_mask.dtype)
+            else:
+                input_ids = input_ids[:self.max_seq_len].clone()
+                attention_mask = attention_mask[:self.max_seq_len].clone()
+
+        sample = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'targets': chunk['targets'][local_idx],
+        }
+        if self.return_ids and 'sids' in chunk:
+            sample['sid'] = chunk['sids'][local_idx]
+        return sample
+
+    def get_pos_weights(self, max_samples: Optional[int] = None) -> torch.Tensor:
+        """Compute pos weights by streaming through all chunks."""
+        import gc as _gc
+        total_pos = None
+        total_n = 0
+        for i in range(len(self._chunk_paths)):
+            chunk = torch.load(self._chunk_paths[i], map_location='cpu', weights_only=False)
+            t = chunk['targets'].numpy()
+            del chunk
+            _gc.collect()
+            if max_samples is not None and total_n + len(t) > max_samples:
+                t = t[:max_samples - total_n]
+            if total_pos is None:
+                total_pos = t.sum(axis=0)
+            else:
+                total_pos += t.sum(axis=0)
+            total_n += len(t)
+            if max_samples is not None and total_n >= max_samples:
+                break
+        n_pos = total_pos.clip(min=1.0)
+        n_neg = (total_n - n_pos).clip(min=1.0)
+        pos_weight = n_neg / n_pos
+        return torch.from_numpy(pos_weight.astype(np.float32))
+
+    def get_chunk_event_rates(
+        self,
+        n_events: int,
+        n_horizons: int,
+        target_horizon_idx: int = 0,
+    ) -> List[float]:
+        """Compute per-chunk event rate for balanced sampling."""
+        import gc as _gc
+        rates = []
+        for i in range(len(self._chunk_paths)):
+            chunk = torch.load(self._chunk_paths[i], map_location='cpu', weights_only=False)
+            t = chunk['targets'].numpy()
+            del chunk
+            _gc.collect()
+
+            any_pos = np.zeros(len(t), dtype=bool)
+            for ei in range(n_events):
+                col = ei * n_horizons + target_horizon_idx
+                any_pos |= (t[:, col] > 0.5)
+            rates.append(float(any_pos.mean()))
+
+        logger.info(
+            f"Rolling chunk event rates (horizon {target_horizon_idx}): "
+            f"min={min(rates):.4f}, max={max(rates):.4f}, "
+            f"mean={np.mean(rates):.4f}"
+        )
+        return rates

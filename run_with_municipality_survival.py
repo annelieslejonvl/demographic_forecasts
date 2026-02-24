@@ -695,11 +695,106 @@ def main_survival(
                     mlflow.log_metric(f"aft_{event}_ci{level_pct}_width",
                                       float(np.median(ci_upper - ci_lower)))
 
-        # Group-level evaluation
-        sex_col = "gender" if "gender" in test_df.columns else None
+        # LM-style metrics (comparable with GRU sequence)
+        print(f"\n  Computing LM-style metrics (top-k accuracy, MRR, perplexity)...")
+        try:
+            from src.survival.evaluation import stack_survival_predictions
+            from src.sequence.evaluation import evaluate_lm_metrics, evaluate_grouped_metrics
+
+            stacked_probs, stacked_targets = stack_survival_predictions(
+                all_predictions, test_df, events, horizons=horizons,
+            )
+
+            lm_results = evaluate_lm_metrics(
+                stacked_probs, stacked_targets, events, horizons, top_k=3,
+            )
+            print(f"  LM next-event top-1 accuracy: {lm_results['next_event_top1_accuracy']:.4f}")
+            print(f"  LM next-event top-3 accuracy: {lm_results['next_event_topk_accuracy']:.4f}")
+            print(f"  LM MRR:                       {lm_results['next_event_mrr']:.4f}")
+            print(f"  LM event perplexity:          {lm_results['event_perplexity']:.4f}")
+            print(f"  LM temporal consistency:       {lm_results['temporal_consistency']:.4f}")
+            print(f"  LM cross-horizon rank stab.:   {lm_results['cross_horizon_rank_stability']:.4f}")
+
+            for k, v in lm_results.items():
+                if isinstance(v, float) and not np.isnan(v):
+                    mlflow.log_metric(f"lm_{k}", v)
+                elif isinstance(v, dict) and k == 'per_horizon':
+                    for h_name, h_metrics in v.items():
+                        for mk, mv in h_metrics.items():
+                            if isinstance(mv, float) and not np.isnan(mv):
+                                mlflow.log_metric(f"lm_{h_name}_{mk}", mv)
+                elif isinstance(v, dict) and k in ('per_event_recall', 'per_event_precision'):
+                    for ev_name, ev_val in v.items():
+                        if isinstance(ev_val, float) and not np.isnan(ev_val):
+                            mlflow.log_metric(f"lm_{k}_{ev_name}", ev_val)
+        except Exception as e:
+            print(f"  LM metrics failed: {e}")
+            import traceback; traceback.print_exc()
+
+        # Grouped evaluation (LM + classification + MAE per age-group / municipality)
         age_col = "age_group" if "age_group" in test_df.columns else None
         muni_col = "refnis" if "refnis" in test_df.columns else None
-        group_cols = [c for c in [sex_col, age_col, muni_col] if c is not None]
+        grouped_cols = {c: c for c in [age_col, muni_col] if c is not None}
+
+        if grouped_cols:
+            print(f"\n  Computing grouped evaluation by {list(grouped_cols.keys())}...")
+            try:
+                for grp_name, grp_col in grouped_cols.items():
+                    group_labels = test_df[grp_col].values
+
+                    grp_result = evaluate_grouped_metrics(
+                        stacked_probs, stacked_targets, group_labels,
+                        events, horizons,
+                        group_name=grp_name,
+                        min_group_size=50,
+                        calibrate_thresholds=True,
+                    )
+
+                    gt = grp_result['group_table']
+                    summary = grp_result['summary']
+                    lm_sum = grp_result['lm_summary']
+
+                    print(f"\n  --- Grouped by {grp_name} ({summary.get('n_groups', 0)} groups) ---")
+
+                    # Print classification/MAE summary
+                    for ei, event in enumerate(events):
+                        for hi, h in enumerate(horizons):
+                            prefix = f'{event}_{h}yr'
+                            mae_w = summary.get(f'{prefix}_mae_weighted')
+                            rmse_w = summary.get(f'{prefix}_rmse_weighted')
+                            if mae_w is not None:
+                                print(f"    {prefix}: MAE_w={mae_w:.4f}  RMSE_w={rmse_w:.4f}")
+                                mlflow.log_metric(f"grp_{grp_name}_{prefix}_mae_w", mae_w)
+                                mlflow.log_metric(f"grp_{grp_name}_{prefix}_rmse_w", rmse_w)
+                            cal_mae_w = summary.get(f'{prefix}_cal_mae_weighted')
+                            if cal_mae_w is not None:
+                                mlflow.log_metric(f"grp_{grp_name}_{prefix}_cal_mae_w", cal_mae_w)
+
+                    # Print LM summary
+                    if lm_sum:
+                        print(f"    LM top-1 weighted: {lm_sum.get('lm_top1_acc_weighted', float('nan')):.4f}")
+                        print(f"    LM top-3 weighted: {lm_sum.get('lm_top3_acc_weighted', float('nan')):.4f}")
+                        print(f"    LM MRR weighted:   {lm_sum.get('lm_mrr_weighted', float('nan')):.4f}")
+                        for lk, lv in lm_sum.items():
+                            if isinstance(lv, float) and not np.isnan(lv):
+                                mlflow.log_metric(f"grp_{grp_name}_{lk}", lv)
+
+                    # Save group table as artifact
+                    if not gt.empty:
+                        grp_csv = f"group_eval_{grp_name}.csv"
+                        gt.to_csv(grp_csv, index=False)
+                        mlflow.log_artifact(grp_csv)
+                        print(f"    Saved {grp_csv} ({len(gt)} groups)")
+
+            except Exception as e:
+                print(f"  Grouped evaluation failed: {e}")
+                import traceback; traceback.print_exc()
+
+        # Group-level evaluation (legacy per-event)
+        sex_col = "gender" if "gender" in test_df.columns else None
+        age_col_legacy = "age_group" if "age_group" in test_df.columns else None
+        muni_col_legacy = "refnis" if "refnis" in test_df.columns else None
+        group_cols = [c for c in [sex_col, age_col_legacy, muni_col_legacy] if c is not None]
 
         group_eval_dfs = {}
         group_eval_summaries = {}

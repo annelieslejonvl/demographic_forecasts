@@ -21,7 +21,7 @@ from ..backends.base import (
 )
 from ..utils.device import get_device_manager
 from .dataset import SequenceDataset, sequence_collate_fn
-from .losses import AFTLoss, EventBCELoss, FocalLoss, LearnedWeightedLoss
+from .losses import AFTLoss, DeepHitLoss, EventBCELoss, FocalLoss, LearnedWeightedLoss
 from .models import SequenceModel
 from .vocabulary import LifeEventVocabulary, EVENT_TOKEN_MAP
 
@@ -150,7 +150,10 @@ class PyTorchSequenceEstimator(BaseEstimator):
         else:
             self.horizon_weight_mode = None
             self.horizon_weights_manual = None
-
+        if self.loss_type == 'deephit' and self.horizon_weight_mode is not None:
+            self.deephit_alpha = params.get('deephit_alpha', 0.1)
+            self.deephit_sigma_rank = params.get('deephit_sigma_rank', 0.1)
+            self.n_rank_pairs = params.get('deephit_n_rank_pairs', 128)
         # Balanced sampling
         self.balanced_sampling = bool(params.get('balanced_sampling', False))
 
@@ -194,6 +197,29 @@ class PyTorchSequenceEstimator(BaseEstimator):
         z = (log_h.unsqueeze(0).unsqueeze(0) - mu.unsqueeze(-1)) / sigma.unsqueeze(-1)
         probs = torch.sigmoid(z)  # (batch, n_events, n_horizons)
         return probs.reshape(output.size(0), -1)
+
+    def _deephit_to_probs(self, output: torch.Tensor) -> torch.Tensor:
+        """Convert DeepHit logits to cumulative horizon probabilities.
+
+        Applies per-event softmax over (n_horizons + 1) bins (intervals +
+        censored), then cumulative-sums the interval PMF to get CDF-like
+        probabilities P(T <= h) at each horizon.
+
+        Returns (batch, n_events * n_horizons) tensor matching BCE layout.
+        """
+        n_events = len(self.events)
+        n_horizons = len(self.horizons)
+        logits_3d = output.view(-1, n_events, n_horizons)
+        # Append implicit censored logit (0 = reference category)
+        censored = torch.zeros(
+            output.size(0), n_events, 1,
+            device=output.device, dtype=output.dtype,
+        )
+        logits_ext = torch.cat([logits_3d, censored], dim=-1)
+        pmf = torch.softmax(logits_ext, dim=-1)[:, :, :n_horizons]
+        # Cumulative sum → CDF: P(T <= h)
+        cdf = pmf.cumsum(dim=-1)
+        return cdf.reshape(output.size(0), -1)
 
     def _init_aft_biases(self, train_dataset, n_events, n_horizons):
         """Initialize AFT head output biases from population event statistics.
@@ -330,7 +356,7 @@ class PyTorchSequenceEstimator(BaseEstimator):
         """Build loss function based on loss_type and event_weight_mode."""
         n_events = len(self.events)
         n_horizons = len(self.horizons)
-
+        params = self.model_config.get('params', {})
         if self.loss_type == 'aft':
             if self.event_weight_mode == 'learned':
                 base = AFTLoss(
@@ -341,6 +367,26 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 return LearnedWeightedLoss(base, n_events).to(device)
             return AFTLoss(
                 self.horizons, n_events,
+                event_weights=event_weights,
+                horizon_weights=horizon_weights,
+            ).to(device)
+        elif self.loss_type == 'deephit':
+            alpha = self.deephit_alpha if hasattr(self, 'deephit_alpha') else 0.1
+            sigma_rank = self.deephit_sigma_rank if hasattr(self, 'deephit_sigma_rank') else 0.1
+            n_rank_pairs = self.n_rank_pairs if hasattr(self, 'n_rank_pairs') else 128
+            if self.event_weight_mode == 'learned':
+                base = DeepHitLoss(
+                    self.horizons, n_events,
+                    alpha=alpha, sigma_rank=sigma_rank,
+                    n_rank_pairs=n_rank_pairs,
+                    horizon_weights=horizon_weights,
+                    reduction='per_event',
+                ).to(device)
+                return LearnedWeightedLoss(base, n_events).to(device)
+            return DeepHitLoss(
+                self.horizons, n_events,
+                alpha=alpha, sigma_rank=sigma_rank,
+                n_rank_pairs=n_rank_pairs,
                 event_weights=event_weights,
                 horizon_weights=horizon_weights,
             ).to(device)
@@ -491,7 +537,7 @@ class PyTorchSequenceEstimator(BaseEstimator):
         saved_mode = self.event_weight_mode
         if self.event_weight_mode == 'learned':
             self.event_weight_mode = 'inverse_rate'  # temporary override
-        if self.loss_type == 'aft':
+        if self.loss_type in ('aft', 'deephit'):
             loss_fn = self._build_loss_fn(device, event_weights=event_weights, horizon_weights=horizon_weights)
         else:
             max_pw = min(50_000, len(train_dataset)) if not isinstance(train_dataset, IterableDataset) else 50_000
@@ -814,6 +860,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
         if self.loss_type == 'aft':
             loss_fn = self._build_loss_fn(device, event_weights=event_weights, horizon_weights=horizon_weights)
             logger.info(f"Using AFT loss (log-logistic, horizons={self.horizons})")
+        elif self.loss_type == 'deephit':
+            loss_fn = self._build_loss_fn(device, event_weights=event_weights, horizon_weights=horizon_weights)
+            logger.info(f"Using DeepHit loss (alpha={self.deephit_alpha}, horizons={self.horizons})")
         else:  # bce or focal
             if is_iterable_train:
                 pos_params = self.model_config.get('params', {})
@@ -946,6 +995,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
                         if self.loss_type == 'aft':
                             probs = self._aft_to_probs(logits).cpu()
                             all_val_aft_raw.append(logits.cpu())
+                        elif self.loss_type == 'deephit':
+                            probs = self._deephit_to_probs(logits).cpu()
+                            all_val_aft_raw.append(logits.cpu())
                         else:
                             probs = torch.sigmoid(logits).cpu()
                         all_val_probs.append(probs)
@@ -1009,7 +1061,7 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 mean_td = float('nan')
                 mean_crps = float('nan')
                 mean_crpss = float('nan')
-                if self.loss_type == 'aft' and all_val_aft_raw:
+                if self.loss_type in ('aft', 'deephit') and all_val_aft_raw:
                     try:
                         from src.sequence.evaluation import (
                             _log_logistic_cdf, _targets_to_survival,
@@ -1038,18 +1090,23 @@ class PyTorchSequenceEstimator(BaseEstimator):
                         else:
                             val_tgt_sub = val_targets
 
-                        mu_all = aft_raw[:, :n_ev]
-                        sigma_all = np.exp(aft_raw[:, n_ev:]).clip(min=0.01)
                         max_h = float(max(self.horizons))
-
                         epoch_c_indices = []
                         epoch_td_aucs = []
                         epoch_crps = []
                         epoch_crpss = []
-                        for ei, event in enumerate(self.events):
-                            mu_e = mu_all[:, ei]
-                            sigma_e = sigma_all[:, ei]
 
+                        if self.loss_type == 'aft':
+                            mu_all = aft_raw[:, :n_ev]
+                            sigma_all = np.exp(aft_raw[:, n_ev:]).clip(min=0.01)
+                        elif self.loss_type == 'deephit':
+                            # Convert raw logits → CDF for each event at each horizon
+                            dh_logits = torch.tensor(aft_raw, dtype=torch.float32)
+                            dh_cdf = self._deephit_to_probs(dh_logits).numpy()
+                            # Reshape: (n, n_events, n_horizons)
+                            dh_cdf_3d = dh_cdf.reshape(-1, n_ev, n_horizons)
+
+                        for ei, event in enumerate(self.events):
                             cols = [ei * n_horizons + hi for hi in range(n_horizons)]
                             event_tgt = val_tgt_sub[:, cols]
                             duration, event_ind = _targets_to_survival(event_tgt, self.horizons)
@@ -1058,51 +1115,72 @@ class PyTorchSequenceEstimator(BaseEstimator):
                             if n_pos_e < 5 or (len(event_ind) - n_pos_e) < 5:
                                 continue
 
-                            # Fast sampled C-index
-                            risk = -np.exp(mu_e)
-                            c_idx = _fast_c_index(event_ind, duration, risk)
-                            if not np.isnan(c_idx):
-                                epoch_c_indices.append(c_idx)
-                                mlflow.log_metric(f"val_c_index_{event}", c_idx, step=epoch)
+                            if self.loss_type == 'aft':
+                                mu_e = mu_all[:, ei]
+                                sigma_e = sigma_all[:, ei]
 
-                            # Fast CRPS with skill score (coarse grid, ~20ms per event)
-                            crps_e, crps_naive_e, skill_e = _fast_crps(
-                                mu_e, sigma_e, duration, event_ind,
-                                max_horizon=max_h, distribution='logistic',
-                                return_skill=True,
-                            )
-                            epoch_crps.append(crps_e)
-                            epoch_crpss.append(skill_e)
-                            mlflow.log_metric(f"val_crps_{event}", crps_e, step=epoch)
-                            mlflow.log_metric(f"val_crpss_{event}", skill_e, step=epoch)
+                                # Fast sampled C-index
+                                risk = -np.exp(mu_e)
+                                c_idx = _fast_c_index(event_ind, duration, risk)
+                                if not np.isnan(c_idx):
+                                    epoch_c_indices.append(c_idx)
+                                    mlflow.log_metric(f"val_c_index_{event}", c_idx, step=epoch)
 
-                            # Diagnostic: log mu/sigma stats for events with bad CRPSS
-                            if epoch < 3 or skill_e < -0.1:
-                                med_time = np.exp(mu_e)
-                                evt_rate = float(event_ind.mean())
-                                logger.info(
-                                    f"  [{event}] mu: mean={mu_e.mean():.2f} std={mu_e.std():.2f} | "
-                                    f"sigma: mean={sigma_e.mean():.2f} std={sigma_e.std():.2f} | "
-                                    f"median_time: mean={med_time.mean():.2f} p50={np.median(med_time):.2f} | "
-                                    f"event_rate={evt_rate:.3f} | "
-                                    f"CRPS={crps_e:.4f} naive={crps_naive_e:.4f} skill={skill_e:.4f}"
+                                # Fast CRPS with skill score
+                                crps_e, crps_naive_e, skill_e = _fast_crps(
+                                    mu_e, sigma_e, duration, event_ind,
+                                    max_horizon=max_h, distribution='logistic',
+                                    return_skill=True,
                                 )
+                                epoch_crps.append(crps_e)
+                                epoch_crpss.append(skill_e)
+                                mlflow.log_metric(f"val_crps_{event}", crps_e, step=epoch)
+                                mlflow.log_metric(f"val_crpss_{event}", skill_e, step=epoch)
 
-                            # TD-AUC at each horizon (binary AUC via sort, fast)
-                            for hi, h in enumerate(self.horizons):
-                                y_h = event_tgt[:, hi]
-                                n_p = int(y_h.sum())
-                                if 0 < n_p < len(y_h):
-                                    risk_h = _log_logistic_cdf(float(h), mu_e, sigma_e)
-                                    auc_h = float(_roc_auc(y_h, risk_h))
-                                    epoch_td_aucs.append(auc_h)
-                                    mlflow.log_metric(f"val_td_auc_{event}_{h}yr", auc_h, step=epoch)
+                                if epoch < 3 or skill_e < -0.1:
+                                    med_time = np.exp(mu_e)
+                                    evt_rate = float(event_ind.mean())
+                                    logger.info(
+                                        f"  [{event}] mu: mean={mu_e.mean():.2f} std={mu_e.std():.2f} | "
+                                        f"sigma: mean={sigma_e.mean():.2f} std={sigma_e.std():.2f} | "
+                                        f"median_time: mean={med_time.mean():.2f} p50={np.median(med_time):.2f} | "
+                                        f"event_rate={evt_rate:.3f} | "
+                                        f"CRPS={crps_e:.4f} naive={crps_naive_e:.4f} skill={skill_e:.4f}"
+                                    )
+
+                                # TD-AUC at each horizon
+                                for hi, h in enumerate(self.horizons):
+                                    y_h = event_tgt[:, hi]
+                                    n_p = int(y_h.sum())
+                                    if 0 < n_p < len(y_h):
+                                        risk_h = _log_logistic_cdf(float(h), mu_e, sigma_e)
+                                        auc_h = float(_roc_auc(y_h, risk_h))
+                                        epoch_td_aucs.append(auc_h)
+                                        mlflow.log_metric(f"val_td_auc_{event}_{h}yr", auc_h, step=epoch)
+
+                            elif self.loss_type == 'deephit':
+                                cdf_e = dh_cdf_3d[:, ei, :]  # (n, n_horizons)
+
+                                # C-index: use CDF at max horizon as risk score
+                                risk = cdf_e[:, -1]
+                                c_idx = _fast_c_index(event_ind, duration, risk)
+                                if not np.isnan(c_idx):
+                                    epoch_c_indices.append(c_idx)
+                                    mlflow.log_metric(f"val_c_index_{event}", c_idx, step=epoch)
+
+                                # TD-AUC at each horizon using learned CDF
+                                for hi, h in enumerate(self.horizons):
+                                    y_h = event_tgt[:, hi]
+                                    n_p = int(y_h.sum())
+                                    if 0 < n_p < len(y_h):
+                                        risk_h = cdf_e[:, hi]
+                                        auc_h = float(_roc_auc(y_h, risk_h))
+                                        epoch_td_aucs.append(auc_h)
+                                        mlflow.log_metric(f"val_td_auc_{event}_{h}yr", auc_h, step=epoch)
 
                         mean_c = float(np.mean(epoch_c_indices)) if epoch_c_indices else float('nan')
                         mean_td = float(np.mean(epoch_td_aucs)) if epoch_td_aucs else float('nan')
                         mean_crps = float(np.mean(epoch_crps)) if epoch_crps else float('nan')
-                        # Clip CRPSS at 0 for the mean: negative skill = "no skill"
-                        # Per-event CRPSS is still logged unclipped for diagnostics
                         mean_crpss = float(np.mean(np.clip(epoch_crpss, 0, None))) if epoch_crpss else float('nan')
                         if not np.isnan(mean_c):
                             mlflow.log_metric("val_mean_c_index", mean_c, step=epoch)
@@ -1112,14 +1190,47 @@ class PyTorchSequenceEstimator(BaseEstimator):
                             mlflow.log_metric("val_mean_crps", mean_crps, step=epoch)
                         if not np.isnan(mean_crpss):
                             mlflow.log_metric("val_mean_crpss", mean_crpss, step=epoch)
-                        aft_metrics_str = f", C-idx: {mean_c:.4f}, CRPSS: {mean_crpss:.4f}, CRPS: {mean_crps:.4f}, TD-AUC: {mean_td:.4f}"
+                        if self.loss_type == 'aft':
+                            aft_metrics_str = f", C-idx: {mean_c:.4f}, CRPSS: {mean_crpss:.4f}, CRPS: {mean_crps:.4f}, TD-AUC: {mean_td:.4f}"
+                        else:
+                            aft_metrics_str = f", C-idx: {mean_c:.4f}, TD-AUC: {mean_td:.4f}"
                     except Exception as e:
-                        logger.warning(f"AFT epoch metrics failed: {e}")
+                        logger.warning(f"Survival epoch metrics failed: {e}")
                 del all_val_aft_raw
+
+                # Language-model-style metrics (next-event accuracy, perplexity, temporal)
+                lm_metrics_str = ""
+                lm_top1 = float('nan')
+                lm_top3 = float('nan')
+                lm_mrr = float('nan')
+                lm_ppl = float('nan')
+                lm_tc = float('nan')
+                try:
+                    from src.sequence.evaluation import evaluate_lm_metrics_fast
+
+                    lm = evaluate_lm_metrics_fast(
+                        val_probs, val_targets, self.events, self.horizons,
+                    )
+                    lm_top1 = lm['lm_top1_acc']
+                    lm_top3 = lm['lm_top3_acc']
+                    lm_mrr = lm['lm_mrr']
+                    lm_ppl = lm['lm_perplexity']
+                    lm_tc = lm['lm_temporal_consistency']
+
+                    for k_lm, v_lm in lm.items():
+                        if not np.isnan(v_lm):
+                            mlflow.log_metric(f"val_{k_lm}", v_lm, step=epoch)
+
+                    lm_metrics_str = (
+                        f", LM(top1={lm_top1:.3f}, top3={lm_top3:.3f}, "
+                        f"MRR={lm_mrr:.3f}, ppl={lm_ppl:.2f}, TC={lm_tc:.4f})"
+                    )
+                except Exception as e:
+                    logger.warning(f"LM epoch metrics failed: {e}")
 
                 del val_probs, val_targets
 
-                val_metrics_str = f", mean_AUC: {mean_auc:.4f}, mean_AP: {mean_ap:.4f}, mean_F1: {mean_f1:.4f}{aft_metrics_str}"
+                val_metrics_str = f", mean_AUC: {mean_auc:.4f}, mean_AP: {mean_ap:.4f}, mean_F1: {mean_f1:.4f}{aft_metrics_str}{lm_metrics_str}"
 
                 # Epoch callback (e.g. for Optuna pruning)
                 if epoch_callback is not None:
@@ -1133,13 +1244,19 @@ class PyTorchSequenceEstimator(BaseEstimator):
                         'val_mean_td_auc': mean_td,
                         'val_mean_crps': mean_crps,
                         'val_mean_crpss': mean_crpss,
+                        'val_lm_top1_acc': lm_top1,
+                        'val_lm_top3_acc': lm_top3,
+                        'val_lm_mrr': lm_mrr,
+                        'val_lm_perplexity': lm_ppl,
+                        'val_lm_temporal_consistency': lm_tc,
                     })
 
                 scheduler.step(val_loss)
 
                 # Compute composite metric for early stopping
                 if es_metric == 'composite':
-                    has_aft = not np.isnan(mean_c) and not np.isnan(mean_crpss)
+                    has_survival = not np.isnan(mean_c) and not np.isnan(mean_td)
+                    has_aft = has_survival and not np.isnan(mean_crpss)
                     if has_aft:
                         # AFT composite: ranking + calibration + classification
                         # CRPSS = skill score (higher=better, 0=naive, 1=perfect)
@@ -1147,6 +1264,13 @@ class PyTorchSequenceEstimator(BaseEstimator):
                         _vals = [v for v in [mean_c, mean_crpss, mean_f1] if not np.isnan(v)]
                         if len(_vals) == 3:
                             es_value = 0.4 * mean_c + 0.3 * mean_crpss + 0.3 * mean_f1
+                        else:
+                            es_value = np.nanmean(_vals) if _vals else float('nan')
+                    elif has_survival:
+                        # DeepHit composite: C-index + TD-AUC + F1
+                        _vals = [v for v in [mean_c, mean_td, mean_f1] if not np.isnan(v)]
+                        if len(_vals) == 3:
+                            es_value = 0.4 * mean_c + 0.3 * mean_td + 0.3 * mean_f1
                         else:
                             es_value = np.nanmean(_vals) if _vals else float('nan')
                     else:
@@ -1653,6 +1777,8 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 logits = self.model_(input_ids, attention_mask)
                 if self.loss_type == 'aft':
                     probs = self._aft_to_probs(logits).cpu().numpy()
+                elif self.loss_type == 'deephit':
+                    probs = self._deephit_to_probs(logits).cpu().numpy()
                 else:
                     probs = torch.sigmoid(logits).cpu().numpy()
                 all_probs.append(probs)
@@ -1722,6 +1848,8 @@ class PyTorchSequenceEstimator(BaseEstimator):
                     logits = self.model_(input_ids, attention_mask)
                     if self.loss_type == 'aft':
                         probs = self._aft_to_probs(logits).cpu().numpy()
+                    elif self.loss_type == 'deephit':
+                        probs = self._deephit_to_probs(logits).cpu().numpy()
                     else:
                         probs = torch.sigmoid(logits).cpu().numpy()
                     batch_probs.append(probs)

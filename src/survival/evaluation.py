@@ -495,6 +495,53 @@ def evaluate_aft_shared_metrics(
     )
 
 
+def stack_survival_predictions(
+    all_predictions,
+    test_df,
+    events,
+    horizons=(1, 3, 5),
+):
+    """Convert XGBoost per-event prediction dicts to stacked arrays.
+
+    Bridges the XGBoost format ``{event -> {prob_1yr, prob_3yr, ...}}``
+    into the ``(n_samples, n_events * n_horizons)`` layout used by
+    ``evaluate_lm_metrics`` and ``evaluate_grouped_metrics``.
+
+    Args:
+        all_predictions: Dict mapping event -> predictions dict with
+            ``prob_{h}yr`` keys.
+        test_df: Test DataFrame with ``{event}_duration`` and
+            ``{event}_event_observed`` columns.
+        events: List of event column names.
+        horizons: Prediction horizons in years.
+
+    Returns:
+        (probabilities, targets) tuple, each ``(n_samples, n_events * n_horizons)``
+        in event-major layout.
+    """
+    n_samples = len(test_df)
+    n_events = len(events)
+    n_horizons = len(horizons)
+
+    probabilities = np.zeros((n_samples, n_events * n_horizons), dtype=np.float64)
+    targets = np.zeros((n_samples, n_events * n_horizons), dtype=np.float32)
+
+    for ei, event in enumerate(events):
+        duration_col = f"{event}_duration"
+        observed_col = f"{event}_event_observed"
+        dur = test_df[duration_col].values
+        evt = test_df[observed_col].values
+
+        for hi, h in enumerate(horizons):
+            col = ei * n_horizons + hi
+            prob_key = f'prob_{h}yr'
+            if prob_key in all_predictions[event]:
+                probabilities[:, col] = all_predictions[event][prob_key]
+            targets[:, col] = ((evt == 1) & (dur <= h)).astype(np.float32)
+
+    return probabilities, targets
+
+
 def evaluate_by_group(
     df_test,
     predicted_risk,
