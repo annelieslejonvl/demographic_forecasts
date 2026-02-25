@@ -13,7 +13,10 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, IterableDataset, Sampler
 
-from .vocabulary import LifeEventVocabulary, EVENT_TOKEN_MAP, MUNICIPALITY_FEATURE_MAP
+from .vocabulary import (
+    LifeEventVocabulary, EVENT_TOKEN_MAP, MUNICIPALITY_FEATURE_MAP,
+    N_NUMERIC_FEATURES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +165,7 @@ class SequenceDataset(Dataset):
         id_col: str = 'sid',
         time_col: str = 'year',
         min_history_year: Optional[int] = None,
+        use_numeric_features: bool = False,
     ):
         self.vocabulary = vocabulary
         self.max_seq_len = max_seq_len
@@ -171,6 +175,7 @@ class SequenceDataset(Dataset):
         self.id_col = id_col
         self.time_col = time_col
         self.min_history_year = min_history_year
+        self.use_numeric_features = use_numeric_features
 
         self.n_events = len(self.events)
         self.n_horizons = len(self.horizons)
@@ -187,6 +192,7 @@ class SequenceDataset(Dataset):
         self._person_ids = []
         self._sequences = []
         self._targets = []
+        self._numeric_features = []
 
         n_skipped = 0
         for sid, person_df in grouped:
@@ -199,12 +205,21 @@ class SequenceDataset(Dataset):
                 continue
 
             # Tokenize history
-            tokens = self.vocabulary.tokenize_person_history(
-                history,
-                time_col=self.time_col,
-                max_year=self.cutoff_year,
-                min_year=self.min_history_year,
-            )
+            if self.use_numeric_features:
+                tokens, numeric = self.vocabulary.tokenize_person_history_with_numerics(
+                    history,
+                    time_col=self.time_col,
+                    max_year=self.cutoff_year,
+                    min_year=self.min_history_year,
+                )
+            else:
+                tokens = self.vocabulary.tokenize_person_history(
+                    history,
+                    time_col=self.time_col,
+                    max_year=self.cutoff_year,
+                    min_year=self.min_history_year,
+                )
+                numeric = None
 
             # Build targets from future observations
             future = person_df[person_df[self.time_col] > self.cutoff_year]
@@ -213,6 +228,8 @@ class SequenceDataset(Dataset):
             self._person_ids.append(sid)
             self._sequences.append(tokens)
             self._targets.append(targets)
+            if numeric is not None:
+                self._numeric_features.append(numeric)
 
         if n_skipped > 0:
             logger.info(f"Skipped {n_skipped} persons with no history before cutoff")
@@ -261,6 +278,15 @@ class SequenceDataset(Dataset):
 
         return input_ids, attention_mask
 
+    def _pad_or_truncate_numerics(self, numeric: np.ndarray, seq_len: int) -> np.ndarray:
+        """Pad or truncate numeric feature sequence to max_seq_len."""
+        n_feat = numeric.shape[1] if numeric.ndim == 2 else N_NUMERIC_FEATURES
+        if seq_len >= self.max_seq_len:
+            return numeric[-self.max_seq_len:].copy()
+        padded = np.zeros((self.max_seq_len, n_feat), dtype=np.float32)
+        padded[:seq_len] = numeric
+        return padded
+
     def __len__(self) -> int:
         return len(self._person_ids)
 
@@ -270,11 +296,17 @@ class SequenceDataset(Dataset):
 
         input_ids, attention_mask = self._pad_or_truncate(tokens)
 
-        return {
+        sample = {
             'input_ids': torch.from_numpy(input_ids),
             'attention_mask': torch.from_numpy(attention_mask),
             'targets': torch.from_numpy(targets),
         }
+        if self.use_numeric_features and idx < len(self._numeric_features):
+            numeric = self._numeric_features[idx]
+            sample['numeric_features'] = torch.from_numpy(
+                self._pad_or_truncate_numerics(numeric, len(tokens))
+            )
+        return sample
 
     def get_pos_weights(self) -> torch.Tensor:
         """Compute positive class weight for each output label (for BCEWithLogitsLoss)."""
@@ -499,6 +531,7 @@ class CachedSequenceDataset(Dataset):
         return_ids: bool = False,
         cache_path: Optional[str] = None,
         min_history_year: Optional[int] = None,
+        use_numeric_features: bool = False,
     ):
         self.vocabulary = vocabulary
         self.max_seq_len = max_seq_len
@@ -510,6 +543,7 @@ class CachedSequenceDataset(Dataset):
         self.time_col = time_col
         self.return_ids = return_ids
         self.min_history_year = min_history_year
+        self.use_numeric_features = use_numeric_features
         self.n_events = len(self.events)
         self.n_horizons = len(self.horizons)
         self.n_outputs = self.n_events * self.n_horizons
@@ -522,6 +556,7 @@ class CachedSequenceDataset(Dataset):
         ] + list(MUNICIPALITY_FEATURE_MAP.keys()) + self.events
 
         # Try loading from cache (supports single .pt file or chunk directory)
+        self._numeric_features = None
         chunk_dir = cache_path.replace('.pt', '_chunks') if cache_path else None
         if cache_path and os.path.exists(cache_path):
             logger.info(f"Loading cached dataset from {cache_path}")
@@ -530,6 +565,9 @@ class CachedSequenceDataset(Dataset):
             self._attention_masks = cache['attention_masks']
             self._targets = cache['targets']
             self._sids = cache.get('sids')
+            self._numeric_features = cache.get('numeric_features')
+            if self.use_numeric_features and self._numeric_features is None:
+                logger.warning("Cache missing numeric features; rebuild cache with --numeric-features")
             logger.info(f"CachedSequenceDataset: {len(self._input_ids)} persons (from cache)")
         elif chunk_dir and os.path.isdir(chunk_dir):
             logger.info(f"Loading cached dataset from chunks in {chunk_dir}")
@@ -541,12 +579,15 @@ class CachedSequenceDataset(Dataset):
             if cache_path:
                 import os as _os
                 _os.makedirs(_os.path.dirname(cache_path) or '.', exist_ok=True)
-                torch.save({
+                cache_data = {
                     'input_ids': self._input_ids,
                     'attention_masks': self._attention_masks,
                     'targets': self._targets,
                     'sids': self._sids,
-                }, cache_path)
+                }
+                if self._numeric_features is not None:
+                    cache_data['numeric_features'] = self._numeric_features
+                torch.save(cache_data, cache_path)
                 logger.info(f"Cached dataset saved to {cache_path}")
 
     def _load_from_chunks(self, chunk_dir: str):
@@ -766,6 +807,7 @@ class CachedSequenceDataset(Dataset):
             all_masks = []
             all_targets = []
             all_sids = []
+            all_numerics = []
             n_processed = 0
 
             # Read merged parquet in batches via PyArrow
@@ -781,10 +823,18 @@ class CachedSequenceDataset(Dataset):
                     if len(history) == 0:
                         continue
 
-                    tokens = self.vocabulary.tokenize_person_history(
-                        history, time_col=self.time_col, max_year=self.cutoff_year,
-                        min_year=self.min_history_year,
-                    )
+                    if self.use_numeric_features:
+                        tokens, numeric = self.vocabulary.tokenize_person_history_with_numerics(
+                            history, time_col=self.time_col, max_year=self.cutoff_year,
+                            min_year=self.min_history_year,
+                        )
+                    else:
+                        tokens = self.vocabulary.tokenize_person_history(
+                            history, time_col=self.time_col, max_year=self.cutoff_year,
+                            min_year=self.min_history_year,
+                        )
+                        numeric = None
+
                     future = person_df[person_df[self.time_col] > self.cutoff_year]
                     targets = self._build_targets(future)
                     input_ids, attention_mask = self._pad_or_truncate(tokens)
@@ -793,6 +843,10 @@ class CachedSequenceDataset(Dataset):
                     all_masks.append(attention_mask)
                     all_targets.append(targets)
                     all_sids.append(sid)
+
+                    if numeric is not None:
+                        padded_numeric = self._pad_or_truncate_numerics(numeric, len(tokens))
+                        all_numerics.append(padded_numeric)
 
                     n_processed += 1
                     if n_processed % 50000 == 0:
@@ -807,6 +861,8 @@ class CachedSequenceDataset(Dataset):
                 self._attention_masks = torch.from_numpy(np.stack(all_masks))
                 self._targets = torch.from_numpy(np.stack(all_targets))
                 self._sids = np.array(all_sids)
+                if all_numerics:
+                    self._numeric_features = torch.from_numpy(np.stack(all_numerics))
             else:
                 self._input_ids = torch.zeros(0, self.max_seq_len, dtype=torch.long)
                 self._attention_masks = torch.zeros(0, self.max_seq_len, dtype=torch.float32)
@@ -847,6 +903,26 @@ class CachedSequenceDataset(Dataset):
             attention_mask[:seq_len] = 1.0
         return input_ids, attention_mask
 
+    def _pad_or_truncate_numerics(
+        self, numeric: np.ndarray, seq_len: int,
+    ) -> np.ndarray:
+        """Pad or truncate numeric features array to max_seq_len.
+
+        Args:
+            numeric: (seq_len, N_NUMERIC_FEATURES) aligned with tokens
+            seq_len: original token sequence length (before pad/truncate)
+        Returns:
+            (max_seq_len, N_NUMERIC_FEATURES) padded with zeros
+        """
+        n_feat = numeric.shape[1]
+        if seq_len >= self.max_seq_len:
+            # Keep last max_seq_len (same as tokens)
+            return numeric[-self.max_seq_len:].copy()
+        else:
+            padded = np.zeros((self.max_seq_len, n_feat), dtype=np.float32)
+            padded[:seq_len] = numeric
+            return padded
+
     def _resolve_chunk(self, idx: int):
         """Map global index to (chunk, local_index) for chunked loading."""
         import bisect
@@ -864,6 +940,9 @@ class CachedSequenceDataset(Dataset):
             chunk, local_idx = self._resolve_chunk(idx)
             input_ids = chunk['input_ids'][local_idx]
             attention_mask = chunk['attention_masks'][local_idx]
+            nf = chunk.get('numeric_features')
+            if nf is not None:
+                nf = nf[local_idx]
 
             # Truncate if chunk was built with a larger max_seq_len
             chunk_seq_len = input_ids.shape[0]
@@ -875,16 +954,22 @@ class CachedSequenceDataset(Dataset):
                     start = actual_len - self.max_seq_len
                     input_ids = input_ids[start:actual_len].clone()
                     attention_mask = torch.ones(self.max_seq_len, dtype=attention_mask.dtype)
+                    if nf is not None:
+                        nf = nf[start:actual_len].clone()
                 else:
                     # Just trim the padding tail
                     input_ids = input_ids[:self.max_seq_len].clone()
                     attention_mask = attention_mask[:self.max_seq_len].clone()
+                    if nf is not None:
+                        nf = nf[:self.max_seq_len].clone()
 
             sample = {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'targets': chunk['targets'][local_idx],
             }
+            if nf is not None:
+                sample['numeric_features'] = nf
             if self.return_ids and 'sids' in chunk:
                 sample['sid'] = chunk['sids'][local_idx]
             iw = getattr(self, '_importance_weights', None)
@@ -897,6 +982,8 @@ class CachedSequenceDataset(Dataset):
             'attention_mask': self._attention_masks[idx],
             'targets': self._targets[idx],
         }
+        if self._numeric_features is not None:
+            sample['numeric_features'] = self._numeric_features[idx]
         if self.return_ids and self._sids is not None and len(self._sids) > 0:
             sample['sid'] = self._sids[idx]
         iw = getattr(self, '_importance_weights', None)
@@ -1006,6 +1093,11 @@ def sequence_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch
         'attention_mask': attention_mask,
         'targets': targets,
     }
+    if 'numeric_features' in batch[0]:
+        nf = torch.stack([b['numeric_features'] for b in batch])
+        if max_len < nf.size(1):
+            nf = nf[:, :max_len, :]
+        output['numeric_features'] = nf
     if 'sid' in batch[0]:
         output['sid'] = np.array([b['sid'] for b in batch])
     if 'sample_weight' in batch[0]:
@@ -1316,6 +1408,9 @@ class CachedRollingWindowDataset(Dataset):
         chunk, local_idx = self._resolve_chunk(idx)
         input_ids = chunk['input_ids'][local_idx]
         attention_mask = chunk['attention_masks'][local_idx]
+        nf = chunk.get('numeric_features')
+        if nf is not None:
+            nf = nf[local_idx]
 
         # Truncate if chunk was built with a larger max_seq_len
         chunk_seq_len = input_ids.shape[0]
@@ -1325,15 +1420,21 @@ class CachedRollingWindowDataset(Dataset):
                 start = actual_len - self.max_seq_len
                 input_ids = input_ids[start:actual_len].clone()
                 attention_mask = torch.ones(self.max_seq_len, dtype=attention_mask.dtype)
+                if nf is not None:
+                    nf = nf[start:actual_len].clone()
             else:
                 input_ids = input_ids[:self.max_seq_len].clone()
                 attention_mask = attention_mask[:self.max_seq_len].clone()
+                if nf is not None:
+                    nf = nf[:self.max_seq_len].clone()
 
         sample = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'targets': chunk['targets'][local_idx],
         }
+        if nf is not None:
+            sample['numeric_features'] = nf
         if self.return_ids and 'sids' in chunk:
             sample['sid'] = chunk['sids'][local_idx]
         return sample

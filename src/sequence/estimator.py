@@ -138,6 +138,15 @@ class PyTorchSequenceEstimator(BaseEstimator):
         self.focal_gamma = float(params.get('focal_gamma', 2.0))
         self.multi_head = bool(params.get('multi_head', False))
         self.event_weight_mode = params.get('event_weight_mode', 'uniform')
+        self.use_numeric_features = bool(params.get('use_numeric_features', False))
+        self.numeric_inject = params.get('numeric_inject', 'add')
+        if self.numeric_inject not in {'add', 'concat'}:
+            logger.warning(
+                "numeric_inject='%s' requested, but only 'add'|'concat' are supported; "
+                "falling back to 'add'.",
+                self.numeric_inject,
+            )
+            self.numeric_inject = 'add'
 
         # Horizon weighting: [3.0, 1.5, 1.0] | "auto" | null
         hw_config = params.get('horizon_weights', None)
@@ -465,6 +474,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
         n_horizons = len(self.horizons)
 
         # Build a fresh model
+        from .vocabulary import N_NUMERIC_FEATURES
+        n_numeric = N_NUMERIC_FEATURES if self.use_numeric_features else 0
+
         model = SequenceModel(
             vocab_size=vocabulary.vocab_size,
             embed_dim=self.embed_dim,
@@ -477,6 +489,8 @@ class PyTorchSequenceEstimator(BaseEstimator):
             dropout=self.dropout,
             loss_type=self.loss_type,
             multi_head=self.multi_head,
+            n_numeric_features=n_numeric,
+            numeric_inject=self.numeric_inject,
         ).to(device)
         model.train()
 
@@ -573,10 +587,13 @@ class PyTorchSequenceEstimator(BaseEstimator):
             input_ids = batch['input_ids'].to(device, non_blocking=use_cuda)
             attention_mask = batch['attention_mask'].to(device, non_blocking=use_cuda)
             targets = batch['targets'].to(device, non_blocking=use_cuda)
+            numeric_features = batch.get('numeric_features')
+            if numeric_features is not None:
+                numeric_features = numeric_features.to(device, non_blocking=use_cuda)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=scaler.is_enabled()):
-                logits = model(input_ids, attention_mask)
+                logits = model(input_ids, attention_mask, numeric_features=numeric_features)
                 loss = loss_fn(logits, targets)
 
             scaler.scale(loss).backward()
@@ -695,6 +712,7 @@ class PyTorchSequenceEstimator(BaseEstimator):
         vocabulary: Optional[LifeEventVocabulary] = None,
         device: Optional[str] = None,
         epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
+        initial_state_dict: Optional[Dict[str, torch.Tensor]] = None,
         **kwargs,
     ) -> TrainResult:
         """
@@ -705,6 +723,7 @@ class PyTorchSequenceEstimator(BaseEstimator):
             eval_dataset: SequenceDataset for validation.
             vocabulary: LifeEventVocabulary (required for model construction).
             device: Override device selection.
+            initial_state_dict: Pre-trained weights to warm-start from (federated learning).
             X, y, sample_weight, eval_set: For BaseEstimator compatibility (unused).
         """
         if train_dataset is None:
@@ -745,6 +764,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
         n_events = len(self.events)
         n_horizons = len(self.horizons)
 
+        from .vocabulary import N_NUMERIC_FEATURES
+        n_numeric = N_NUMERIC_FEATURES if self.use_numeric_features else 0
+
         self.model_ = SequenceModel(
             vocab_size=vocabulary.vocab_size,
             embed_dim=self.embed_dim,
@@ -757,13 +779,20 @@ class PyTorchSequenceEstimator(BaseEstimator):
             dropout=self.dropout,
             loss_type=self.loss_type,
             multi_head=self.multi_head,
+            n_numeric_features=n_numeric,
+            numeric_inject=self.numeric_inject,
         ).to(device)
 
         n_params = sum(p.numel() for p in self.model_.parameters())
         logger.info(f"Model parameters: {n_params:,}")
 
+        # Warm-start from pre-trained weights (federated learning)
+        if initial_state_dict is not None:
+            self.model_.load_state_dict(initial_state_dict)
+            logger.info("Loaded initial weights (federated warm-start)")
+
         # Initialize AFT output biases from population-level event statistics
-        if self.loss_type == 'aft' and self.multi_head:
+        elif self.loss_type == 'aft' and self.multi_head:
             self._init_aft_biases(train_dataset, n_events, n_horizons)
 
         # DataLoaders
@@ -946,11 +975,14 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 sample_weights = batch.get('sample_weight')
                 if sample_weights is not None:
                     sample_weights = sample_weights.to(device, non_blocking=use_cuda)
+                numeric_features = batch.get('numeric_features')
+                if numeric_features is not None:
+                    numeric_features = numeric_features.to(device, non_blocking=use_cuda)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast('cuda', enabled=scaler.is_enabled()):
-                    logits = self.model_(input_ids, attention_mask)
+                    logits = self.model_(input_ids, attention_mask, numeric_features=numeric_features)
                     loss = loss_fn(logits, targets, sample_weights=sample_weights)
 
                 scaler.scale(loss).backward()
@@ -984,8 +1016,11 @@ class PyTorchSequenceEstimator(BaseEstimator):
                         input_ids = batch['input_ids'].to(device, non_blocking=use_cuda)
                         attention_mask = batch['attention_mask'].to(device, non_blocking=use_cuda)
                         targets = batch['targets'].to(device, non_blocking=use_cuda)
+                        numeric_features = batch.get('numeric_features')
+                        if numeric_features is not None:
+                            numeric_features = numeric_features.to(device, non_blocking=use_cuda)
 
-                        logits = self.model_(input_ids, attention_mask)
+                        logits = self.model_(input_ids, attention_mask, numeric_features=numeric_features)
                         loss = loss_fn(logits, targets)
 
                         bs = input_ids.size(0)
@@ -1773,8 +1808,11 @@ class PyTorchSequenceEstimator(BaseEstimator):
             for batch in loader:
                 input_ids = batch['input_ids'].to(device, non_blocking=use_cuda)
                 attention_mask = batch['attention_mask'].to(device, non_blocking=use_cuda)
+                numeric_features = batch.get('numeric_features')
+                if numeric_features is not None:
+                    numeric_features = numeric_features.to(device, non_blocking=use_cuda)
 
-                logits = self.model_(input_ids, attention_mask)
+                logits = self.model_(input_ids, attention_mask, numeric_features=numeric_features)
                 if self.loss_type == 'aft':
                     probs = self._aft_to_probs(logits).cpu().numpy()
                 elif self.loss_type == 'deephit':
@@ -1844,8 +1882,11 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 for batch in loader:
                     input_ids = batch['input_ids'].to(device, non_blocking=use_cuda)
                     attention_mask = batch['attention_mask'].to(device, non_blocking=use_cuda)
+                    numeric_features = batch.get('numeric_features')
+                    if numeric_features is not None:
+                        numeric_features = numeric_features.to(device, non_blocking=use_cuda)
 
-                    logits = self.model_(input_ids, attention_mask)
+                    logits = self.model_(input_ids, attention_mask, numeric_features=numeric_features)
                     if self.loss_type == 'aft':
                         probs = self._aft_to_probs(logits).cpu().numpy()
                     elif self.loss_type == 'deephit':
@@ -2034,6 +2075,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
     def save(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
+        from .vocabulary import N_NUMERIC_FEATURES
+        n_numeric = N_NUMERIC_FEATURES if self.use_numeric_features else 0
+
         torch.save(
             {
                 'model_state_dict': self.model_.state_dict(),
@@ -2054,6 +2098,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 'group_thresholds': getattr(self, 'group_thresholds_', None),
                 'sigma_scales': getattr(self, 'sigma_scales_', None),
                 'vocab_size': self.vocabulary_.vocab_size if self.vocabulary_ else None,
+                'use_numeric_features': self.use_numeric_features,
+                'numeric_inject': self.numeric_inject,
+                'n_numeric_features': n_numeric,
             },
             os.path.join(path, "model.pt"),
         )
@@ -2096,6 +2143,15 @@ class PyTorchSequenceEstimator(BaseEstimator):
         estimator.optimal_thresholds_ = checkpoint.get('optimal_thresholds', None)
         estimator.group_thresholds_ = checkpoint.get('group_thresholds', None)
         estimator.sigma_scales_ = checkpoint.get('sigma_scales', None)
+        estimator.use_numeric_features = checkpoint.get('use_numeric_features', False)
+        estimator.numeric_inject = checkpoint.get('numeric_inject', 'add')
+        if estimator.numeric_inject not in {'add', 'concat'}:
+            logger.warning(
+                "Checkpoint numeric_inject='%s' is not supported; using 'add'.",
+                estimator.numeric_inject,
+            )
+            estimator.numeric_inject = 'add'
+        n_numeric = checkpoint.get('n_numeric_features', 0)
 
         vocab_path = os.path.join(path, "vocabulary.joblib")
         if os.path.exists(vocab_path):
@@ -2113,6 +2169,8 @@ class PyTorchSequenceEstimator(BaseEstimator):
             dropout=estimator.dropout,
             loss_type=estimator.loss_type,
             multi_head=estimator.multi_head,
+            n_numeric_features=n_numeric,
+            numeric_inject=estimator.numeric_inject,
         )
         estimator.model_.load_state_dict(checkpoint['model_state_dict'])
         estimator.model_.to(torch.device(device))

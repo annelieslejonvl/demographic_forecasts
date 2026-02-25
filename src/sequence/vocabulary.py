@@ -5,7 +5,7 @@ Maps person-year observations (year, municipality context, demographics, events)
 to integer token IDs for use with sequence models.
 """
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -32,6 +32,18 @@ MUNICIPALITY_FEATURE_MAP = {
     'muni_avg_household_size_context': 'MUNI_HH_SIZE',
     'muni_emigration_rate_context': 'MUNI_EMIG_RATE',
 }
+
+# Features to keep as raw numeric values alongside tokens (hybrid mode)
+NUMERIC_FEATURE_COLUMNS = [
+    'muni_urban_context',
+    'muni_income_trend_3yr',
+    'muni_immigration_rate_context',
+    'muni_median_age_lag1',
+    'muni_avg_household_size_context',
+    'muni_emigration_rate_context',
+    'age',
+]
+N_NUMERIC_FEATURES = len(NUMERIC_FEATURE_COLUMNS)
 
 
 class LifeEventVocabulary:
@@ -72,6 +84,8 @@ class LifeEventVocabulary:
         self._built = False
         # Quantile bin edges for municipality features (computed from data)
         self._muni_quantile_bins: Dict[str, np.ndarray] = {}
+        # Normalization stats for numeric features: {col: (mean, std)}
+        self._numeric_stats: Dict[str, Tuple[float, float]] = {}
 
     def _add_token(self, token: str) -> int:
         if token in self._token_to_id:
@@ -299,6 +313,36 @@ class LifeEventVocabulary:
 
         return self._tokenize_person_fast(person_df, time_col=time_col)
 
+    def tokenize_person_history_with_numerics(
+        self,
+        person_df: pd.DataFrame,
+        time_col: str = 'year',
+        max_year: Optional[int] = None,
+        min_year: Optional[int] = None,
+        **kwargs,
+    ) -> Tuple[List[int], np.ndarray]:
+        """
+        Tokenize a person's history and extract aligned numeric features.
+
+        Returns:
+            tokens: List[int] - token IDs (same as tokenize_person_history)
+            numeric_features: np.ndarray of shape (len(tokens), N_NUMERIC_FEATURES)
+                Each token position gets the numeric vector for its year-observation.
+                BOS, SEP, EOS positions get zeros.
+        """
+        person_df = person_df.sort_values(time_col)
+        if max_year is not None:
+            person_df = person_df[person_df[time_col] <= max_year]
+        if min_year is not None:
+            person_df = person_df[person_df[time_col] > min_year]
+
+        if len(person_df) == 0:
+            tokens = [self.BOS, self.EOS]
+            numeric = np.zeros((2, N_NUMERIC_FEATURES), dtype=np.float32)
+            return tokens, numeric
+
+        return self._tokenize_person_fast_with_numerics(person_df, time_col=time_col)
+
     def _tokenize_person_fast(
         self,
         person_df: pd.DataFrame,
@@ -423,6 +467,141 @@ class LifeEventVocabulary:
         tokens.append(self.EOS)
         return tokens
 
+    def _tokenize_person_fast_with_numerics(
+        self,
+        person_df: pd.DataFrame,
+        time_col: str = 'year',
+    ) -> Tuple[List[int], np.ndarray]:
+        """Tokenize with parallel numeric feature extraction."""
+        tokens = [self.BOS]
+        numeric_rows = [np.zeros(N_NUMERIC_FEATURES, dtype=np.float32)]  # BOS = zeros
+
+        cols = person_df.columns
+        t2id = self._token_to_id
+        unk = self.UNK
+
+        has_year = time_col in cols
+        has_age_group = 'age_group' in cols
+        has_age = 'age' in cols
+        has_gender = 'gender' in cols
+        has_coupled = 'coupled' in cols
+        has_nat = 'eerste_nationaliteit' in cols
+        has_hhpos = 'hh_pos' in cols
+        has_income = 'income_quintile' in cols
+
+        muni_cols_present = [
+            (c, prefix) for c, prefix in MUNICIPALITY_FEATURE_MAP.items() if c in cols
+        ]
+        event_cols_present = [
+            (ec, t2id.get(tn, unk)) for ec, tn in EVENT_TOKEN_MAP.items() if ec in cols
+        ]
+        no_event_id = t2id.get('NO_EVENT', unk)
+
+        values = person_df.values
+        col_idx = {c: i for i, c in enumerate(cols)}
+
+        year_ci = col_idx.get(time_col)
+        ag_ci = col_idx.get('age_group')
+        age_ci = col_idx.get('age')
+        gender_ci = col_idx.get('gender')
+        coupled_ci = col_idx.get('coupled')
+        nat_ci = col_idx.get('eerste_nationaliteit')
+        hhpos_ci = col_idx.get('hh_pos')
+        income_ci = col_idx.get('income_quintile')
+
+        muni_cis = [(col_idx[c], prefix) for c, prefix in muni_cols_present]
+        event_cis = [(col_idx[ec], tid) for ec, tid in event_cols_present]
+
+        # Pre-compute numeric column indices
+        numeric_col_indices = []
+        for nc in NUMERIC_FEATURE_COLUMNS:
+            numeric_col_indices.append(col_idx.get(nc))
+
+        for row_i in range(len(values)):
+            if row_i > 0:
+                tokens.append(self.SEP)
+                numeric_rows.append(np.zeros(N_NUMERIC_FEATURES, dtype=np.float32))  # SEP = zeros
+
+            row = values[row_i]
+
+            # Extract normalized numeric features for this row
+            row_numeric = np.zeros(N_NUMERIC_FEATURES, dtype=np.float32)
+            for ni, nc in enumerate(NUMERIC_FEATURE_COLUMNS):
+                ci = numeric_col_indices[ni]
+                if ci is not None:
+                    v = row[ci]
+                    if v == v:  # not NaN
+                        row_numeric[ni] = self.normalize_numeric(nc, float(v))
+
+            # Count tokens before this row to know how many to broadcast
+            tokens_before = len(tokens)
+
+            # --- Standard tokenization (same as _tokenize_person_fast) ---
+            if has_year:
+                v = row[year_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'YEAR_{int(v)}', unk))
+
+            for ci, prefix in muni_cis:
+                v = row[ci]
+                if v == v:
+                    q = self._get_muni_quintile_raw(ci, float(v), prefix)
+                    tokens.append(q)
+
+            if has_age_group:
+                v = row[ag_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'AGE_{int(v)}', unk))
+            elif has_age:
+                v = row[age_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'AGE_{min(int(v) // 10, 9)}', unk))
+
+            if has_gender:
+                v = row[gender_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'GENDER_{int(v)}', unk))
+
+            if has_coupled:
+                v = row[coupled_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'COUPLED_{int(v)}', unk))
+
+            if has_nat:
+                v = row[nat_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'NAT_{int(v)}', unk))
+
+            if has_hhpos:
+                v = row[hhpos_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'HHPOS_{int(v)}', unk))
+
+            if has_income:
+                v = row[income_ci]
+                if v == v:
+                    tokens.append(t2id.get(f'INCOME_Q{int(v)}', unk))
+
+            event_fired = False
+            for ci, tid in event_cis:
+                v = row[ci]
+                if v == v and int(v) == 1:
+                    tokens.append(tid)
+                    event_fired = True
+            if not event_fired:
+                tokens.append(no_event_id)
+
+            # Broadcast numeric vector to all data tokens from this row
+            n_data_tokens = len(tokens) - tokens_before
+            for _ in range(n_data_tokens):
+                numeric_rows.append(row_numeric)
+
+        tokens.append(self.EOS)
+        numeric_rows.append(np.zeros(N_NUMERIC_FEATURES, dtype=np.float32))  # EOS = zeros
+
+        numeric_features = np.stack(numeric_rows, axis=0)
+        return tokens, numeric_features
+
     def _get_muni_quintile_raw(self, col_idx: int, value: float, prefix: str) -> int:
         """Fast quintile lookup returning token ID directly.
 
@@ -444,6 +623,69 @@ class LifeEventVocabulary:
         q = max(1, min(bin_idx, n_bins))
         return self._token_to_id.get(f'{prefix}_Q{q}', self.UNK)
 
+    def compute_numeric_stats(self, df: pd.DataFrame) -> None:
+        """Compute mean/std for numeric features from a DataFrame."""
+        self._numeric_stats = {}
+        for col in NUMERIC_FEATURE_COLUMNS:
+            if col in df.columns:
+                values = pd.to_numeric(df[col], errors='coerce').dropna()
+                if len(values) > 0:
+                    self._numeric_stats[col] = (float(values.mean()), float(values.std()))
+                else:
+                    self._numeric_stats[col] = (0.0, 1.0)
+        logger.info(f"Computed numeric stats for {len(self._numeric_stats)} features")
+
+    def compute_numeric_stats_from_parquet(
+        self, parquet_path: str, chunk_size: int = 500_000,
+    ) -> None:
+        """Compute mean/std for numeric features by streaming parquet (Welford)."""
+        import pyarrow.parquet as pq
+
+        dataset = pq.ParquetDataset(parquet_path)
+        available = [
+            c for c in NUMERIC_FEATURE_COLUMNS
+            if c in set(dataset.schema.names)
+        ]
+
+        counts: Dict[str, int] = {c: 0 for c in available}
+        means: Dict[str, float] = {c: 0.0 for c in available}
+        m2s: Dict[str, float] = {c: 0.0 for c in available}
+
+        for fragment in dataset.fragments:
+            for batch in fragment.to_batches(batch_size=chunk_size, columns=available):
+                df = batch.to_pandas()
+                for col in available:
+                    vals = pd.to_numeric(df[col], errors='coerce').dropna().values.astype(np.float64)
+                    n_new = len(vals)
+                    if n_new == 0:
+                        continue
+                    batch_mean = float(vals.mean())
+                    batch_var = float(vals.var()) if n_new > 1 else 0.0
+                    n_old = counts[col]
+                    n_total = n_old + n_new
+                    delta = batch_mean - means[col]
+                    means[col] = (n_old * means[col] + n_new * batch_mean) / n_total
+                    m2s[col] += batch_var * (n_new - 1) + delta ** 2 * n_old * n_new / n_total
+                    counts[col] = n_total
+                del df
+
+        self._numeric_stats = {}
+        for col in available:
+            if counts[col] > 1:
+                std = (m2s[col] / (counts[col] - 1)) ** 0.5
+                self._numeric_stats[col] = (means[col], max(std, 1e-8))
+            else:
+                self._numeric_stats[col] = (0.0, 1.0)
+
+        logger.info(f"Computed numeric stats for {len(self._numeric_stats)} features (from parquet)")
+        for col, (m, s) in self._numeric_stats.items():
+            logger.info(f"  {col}: mean={m:.4f}, std={s:.4f}")
+
+    def normalize_numeric(self, col: str, value: float) -> float:
+        """Normalize a single numeric value using stored stats."""
+        mean, std = self._numeric_stats.get(col, (0.0, 1.0))
+        return (value - mean) / max(std, 1e-8)
+
     @property
     def vocab_size(self) -> int:
         return self._next_id
@@ -455,6 +697,7 @@ class LifeEventVocabulary:
             'next_id': self._next_id,
             'built': self._built,
             'muni_quantile_bins': self._muni_quantile_bins,
+            'numeric_stats': self._numeric_stats,
         }, path)
         logger.info(f"Vocabulary saved to {path} ({self.vocab_size} tokens)")
 
@@ -467,6 +710,7 @@ class LifeEventVocabulary:
         vocab._next_id = data['next_id']
         vocab._built = data['built']
         vocab._muni_quantile_bins = data.get('muni_quantile_bins', {})
+        vocab._numeric_stats = data.get('numeric_stats', {})
         logger.info(f"Vocabulary loaded from {path} ({vocab.vocab_size} tokens)")
         return vocab
 

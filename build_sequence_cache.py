@@ -23,7 +23,10 @@ from datetime import datetime
 import pyarrow.parquet as pq
 
 from src.utils.logging_setup import setup_logging, log_stage_start, log_stage_complete
-from src.sequence.vocabulary import LifeEventVocabulary, MUNICIPALITY_FEATURE_MAP
+from src.sequence.vocabulary import (
+    LifeEventVocabulary, MUNICIPALITY_FEATURE_MAP,
+    NUMERIC_FEATURE_COLUMNS, N_NUMERIC_FEATURES,
+)
 from src.sequence.dataset import CachedSequenceDataset
 from run_test import load_model_config
 from run_with_municipality_sequence import (
@@ -100,6 +103,7 @@ def _collect_all_valid_persons(parquet_path, cutoff_years, history_len, max_hori
 def _build_rolling_from_existing_cache(
     existing_cache_dir, vocabulary, max_seq_len, events, horizons,
     cutoff_years, history_len, cache_dir, sample_fraction=None,
+    use_numeric_features=False,
 ):
     """Build rolling window caches by reusing an existing single-cutoff cache.
 
@@ -238,6 +242,7 @@ def _build_rolling_from_existing_cache(
         window_writers[cutoff] = {
             'chunk_dir': cdir,
             'buf_ids': [], 'buf_masks': [], 'buf_targets': [], 'buf_sids': [],
+            'buf_numerics': [],
             'chunk_idx': 0, 'n_processed': 0,
         }
 
@@ -251,6 +256,8 @@ def _build_rolling_from_existing_cache(
             'targets': torch.from_numpy(np.stack(w['buf_targets'])),
             'sids': np.array(w['buf_sids']),
         }
+        if use_numeric_features and w['buf_numerics']:
+            chunk_data['numeric_features'] = torch.from_numpy(np.stack(w['buf_numerics']))
         chunk_path = os.path.join(w['chunk_dir'], f"chunk_{w['chunk_idx']:04d}.pt")
         torch.save(chunk_data, chunk_path)
         print(f"    [cut={cutoff}] Wrote chunk {w['chunk_idx']}: "
@@ -260,6 +267,7 @@ def _build_rolling_from_existing_cache(
         w['buf_masks'].clear()
         w['buf_targets'].clear()
         w['buf_sids'].clear()
+        w['buf_numerics'].clear()
         del chunk_data
 
     # Pass A: Filter existing shards -> temp parquet on disk, sorted by sid
@@ -475,9 +483,24 @@ def _build_rolling_from_existing_cache(
 
         # Stack: (n_rows, n_token_cols)
         row_tokens = np.column_stack(token_cols)
-        return row_tokens
 
-    def _assemble_and_emit(sids, years, row_tokens, event_values, row_start, row_end_per_person):
+        # Extract normalized numeric features if enabled
+        row_numerics = None
+        if use_numeric_features:
+            row_numerics = np.zeros((n, N_NUMERIC_FEATURES), dtype=np.float32)
+            for ni, nc in enumerate(NUMERIC_FEATURE_COLUMNS):
+                if nc in df.columns:
+                    vals = pd.to_numeric(df[nc], errors='coerce').values.astype(np.float64)
+                    mean, std = vocabulary._numeric_stats.get(nc, (0.0, 1.0))
+                    normalized = (vals - mean) / max(std, 1e-8)
+                    nan_mask = np.isnan(vals)
+                    if nan_mask.any():
+                        normalized[nan_mask] = 0.0
+                    row_numerics[:, ni] = normalized
+
+        return row_tokens, row_numerics
+
+    def _assemble_and_emit(sids, years, row_tokens, event_values, row_start, row_end_per_person, row_numerics=None):
         """For a group of persons (contiguous in the sorted data), assemble
         sequences and targets for all cutoff windows."""
         nonlocal total_persons
@@ -492,6 +515,7 @@ def _build_rolling_from_existing_cache(
             p_years = years[rs:re]
             p_tokens = row_tokens[rs:re]  # (n_years, tokens_per_row)
             p_events = event_values[rs:re]  # (n_years, n_events)
+            p_numerics = row_numerics[rs:re] if row_numerics is not None else None
 
             for cutoff in cutoffs_to_build:
                 if sid not in valid_per_cutoff[cutoff]:
@@ -504,31 +528,52 @@ def _build_rolling_from_existing_cache(
 
                 # Build token sequence from history rows
                 hist_tokens = p_tokens[hist_mask]
+                hist_numerics = p_numerics[hist_mask] if p_numerics is not None else None
                 n_hist_rows = hist_tokens.shape[0]
                 # Flatten with SEP between rows: BOS + row0 + SEP + row1 + ... + EOS
-                seq = np.empty(2 + n_hist_rows * tokens_per_row + (n_hist_rows - 1), dtype=np.int64)
+                total_seq_len = 2 + n_hist_rows * tokens_per_row + (n_hist_rows - 1)
+                seq = np.empty(total_seq_len, dtype=np.int64)
                 seq[0] = bos_id
                 pos = 1
+
+                # Build parallel numeric array if enabled
+                if hist_numerics is not None:
+                    seq_numeric = np.zeros((total_seq_len, N_NUMERIC_FEATURES), dtype=np.float32)
+                else:
+                    seq_numeric = None
+
                 for ri in range(n_hist_rows):
                     if ri > 0:
                         seq[pos] = sep_id
+                        # SEP gets zeros (already initialized)
                         pos += 1
                     seq[pos:pos + tokens_per_row] = hist_tokens[ri]
+                    if seq_numeric is not None:
+                        # Broadcast this row's numeric values to all token positions
+                        seq_numeric[pos:pos + tokens_per_row] = hist_numerics[ri]
                     pos += tokens_per_row
                 seq[pos] = eos_id
+                # EOS gets zeros (already initialized)
                 pos += 1
                 seq = seq[:pos]
+                if seq_numeric is not None:
+                    seq_numeric = seq_numeric[:pos]
 
                 # Pad/truncate
                 seq_len = len(seq)
                 if seq_len >= max_seq_len:
                     input_ids = seq[-max_seq_len:].copy()
                     att_mask = np.ones(max_seq_len, dtype=np.float32)
+                    if seq_numeric is not None:
+                        num_feat = seq_numeric[-max_seq_len:].copy()
                 else:
                     input_ids = np.full(max_seq_len, pad_id, dtype=np.int64)
                     input_ids[:seq_len] = seq
                     att_mask = np.zeros(max_seq_len, dtype=np.float32)
                     att_mask[:seq_len] = 1.0
+                    if seq_numeric is not None:
+                        num_feat = np.zeros((max_seq_len, N_NUMERIC_FEATURES), dtype=np.float32)
+                        num_feat[:seq_len] = seq_numeric
 
                 # Build targets from future rows
                 fut_mask = (p_years > cutoff) & (p_years <= cutoff + max_horizon)
@@ -547,6 +592,8 @@ def _build_rolling_from_existing_cache(
                 w['buf_masks'].append(att_mask)
                 w['buf_targets'].append(targets)
                 w['buf_sids'].append(sid)
+                if seq_numeric is not None:
+                    w['buf_numerics'].append(num_feat)
                 w['n_processed'] += 1
 
                 if len(w['buf_ids']) >= CHUNK_SIZE:
@@ -571,11 +618,12 @@ def _build_rolling_from_existing_cache(
     del sample_batch, sample_df
 
     pf = pq_local.ParquetFile(temp_parquet)  # re-open
+    pending_numerics = None
     for batch in pf.iter_batches(batch_size=BATCH_SIZE):
         df = batch.to_pandas()
 
         # Vectorized tokenization of entire batch
-        row_tokens = _tokenize_batch_vectorized(df)
+        row_tokens, row_numerics = _tokenize_batch_vectorized(df)
         batch_years = df['year'].values.astype(int)
         batch_sids = df['sid'].values
 
@@ -601,20 +649,25 @@ def _build_rolling_from_existing_cache(
             cur_years = batch_years[start:end]
             cur_tokens = row_tokens[start:end]
             cur_events = batch_events[start:end]
+            cur_numerics = row_numerics[start:end] if row_numerics is not None else None
 
             if pending_sid is not None and sid != pending_sid:
                 # Emit the pending person
                 _assemble_and_emit(
                     [pending_sid], pending_years, pending_tokens, pending_events,
                     np.array([0]), np.array([len(pending_years)]),
+                    row_numerics=pending_numerics,
                 )
                 pending_sid = None
+                pending_numerics = None
 
             if pending_sid == sid:
                 # Extend pending person (split across batch boundary)
                 pending_years = np.concatenate([pending_years, cur_years])
                 pending_tokens = np.vstack([pending_tokens, cur_tokens])
                 pending_events = np.vstack([pending_events, cur_events])
+                if cur_numerics is not None and pending_numerics is not None:
+                    pending_numerics = np.vstack([pending_numerics, cur_numerics])
             else:
                 # Check if this is the last person in the batch (might continue in next)
                 if bi == len(boundaries) - 2:
@@ -623,20 +676,23 @@ def _build_rolling_from_existing_cache(
                     pending_years = cur_years.copy()
                     pending_tokens = cur_tokens.copy()
                     pending_events = cur_events.copy()
+                    pending_numerics = cur_numerics.copy() if cur_numerics is not None else None
                 else:
                     # Complete person within this batch — emit directly
                     _assemble_and_emit(
                         [sid], cur_years, cur_tokens, cur_events,
                         np.array([0]), np.array([len(cur_years)]),
+                        row_numerics=cur_numerics,
                     )
 
-        del row_tokens, batch_years, batch_sids, batch_events
+        del row_tokens, row_numerics, batch_years, batch_sids, batch_events
 
     # Emit last pending person
     if pending_sid is not None:
         _assemble_and_emit(
             [pending_sid], pending_years, pending_tokens, pending_events,
             np.array([0]), np.array([len(pending_years)]),
+            row_numerics=pending_numerics,
         )
 
     # Flush remaining buffers for all windows
@@ -658,6 +714,7 @@ def _build_rolling_from_existing_cache(
 def _build_rolling_caches(
     data_path, vocabulary, max_seq_len, events, horizons,
     cutoff_years, history_len, cache_dir, sample_fraction=None,
+    use_numeric_features=False,
 ):
     """Build all rolling window caches with a SINGLE pass through the parquet.
 
@@ -826,6 +883,7 @@ def _build_rolling_caches(
         all_masks = []
         all_targets = []
         all_sids_list = []
+        all_numerics = []
         n_processed = 0
 
         for chunk in pd.read_parquet(merged_path, chunksize=100_000):
@@ -841,10 +899,17 @@ def _build_rolling_caches(
                 if len(history) == 0:
                     continue
 
-                tokens = vocabulary.tokenize_person_history(
-                    history, time_col='year', max_year=cutoff,
-                    min_year=min_hist_year,
-                )
+                if use_numeric_features:
+                    tokens, numerics = vocabulary.tokenize_person_history_with_numerics(
+                        history, time_col='year', max_year=cutoff,
+                        min_year=min_hist_year,
+                    )
+                else:
+                    tokens = vocabulary.tokenize_person_history(
+                        history, time_col='year', max_year=cutoff,
+                        min_year=min_hist_year,
+                    )
+                    numerics = None
 
                 # Build targets
                 future = person_df[
@@ -865,16 +930,23 @@ def _build_rolling_caches(
                 if seq_len >= max_seq_len:
                     input_ids = np.array(tokens[-max_seq_len:], dtype=np.int64)
                     mask = np.ones(max_seq_len, dtype=np.float32)
+                    if numerics is not None:
+                        num_feat = numerics[-max_seq_len:].copy()
                 else:
                     input_ids = np.full(max_seq_len, vocabulary.PAD, dtype=np.int64)
                     input_ids[:seq_len] = tokens
                     mask = np.zeros(max_seq_len, dtype=np.float32)
                     mask[:seq_len] = 1.0
+                    if numerics is not None:
+                        num_feat = np.zeros((max_seq_len, N_NUMERIC_FEATURES), dtype=np.float32)
+                        num_feat[:seq_len] = numerics
 
                 all_input_ids.append(input_ids)
                 all_masks.append(mask)
                 all_targets.append(targets)
                 all_sids_list.append(sid)
+                if numerics is not None:
+                    all_numerics.append(num_feat)
                 n_processed += 1
 
                 if n_processed % 100_000 == 0:
@@ -891,12 +963,14 @@ def _build_rolling_caches(
                 'targets': torch.from_numpy(np.stack(all_targets)),
                 'sids': np.array(all_sids_list),
             }
+            if use_numeric_features and all_numerics:
+                cache_data['numeric_features'] = torch.from_numpy(np.stack(all_numerics))
             os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
             torch.save(cache_data, cache_path)
             print(f"  Saved: {cache_path} ({os.path.getsize(cache_path) / 1024**2:.1f} MB)")
             del cache_data
 
-        del all_input_ids, all_masks, all_targets, all_sids_list
+        del all_input_ids, all_masks, all_targets, all_sids_list, all_numerics
         log_stage_complete(f"Tokenizing Window (cutoff={cutoff})")
 
     # Cleanup temp dir
@@ -930,6 +1004,10 @@ def main():
                         help='Path to existing single-cutoff cache directory with '
                              'per-year shards. Reuses these shards instead of '
                              're-reading the raw parquet (much faster).')
+    parser.add_argument('--numeric-features', action='store_true',
+                        help='Include normalized numeric features alongside tokens '
+                             '(hybrid mode). Requires vocabulary with computed '
+                             'numeric stats.')
 
     args = parser.parse_args()
 
@@ -950,6 +1028,8 @@ def main():
             print(f"  Reusing existing cache: {args.existing_cache}")
     else:
         print(f"Mode: Single cutoff (year={args.cutoff_year})")
+    if args.numeric_features:
+        print(f"Numeric features: ENABLED (hybrid mode)")
     if args.sample_fraction:
         print(f"Sample fraction: {args.sample_fraction:.2%} (subset mode)")
     else:
@@ -1003,6 +1083,32 @@ def main():
         vocabulary = _build_vocab_from_parquet(args.data_path, vocab_path)
 
     print(f"Vocabulary size: {vocabulary.vocab_size} tokens")
+
+    # Compute numeric stats if needed
+    if args.numeric_features and not vocabulary._numeric_stats:
+        if args.rolling and args.existing_cache:
+            # Compute from existing cache shards
+            print("Computing numeric normalization stats from existing cache shards...")
+            import pandas as pd
+            shard_files = sorted([
+                os.path.join(args.existing_cache, f)
+                for f in os.listdir(args.existing_cache) if f.endswith('.parquet')
+            ])
+            all_dfs = []
+            for sf in shard_files:
+                all_dfs.append(pd.read_parquet(sf))
+            combined = pd.concat(all_dfs, ignore_index=True)
+            vocabulary.compute_numeric_stats(combined)
+            del all_dfs, combined
+        else:
+            print("Computing numeric normalization stats from parquet...")
+            vocabulary.compute_numeric_stats_from_parquet(args.data_path)
+        # Re-save vocabulary with stats
+        vocabulary.save(vocab_path)
+        print(f"  Saved vocabulary with numeric stats to {vocab_path}")
+    elif args.numeric_features:
+        print(f"Vocabulary already has numeric stats for {len(vocabulary._numeric_stats)} features")
+
     log_stage_complete("Building Vocabulary")
     print()
 
@@ -1071,6 +1177,7 @@ def main():
                 history_len=history_len,
                 cache_dir=cache_dir,
                 sample_fraction=args.sample_fraction,
+                use_numeric_features=args.numeric_features,
             )
         else:
             # Slow path: read from raw parquet
@@ -1084,6 +1191,7 @@ def main():
                 history_len=history_len,
                 cache_dir=cache_dir,
                 sample_fraction=args.sample_fraction,
+                use_numeric_features=args.numeric_features,
             )
 
         print("=" * 70)

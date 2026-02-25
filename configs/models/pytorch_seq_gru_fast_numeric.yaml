@@ -1,0 +1,69 @@
+# PyTorch Sequence Model - GRU Fast (Minimal)
+# Properly proportioned hourglass: 32 -> 128 -> [64, 32] -> 2
+# ~4x smaller than standard config, suitable for quick iteration
+
+backend: pytorch
+model_type: seq_gru
+
+device:
+  type: auto
+  gpu_id: null
+
+model:
+  type: seq_gru
+  params:
+    horizon_weights: [3.0, 1.5, 1.0]
+    balanced_sampling: false
+    calibration_method: isotonic
+    mc_dropout_samples: 0              # disabled for speed
+    swa_start_fraction: null
+    loss_type: aft
+    multi_head: true
+    event_weight_mode: learned
+    encoder_type: gru
+    embed_dim: 32
+    max_seq_len: 64
+    pos_weight_max_samples: 5000
+
+    # Hybrid numeric features
+    use_numeric_features: true
+    numeric_inject: add          # add | concat
+
+
+    # Minimal GRU encoder (hourglass: 32 -> 128)
+    encoder:
+      hidden_dim: 128
+      num_layers: 1
+      dropout: 0.2
+
+    # Prediction head (128 -> 64 -> 32 -> 2)
+    head_hidden_dims: [64, 32]
+    dropout: 0.2
+
+    # Training
+    learning_rate: 0.001
+    weight_decay: 0.001
+    epochs: 30
+    batch_size: 256
+    early_stopping_patience: 5
+    early_stopping_metric: composite
+    use_amp: true
+
+    # LR Finder
+    lr_find: true
+    lr_find_config:
+      lr_min: 1.0e-7
+      lr_max: 1.0
+      num_steps: 2500
+      fraction: 0.3
+
+# Events to predict
+events:
+  - y_moved
+  - birth1_event
+  - birth2_event
+  - divorce_event
+  - getalifeother_event
+
+# Prediction horizons (years)
+horizons: [1, 3, 5]

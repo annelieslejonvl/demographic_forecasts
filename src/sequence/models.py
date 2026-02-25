@@ -278,12 +278,30 @@ class MultiEventHead(nn.Module):
             return torch.cat(outputs, dim=-1)  # (batch, n_events*n_horizons)
 
 
+class NumericProjection(nn.Module):
+    """Projects numeric features directly to embedding space."""
+
+    def __init__(self, n_numeric: int, embed_dim: int):
+        super().__init__()
+        self.projection = nn.Linear(n_numeric, embed_dim)
+
+    def forward(self, numeric_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            numeric_features: (batch, seq_len, n_numeric)
+        Returns:
+            (batch, seq_len, embed_dim)
+        """
+        return self.projection(numeric_features)
+
+
 class SequenceModel(nn.Module):
     """
     Full sequence model: Embedding -> Encoder -> Prediction Head.
 
     Supports three encoder types: lstm, gru, transformer.
     Supports multi_head=True for separate per-event prediction heads.
+    Supports optional hybrid numeric features via additive or concat injection.
     """
 
     def __init__(
@@ -299,31 +317,48 @@ class SequenceModel(nn.Module):
         dropout: float = 0.1,
         loss_type: str = 'bce',
         multi_head: bool = False,
+        n_numeric_features: int = 0,
+        numeric_inject: str = 'add',
     ):
         super().__init__()
         encoder_config = encoder_config or {}
+
+        self.n_numeric_features = n_numeric_features
+        self.numeric_inject = numeric_inject
 
         self.embedding = TokenEmbedding(
             vocab_size, embed_dim, max_seq_len, dropout
         )
 
+        # Numeric projection (hybrid mode)
+        if n_numeric_features > 0:
+            if numeric_inject not in {'add', 'concat'}:
+                raise ValueError(
+                    f"numeric_inject must be one of ['add', 'concat'], got '{numeric_inject}'"
+                )
+            self.numeric_projection = NumericProjection(n_numeric_features, embed_dim)
+            encoder_input_dim = embed_dim * 2 if numeric_inject == 'concat' else embed_dim
+        else:
+            self.numeric_projection = None
+            encoder_input_dim = embed_dim
+
         if encoder_type == 'lstm':
             self.encoder = LSTMEncoder(
-                embed_dim=embed_dim,
+                embed_dim=encoder_input_dim,
                 hidden_dim=encoder_config.get('hidden_dim', 256),
                 num_layers=encoder_config.get('num_layers', 2),
                 dropout=encoder_config.get('dropout', 0.3),
             )
         elif encoder_type == 'gru':
             self.encoder = GRUEncoder(
-                embed_dim=embed_dim,
+                embed_dim=encoder_input_dim,
                 hidden_dim=encoder_config.get('hidden_dim', 256),
                 num_layers=encoder_config.get('num_layers', 2),
                 dropout=encoder_config.get('dropout', 0.3),
             )
         elif encoder_type == 'transformer':
             self.encoder = TransformerSequenceEncoder(
-                embed_dim=embed_dim,
+                embed_dim=encoder_input_dim,
                 num_heads=encoder_config.get('num_heads', 4),
                 num_layers=encoder_config.get('num_layers', 3),
                 ff_dim=encoder_config.get('ff_dim', 512),
@@ -363,15 +398,37 @@ class SequenceModel(nn.Module):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.Tensor,
+        numeric_features: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
             input_ids: (batch, seq_len) token IDs
             attention_mask: (batch, seq_len) 1=real, 0=pad
+            numeric_features: (batch, seq_len, n_numeric) or None
         Returns:
             logits: (batch, n_events * n_horizons)
         """
         embeddings = self.embedding(input_ids)
+
+        if self.numeric_projection is not None:
+            if numeric_features is not None:
+                numeric_emb = self.numeric_projection(
+                    numeric_features.to(dtype=embeddings.dtype)
+                )
+                # Enforce zero numeric contribution for special tokens.
+                # Specials: PAD(0), BOS(1), EOS(2), SEP(3)
+                valid_token_mask = (input_ids > 3).unsqueeze(-1).to(dtype=embeddings.dtype)
+                numeric_emb = numeric_emb * valid_token_mask
+            else:
+                # Keep shape consistent for concat mode when numeric features
+                # are unexpectedly missing.
+                numeric_emb = torch.zeros_like(embeddings)
+
+            if self.numeric_inject == 'concat':
+                embeddings = torch.cat([embeddings, numeric_emb], dim=-1)
+            else:
+                embeddings = embeddings + numeric_emb
+
         encoded = self.encoder(embeddings, attention_mask)
         logits = self.head(encoded)
         return logits

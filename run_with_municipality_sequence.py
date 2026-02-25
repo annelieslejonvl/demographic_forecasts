@@ -27,6 +27,7 @@ import os
 import argparse
 import gc
 import json
+import shutil
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -58,6 +59,25 @@ DEFAULT_EVENTS = [
 ]
 
 DEFAULT_HORIZONS = [1, 3, 5]
+
+
+def _save_checkpoint_config(
+    checkpoint_path: str,
+    config: Optional[Dict[str, Any]],
+    config_path: Optional[str],
+) -> None:
+    """Persist config as standalone files inside the checkpoint directory."""
+    if config is not None:
+        resolved_config_path = os.path.join(checkpoint_path, "config_used.json")
+        with open(resolved_config_path, "w") as f:
+            json.dump(config, f, indent=2, default=str)
+        print(f"  Saved resolved config: {resolved_config_path}")
+
+    if config_path and os.path.exists(config_path):
+        suffix = Path(config_path).suffix or ".yaml"
+        source_config_path = os.path.join(checkpoint_path, f"config_source{suffix}")
+        shutil.copy2(config_path, source_config_path)
+        print(f"  Saved source config copy: {source_config_path}")
 
 def _scan_unique_values(parquet_path: str, columns: List[str], chunk_size: int = 500_000) -> Dict[str, set]:
     dataset = pq.ParquetDataset(parquet_path)
@@ -186,6 +206,25 @@ def _collect_valid_persons(
             del df
 
     return history & future
+
+
+def _ensure_numeric_stats(
+    vocabulary: LifeEventVocabulary,
+    config: Optional[Dict[str, Any]],
+    parquet_path: str,
+    vocab_path: str,
+):
+    """Compute and persist numeric normalization stats if needed by config."""
+    params = (config or {}).get('model', {}).get('params', {})
+    if not params.get('use_numeric_features', False):
+        return
+    if vocabulary._numeric_stats:
+        print(f"  Vocabulary has numeric stats for {len(vocabulary._numeric_stats)} features")
+        return
+    print("  Computing numeric normalization stats from parquet...")
+    vocabulary.compute_numeric_stats_from_parquet(parquet_path)
+    vocabulary.save(vocab_path)
+    print(f"  Saved vocabulary with numeric stats to {vocab_path}")
 
 
 def _scan_year_range(parquet_path: str, chunk_size: int = 500_000):
@@ -605,6 +644,7 @@ def _run_hyperparameter_tuning(
         vocabulary = _build_vocab_from_parquet(output_path, vocab_path)
 
     print(f"  Vocabulary size: {vocabulary.vocab_size} tokens")
+    _ensure_numeric_stats(vocabulary, config, output_path, vocab_path)
     log_stage_complete("Building Vocabulary")
 
     # ---- Load datasets from existing caches ----
@@ -614,6 +654,7 @@ def _run_hyperparameter_tuning(
     log_stage_start("Loading Datasets for Tuning")
 
     max_seq_len = config.get('model', {}).get('params', {}).get('max_seq_len', 256) if config else 256
+    use_numeric = (config or {}).get('model', {}).get('params', {}).get('use_numeric_features', False)
     val_cutoff = cutoff_year - 2
 
     cache_dir = "checkpoints/sequence_cache"
@@ -681,6 +722,7 @@ def _run_hyperparameter_tuning(
         cutoff_year=cutoff_year,
         allowed_sids=valid_persons,
         cache_path=train_cache,
+        use_numeric_features=use_numeric,
     )
     print(f"  Train dataset: {len(train_dataset):,} persons")
 
@@ -693,6 +735,7 @@ def _run_hyperparameter_tuning(
         cutoff_year=val_cutoff,
         allowed_sids=val_persons,
         cache_path=val_cache,
+        use_numeric_features=use_numeric,
     )
     print(f"  Val dataset: {len(val_dataset):,} persons")
     del valid_persons, val_persons
@@ -830,9 +873,12 @@ def _run_streaming_sequence_pipeline(
         vocabulary = _build_vocab_from_parquet(output_path, vocab_path)
 
     print(f"  Vocabulary size: {vocabulary.vocab_size} tokens")
+    _ensure_numeric_stats(vocabulary, config, output_path, vocab_path)
     log_stage_complete("Building Vocabulary")
 
     log_stage_start("Creating Sequence Datasets (Streaming)")
+
+    use_numeric = (config or {}).get('model', {}).get('params', {}).get('use_numeric_features', False)
 
     parquet_dataset = pq.ParquetDataset(output_path)
     schema_cols = set(parquet_dataset.schema.names)
@@ -933,6 +979,7 @@ def _run_streaming_sequence_pipeline(
         cutoff_year=cutoff_year,
         allowed_sids=valid_persons,
         cache_path=train_cache,
+        use_numeric_features=use_numeric,
     )
     print(f"  Train dataset: {len(train_dataset):,} persons")
 
@@ -945,6 +992,7 @@ def _run_streaming_sequence_pipeline(
         cutoff_year=val_cutoff,
         allowed_sids=val_persons,
         cache_path=val_cache,
+        use_numeric_features=use_numeric,
     )
     print(f"  Val dataset: {len(val_dataset):,} persons")
     # Free person sets after dataset creation
@@ -963,6 +1011,7 @@ def _run_streaming_sequence_pipeline(
             allowed_sids=eval_persons,
             return_ids=True,
             cache_path=test_cache,
+            use_numeric_features=use_numeric,
         )
         print(f"  Test dataset: {len(test_dataset):,} persons")
     else:
@@ -1333,6 +1382,7 @@ def _run_streaming_sequence_pipeline(
         os.makedirs(checkpoint_path, exist_ok=True)
 
         estimator.save(checkpoint_path)
+        _save_checkpoint_config(checkpoint_path, config, config_path)
         print(f"  Saved model: {checkpoint_path}")
 
         if all_predictions is not None and sids is not None:
@@ -1522,12 +1572,15 @@ def _run_rolling_window_pipeline(
         vocabulary = _build_vocab_from_parquet(output_path, vocab_path)
 
     print(f"  Vocabulary size: {vocabulary.vocab_size} tokens")
+    _ensure_numeric_stats(vocabulary, config, output_path, vocab_path)
     log_stage_complete("Building Vocabulary")
 
     # ================================================================
     # Step 3: Build/load per-window caches
     # ================================================================
     log_stage_start("Creating Rolling Window Datasets")
+
+    use_numeric = (config or {}).get('model', {}).get('params', {}).get('use_numeric_features', False)
 
     cache_dir = "checkpoints/sequence_cache"
     os.makedirs(cache_dir, exist_ok=True)
@@ -1590,6 +1643,7 @@ def _run_rolling_window_pipeline(
                 allowed_sids=valid,
                 cache_path=cp,
                 min_history_year=min_hist_year,
+                use_numeric_features=use_numeric,
             )
             print(f"    Cache built for cutoff={cutoff}")
 
@@ -1615,6 +1669,7 @@ def _run_rolling_window_pipeline(
         cutoff_year=val_cutoff,
         cache_path=val_cp,
         min_history_year=val_cutoff - history_len,
+        use_numeric_features=use_numeric,
     )
     print(f"  Val dataset: {len(val_dataset):,} persons (cutoff={val_cutoff})")
 
@@ -1629,6 +1684,7 @@ def _run_rolling_window_pipeline(
         return_ids=True,
         cache_path=test_cp,
         min_history_year=test_cutoff - history_len,
+        use_numeric_features=use_numeric,
     )
     print(f"  Test dataset: {len(test_dataset):,} persons (cutoff={test_cutoff})")
 
@@ -1893,6 +1949,7 @@ def _run_rolling_window_pipeline(
                     cache_path=cp,
                     min_history_year=cutoff - history_len,
                     return_ids=True,
+                    use_numeric_features=use_numeric,
                 )
                 window_proba = estimator.predict_proba(dataset=window_ds)
                 window_preds = _build_predictions_from_probs(
@@ -1948,6 +2005,7 @@ def _run_rolling_window_pipeline(
         os.makedirs(checkpoint_path, exist_ok=True)
 
         estimator.save(checkpoint_path)
+        _save_checkpoint_config(checkpoint_path, config, config_path)
         print(f"  Saved model: {checkpoint_path}")
 
         if all_predictions is not None and sids is not None:
@@ -2296,12 +2354,14 @@ def main_sequence(
         vocabulary.save(vocab_path)
 
     print(f"  Vocabulary size: {vocabulary.vocab_size} tokens")
+    _ensure_numeric_stats(vocabulary, config, output_path, vocab_path)
     log_stage_complete("Building Vocabulary")
 
     # ================================================================
     # STAGE 3: Train/test split + create datasets
     # ================================================================
     log_stage_start("Creating Sequence Datasets")
+    use_numeric = (config or {}).get('model', {}).get('params', {}).get('use_numeric_features', False)
 
     if 'year' in df.columns:
         train_df = df[df['year'] <= cutoff_year].copy()
@@ -2336,6 +2396,7 @@ def main_sequence(
         events=events,
         horizons=horizons,
         cutoff_year=cutoff_year,
+        use_numeric_features=use_numeric,
     )
     print(f"  Train dataset: {len(train_dataset):,} persons")
 
@@ -2354,6 +2415,7 @@ def main_sequence(
         events=events,
         horizons=horizons,
         cutoff_year=val_cutoff,
+        use_numeric_features=use_numeric,
     )
     del val_data
     gc.collect()
@@ -2382,6 +2444,7 @@ def main_sequence(
             events=events,
             horizons=horizons,
             cutoff_year=cutoff_year,
+            use_numeric_features=use_numeric,
         )
         del eval_data
         gc.collect()
@@ -3024,6 +3087,7 @@ def main_sequence(
 
         # Save model
         estimator.save(checkpoint_path)
+        _save_checkpoint_config(checkpoint_path, config, config_path)
         print(f"  Saved model: {checkpoint_path}")
 
         # Save predictions as parquet (including intervals if available)
