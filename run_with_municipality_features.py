@@ -15,7 +15,17 @@ Usage:
 import sys
 import argparse
 import os
-import shutil
+from pathlib import Path
+# Always set JAVA_HOME to JDK 17 (required by Spark 4.x; JDK 25+ is incompatible)
+_jdk_path = Path.home() / "jdk-17.0.18+8"
+if _jdk_path.exists():
+    os.environ["JAVA_HOME"] = str(_jdk_path)
+
+# Hadoop winutils.exe required on Windows
+if not os.environ.get("HADOOP_HOME"):
+    _hadoop_path = Path.home() / "hadoop"
+    if _hadoop_path.exists():
+        os.environ["HADOOP_HOME"] = str(_hadoop_path)
 
 # Setup logging FIRST (captures all output)
 from src.utils.logging_setup import setup_logging, configure_spark_logging, log_stage_start, log_stage_complete, log_memory_usage
@@ -38,7 +48,6 @@ from src.features.municipality_context import (
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 import pathlib
-from pathlib import Path
 from typing import Dict, Any, Optional
 from src.features.socioeconomic import create_all_socioeconomic_features
 from src.features.imputation import impute_missing_values
@@ -169,24 +178,49 @@ def main_with_municipality(
 
     log_stage_start("Spark Session Initialization")
 
-    # Spark session with CONSERVATIVE memory settings for OOM prevention
+    import tempfile
+    import shutil
+    import atexit
+
+    # Create temp dir for Spark local storage and checkpoints
+    spark_temp_dir = tempfile.mkdtemp(prefix="spark_local_")
+
+    # Spark session optimized for 32GB system with year-by-year processing
+    # In local mode, driver and executor share same JVM - so use master="local[*]"
     spark = SparkSession.builder \
         .appName("DemographicForecasts_Municipality") \
-        .config("spark.driver.memory", "8g") \
-        .config("spark.executor.memory", "8g") \
-        .config("spark.driver.maxResultSize", "2g") \
-        .config("spark.sql.shuffle.partitions", "100") \
-        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
-        .config("spark.python.worker.memory", "2g") \
-        .config("spark.memory.fraction", "0.6") \
-        .config("spark.memory.storageFraction", "0.3") \
+        .master("local[*]") \
+        .config("spark.driver.memory", "22g") \
+        .config("spark.driver.maxResultSize", "4g") \
+        .config("spark.memory.fraction", "0.8") \
+        .config("spark.memory.storageFraction", "0.2") \
+        .config("spark.sql.shuffle.partitions", "8") \
+        .config("spark.default.parallelism", "8") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-        .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000") \
-        .config("spark.executor.memoryOverhead", "1g") \
-        .config("spark.driver.memoryOverhead", "1g") \
-        .config("spark.default.parallelism", "100") \
-        .config("spark.sql.autoBroadcastJoinThreshold", "-1") \
+        .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "128MB") \
+        .config("spark.sql.autoBroadcastJoinThreshold", "256MB") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true") \
+        .config("spark.sql.execution.arrow.maxRecordsPerBatch", "50000") \
+        .config("spark.python.worker.memory", "2g") \
+        .config("spark.local.dir", spark_temp_dir) \
+        .config("spark.shuffle.spill.compress", "true") \
+        .config("spark.shuffle.compress", "true") \
+        .config("spark.io.compression.codec", "snappy") \
+        .config("spark.driver.extraJavaOptions",
+                "-XX:+UseG1GC "
+                "-XX:InitiatingHeapOccupancyPercent=45 "
+                "-XX:G1HeapRegionSize=32M "
+                "-XX:MaxGCPauseMillis=500 "
+                "-XX:+ParallelRefProcEnabled "
+                "-XX:ParallelGCThreads=8 "
+                "-XX:ConcGCThreads=2 "
+                "-XX:ReservedCodeCacheSize=256m "
+                "-XX:NonProfiledCodeHeapSize=128m") \
+        .config("spark.ui.enabled", "false") \
+        .config("spark.cleaner.periodicGC.interval", "5min") \
+        .config("spark.cleaner.referenceTracking.cleanCheckpoints", "true") \
         .getOrCreate()
 
     # Configure Spark logging
@@ -195,17 +229,31 @@ def main_with_municipality(
     log_stage_complete("Spark Session Initialization")
     log_memory_usage()
 
-    import tempfile
-    checkpoint_dir = tempfile.mkdtemp(prefix="spark_checkpoint_")
+    # Set checkpoint directory
+    checkpoint_dir = os.path.join(spark_temp_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
     spark.sparkContext.setCheckpointDir(checkpoint_dir)
 
-    print("✓ Spark session created")
+    # Register cleanup function to remove temp directory on exit
+    def cleanup_spark_temp():
+        try:
+            if os.path.exists(spark_temp_dir):
+                shutil.rmtree(spark_temp_dir)
+                print(f"✓ Cleaned up Spark temp directory: {spark_temp_dir}")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not clean up Spark temp directory: {e}")
 
-    window_spec = Window.partitionBy('sid').orderBy('year')
+    atexit.register(cleanup_spark_temp)
+
+    print("✓ Spark session created")
+    print(f"  Temp dir: {spark_temp_dir} (will be cleaned up on exit)")
+    print(f"  Disk space available: 57 GB")
+
+    window_spec = Window.partitionBy('id').orderBy('year')
 
     # Load data
     log_stage_start("Data Loading")
-    DATA_PATH = "data/synthetic_with_demographics_fixed"
+    DATA_PATH = r"..\AI_datagen\data\real_panel_long"
     files = list(pathlib.Path(DATA_PATH).rglob("*.parquet"))
     df = spark.read.parquet(*[str(file) for file in files])
     print(f"✓ Data loaded: {len(df.columns)} columns")
@@ -248,15 +296,16 @@ def main_with_municipality(
     event_cols = [c for c in df.columns if c.endswith("_event")]
     event_cols.extend(['y_moved'])
 
-    # Repartition
-    num_partitions = max(200, df.select("sid").distinct().count() // 1000)
-    print(f"Repartitioning by 'sid' into {num_partitions} partitions...")
-    df = df.repartition(num_partitions, "sid")
+    # Repartition - fewer partitions to reduce memory overhead
+    # Each partition should be 100-200MB for optimal memory usage
+    num_partitions = 8  # Match parallelism for minimal overhead
+    print(f"Repartitioning by 'id' into {num_partitions} partitions...")
+    df = df.repartition(num_partitions, "id")
 
     # Enhanced features
     log_stage_start("Enhanced Features Creation")
     print("\n🚀 Creating ENHANCED features...")
-    df2 = create_all_enhanced_features(df, event_cols, id_col='sid', t_col='year')
+    df2 = create_all_enhanced_features(df, event_cols, id_col='id', t_col='year')
     print("✓ Enhanced event history features created")
 
     # SKIP checkpoints entirely - all computation deferred to incremental write
@@ -272,7 +321,7 @@ def main_with_municipality(
         print("\n📍 Creating municipality history (refnis_lag1, refnis_lag2)...")
         print("   This prevents temporal leakage - we use ORIGIN municipality, not DESTINATION")
 
-        w_individual = Window.partitionBy('sid').orderBy('year')
+        w_individual = Window.partitionBy('id').orderBy('year')
         df2 = df2.withColumn('refnis_lag1', F.lag('refnis', 1).over(w_individual))
         df2 = df2.withColumn('refnis_lag2', F.lag('refnis', 2).over(w_individual))
 
@@ -289,7 +338,7 @@ def main_with_municipality(
         print("\n🏘️  Creating MUNICIPALITY contextual features...")
         df2 = create_all_municipality_features(
             df2,
-            id_col='sid',
+            id_col='id',
             time_col='year',
             muni_col='refnis_lag1',  # Use ORIGIN municipality (where they were)
             lag_years=1,
@@ -331,7 +380,13 @@ def main_with_municipality(
             print("   Continuing with internal municipality aggregates only")
             log_stage_complete("External Socioeconomic Data (Error)")
 
-    # Rest of pipeline
+    # *** SKIP CHECKPOINT - Process lazily to avoid OOM ***
+    # Don't materialize the whole dataset - let Spark handle it lazily
+    # The DAG will be evaluated incrementally when we process year-by-year
+    print("\n⚡ Skipping intermediate checkpoint to avoid OOM")
+    print("   DAG will be evaluated incrementally during year-by-year processing")
+
+    # Rest of pipeline — now runs on a flat DataFrame
     log_stage_start("Base Features Pipeline")
     df2 = (df2
         .transform(cast_events_to_bool)
@@ -355,14 +410,11 @@ def main_with_municipality(
     log_stage_start("Socioeconomic Features")
     df2 = create_all_socioeconomic_features(
         df2,
-        id_col='sid',
+        id_col='id',
         time_col='year',
         include_hh_pos_features=True
     )
     print(f"✓ Socioeconomic features created: {len(df2.columns)} columns")
-
-    # SKIP final checkpoint - defer all computation to incremental write
-    # The year-by-year write will naturally handle the computation in chunks
     print(f"  Total columns: {len(df2.columns)}")
     log_stage_complete("Socioeconomic Features")
     log_memory_usage()
@@ -375,27 +427,6 @@ def main_with_municipality(
             print(f"  - {col}")
         print("  These should be lagged! Check municipality_context.py")
 
-    # *** INTERMEDIATE CHECKPOINT: Break DAG into smaller chunks ***
-    # Writing to temp parquet BEFORE imputation to reduce memory pressure
-    log_stage_start("Intermediate Materialization (Before Imputation)")
-    print("\n📦 Writing intermediate features to temp parquet...")
-    print("   This breaks the deep DAG into smaller chunks to prevent OOM")
-
-    temp_path_intermediate = "data/temp_before_imputation"
-    if os.path.exists(temp_path_intermediate):
-        shutil.rmtree(temp_path_intermediate)
-
-    print("  Materializing features created so far...")
-    df2.write.mode("overwrite").parquet(temp_path_intermediate)
-    print("  ✓ Intermediate data written to disk")
-
-    print("  Reading back from parquet...")
-    df2 = spark.read.parquet(temp_path_intermediate)
-    print("  ✓ Fresh DataFrame loaded - first DAG chunk materialized")
-
-    log_stage_complete("Intermediate Materialization (Before Imputation)")
-    log_memory_usage()
-
     # *** CRITICAL: IMPUTE MISSING VALUES ***
     # Lagged features and window operations create NULLs that must be filled.
 
@@ -404,7 +435,7 @@ def main_with_municipality(
     df2 = impute_missing_values(
         df2,
         strategy="smart",  # median for numeric, mode for boolean
-        exclude_cols=['sid', 'year', 'refnis', 'y_moved'],  # Don't impute these
+        exclude_cols=['id', 'year', 'refnis', 'y_moved'],  # Don't impute these
         verbose=True
     )
     print("✓ Imputation complete")
@@ -412,62 +443,42 @@ def main_with_municipality(
     log_memory_usage()
 
     # Write to disk INCREMENTALLY (year by year to avoid OOM)
+    # Using pandas/pyarrow for parquet writes to bypass Hadoop NativeIO on Windows
     log_stage_start("Incremental Write to Disk")
     print("\n📁 Writing processed data to disk (incremental by year)...")
-    print("   This avoids Out-Of-Memory errors on large datasets")
+    print("   Processing each year separately to minimize memory usage")
+    print("   Using pandas+pyarrow to bypass Hadoop NativeIO on Windows")
 
-    # CRITICAL: Write to temp parquet and read back to break DAG lineage
-    # This completely bypasses Spark's DAG analysis (which causes StackOverflow)
-    # Unlike checkpoint(), this never calls Catalyst optimizer on the deep DAG
-    log_stage_start("Materializing Features to Temp File")
-    print("  Writing to temporary parquet file to break deep DAG...")
-    print("  (This will materialize all transformations - may take time)")
-
-    import shutil
-    temp_path = "data/temp_checkpoint_features"
-
-    # Remove temp path if it exists
-    if os.path.exists(temp_path):
-        shutil.rmtree(temp_path)
-
-    # Write all data to temp parquet (materializes the DAG)
-    df2.write.mode("overwrite").parquet(temp_path)
-    print("  ✓ Data materialized to disk")
-
-    # Read back from parquet (fresh DataFrame, no DAG lineage)
-    df2 = spark.read.parquet(temp_path)
-    print("  ✓ Fresh DataFrame loaded - DAG lineage completely broken")
-
-    log_stage_complete("Materializing Features to Temp File")
-    log_memory_usage()
-
-    # Get list of years in the dataset
+    # Get list of years FIRST (small operation)
     log_stage_start("Getting Year List")
     years = [row.year for row in df2.select('year').distinct().orderBy('year').collect()]
     print(f"  Found {len(years)} years: {min(years)} - {max(years)}")
     log_stage_complete("Getting Year List")
     log_memory_usage()
 
-    # Write year by year to avoid OOM
+    # Write year by year - each year is processed independently
+    # This avoids loading entire dataset into memory
+    os.makedirs(output_path, exist_ok=True)
     for i, year in enumerate(years):
         log_stage_start(f"Writing Year {year}")
-        print(f"  [{i+1}/{len(years)}] Writing year {year}...", end=" ", flush=True)
+        print(f"  [{i+1}/{len(years)}] Processing year {year}...", end=" ", flush=True)
 
-        df_year = df2.filter(F.col('year') == year)
+        # Filter to single year and persist to break DAG between years
+        df_year = df2.filter(F.col('year') == year).persist()
 
-        # Coalesce to reduce number of files (improves read performance later)
-        # Use 10 partitions per year for balance between parallelism and file count
-        df_year = df_year.coalesce(10)
+        # Force evaluation and get count
+        count = df_year.count()
+        print(f"({count:,} rows)...", end=" ", flush=True)
 
-        if i == 0:
-            # First year: overwrite
-            df_year.write.mode("overwrite").parquet(output_path)
-        else:
-            # Subsequent years: append
-            df_year.write.mode("append").parquet(output_path)
+        # Convert to pandas and write
+        pdf = df_year.toPandas()
+        year_file = os.path.join(output_path, f"year_{year}.parquet")
+        pdf.to_parquet(year_file, index=False, engine="pyarrow")
 
-        # Don't call count() here - it triggers StackOverflowError with long DAG
-        # The write itself confirms success
+        # Unpersist to free memory for next year
+        df_year.unpersist()
+        del pdf
+
         print(f"✓")
         log_stage_complete(f"Writing Year {year}")
         log_memory_usage()

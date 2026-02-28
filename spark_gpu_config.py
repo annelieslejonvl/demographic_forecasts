@@ -8,27 +8,43 @@ Key optimizations:
 4. Reduced JVM heap to leave more memory for GPU
 """
 
+import os
+from pathlib import Path
+
+# Always set JAVA_HOME to JDK 17 (required by Spark 4.x; JDK 25+ is incompatible)
+_jdk_path = Path.home() / "jdk-17.0.18+8"
+if _jdk_path.exists():
+    os.environ["JAVA_HOME"] = str(_jdk_path)
+
+# Hadoop winutils.exe required on Windows
+if not os.environ.get("HADOOP_HOME"):
+    _hadoop_path = Path.home() / "hadoop"
+    if _hadoop_path.exists():
+        os.environ["HADOOP_HOME"] = str(_hadoop_path)
+
 from pyspark.sql import SparkSession
 
 
 def create_gpu_optimized_spark_session(
     app_name: str = "DemographicForecasts",
-    driver_memory: str = "6g",      # Reduced from 8g to leave room for off-heap
-    executor_memory: str = "6g",
-    memory_overhead: str = "4g",    # CRITICAL: Off-heap memory for GPU operations
+    driver_memory: str = "12g",
+    executor_memory: str = "12g",
+    memory_overhead: str = "2g",    # Off-heap memory for GPU operations
     use_arrow: bool = True,
 ) -> SparkSession:
     """
     Create Spark session optimized for GPU workloads.
 
-    Memory allocation example for 16GB system with 10GB GPU:
-    - JVM heap (driver + executor): 6GB + 6GB = 12GB
-    - Off-heap (GPU operations): 4GB
-    - System/GPU: remaining ~4GB
+    Memory allocation for 32GB system (local mode = single JVM):
+    - JVM heap: 12GB (driver/executor share the same JVM)
+    - Off-heap: 2GB (GPU/native operations)
+    - Code cache: ~512MB
+    - Total Spark footprint: ~15GB
+    - Remaining for OS + browser + IDE: ~17GB
 
     Args:
         app_name: Spark application name
-        driver_memory: JVM heap for driver (reduce to leave GPU memory)
+        driver_memory: JVM heap for driver
         executor_memory: JVM heap per executor
         memory_overhead: Off-heap memory for GPU/native operations
         use_arrow: Enable Apache Arrow for fast Spark↔Pandas conversion
@@ -46,13 +62,15 @@ def create_gpu_optimized_spark_session(
 
         # GC tuning for concurrent workloads
         .config("spark.driver.extraJavaOptions",
-                "-XX:+UseG1GC "                    # Use G1GC (better for concurrent ops)
-                "-XX:InitiatingHeapOccupancyPercent=35 "  # Start GC earlier
-                "-XX:G1HeapRegionSize=16M "        # Larger regions for big allocations
-                "-XX:MaxGCPauseMillis=200 "        # Target max GC pause
-                "-XX:+ParallelRefProcEnabled "     # Parallel reference processing
-                "-XX:ParallelGCThreads=8 "         # Parallel GC threads
-                "-XX:ConcGCThreads=2")             # Concurrent GC threads
+                "-XX:+UseG1GC "
+                "-XX:InitiatingHeapOccupancyPercent=35 "
+                "-XX:G1HeapRegionSize=16M "
+                "-XX:MaxGCPauseMillis=200 "
+                "-XX:+ParallelRefProcEnabled "
+                "-XX:ParallelGCThreads=8 "
+                "-XX:ConcGCThreads=2 "
+                "-XX:ReservedCodeCacheSize=512m "
+                "-XX:NonProfiledCodeHeapSize=256m")
 
         .config("spark.executor.extraJavaOptions",
                 "-XX:+UseG1GC "
@@ -61,17 +79,29 @@ def create_gpu_optimized_spark_session(
                 "-XX:MaxGCPauseMillis=200 "
                 "-XX:+ParallelRefProcEnabled "
                 "-XX:ParallelGCThreads=8 "
-                "-XX:ConcGCThreads=2")
+                "-XX:ConcGCThreads=2 "
+                "-XX:ReservedCodeCacheSize=512m "
+                "-XX:NonProfiledCodeHeapSize=256m")
 
-        # Reduce partitions for local mode (less overhead)
-        .config("spark.sql.shuffle.partitions", "8")
-        .config("spark.default.parallelism", "8")
+        # Memory tuning: maximize in-memory processing
+        .config("spark.memory.fraction", "0.8")
+        .config("spark.memory.storageFraction", "0.5")
+        .config("spark.driver.maxResultSize", "4g")
 
-        # Disable UI if not needed (saves memory)
+        # Partitions for local mode
+        .config("spark.sql.shuffle.partitions", "16")
+        .config("spark.default.parallelism", "16")
+
+        # Adaptive query execution
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "64MB")
+
+        # Broadcast joins for small tables (huge speedup over sort-merge)
+        .config("spark.sql.autoBroadcastJoinThreshold", "256MB")
+
+        # Disable UI (saves memory)
         .config("spark.ui.enabled", "false")
-
-        # Locality wait (give time for data locality)
-        .config("spark.locality.wait", "3s")
     )
 
     # Apache Arrow for fast Spark↔Pandas conversion
@@ -80,7 +110,7 @@ def create_gpu_optimized_spark_session(
             builder
             .config("spark.sql.execution.arrow.pyspark.enabled", "true")
             .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true")
-            .config("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")  # Batch size
+            .config("spark.sql.execution.arrow.maxRecordsPerBatch", "50000")
         )
 
     spark = builder.getOrCreate()

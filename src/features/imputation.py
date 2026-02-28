@@ -21,6 +21,8 @@ def impute_missing_values(
     """
     Comprehensive missing value imputation for all feature columns.
 
+    Optimized to use minimal Spark jobs (1 aggregation pass instead of per-column scans).
+
     Args:
         df: Spark DataFrame with potential NULL values
         strategy: Imputation strategy
@@ -43,137 +45,128 @@ def impute_missing_values(
         print("=" * 80)
         print(f"Strategy: {strategy}")
 
-    # Count NULLs before imputation
-    null_counts_before = {}
-    total_nulls_before = 0
+    # Classify columns by type
+    exclude_set = set(exclude_cols)
+    numeric_cols = []
+    boolean_cols = []
 
     for col in df.columns:
-        if col not in exclude_cols:
-            null_count = df.filter(F.col(col).isNull()).count()
-            if null_count > 0:
-                null_counts_before[col] = null_count
-                total_nulls_before += null_count
+        if col in exclude_set:
+            continue
+        col_type = df.schema[col].dataType
+        if isinstance(col_type, BooleanType):
+            boolean_cols.append(col)
+        elif isinstance(col_type, (NumericType, IntegralType, DecimalType, DoubleType, FloatType)):
+            numeric_cols.append(col)
+
+    # --- SINGLE PASS: count NULLs for all columns at once ---
+    null_count_exprs = [
+        F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c)
+        for c in numeric_cols + boolean_cols
+    ]
+
+    if not null_count_exprs:
+        if verbose:
+            print("\n✓ No imputable columns found")
+            print("=" * 80)
+        return df
+
+    null_counts_row = df.agg(*null_count_exprs).first()
+    null_counts_before = {}
+    for c in numeric_cols + boolean_cols:
+        cnt = null_counts_row[c]
+        if cnt and cnt > 0:
+            null_counts_before[c] = cnt
+
+    total_nulls_before = sum(null_counts_before.values())
 
     if verbose and null_counts_before:
+        total_rows = df.count()
         print(f"\n📊 Found {len(null_counts_before)} columns with NULLs")
         print(f"   Total NULL values: {total_nulls_before:,}")
-
-        # Show top 10 columns with most NULLs
         sorted_nulls = sorted(null_counts_before.items(), key=lambda x: x[1], reverse=True)
         print(f"\n   Top columns with NULLs:")
         for col, count in sorted_nulls[:10]:
-            pct = count / df.count() * 100
+            pct = count / total_rows * 100
             print(f"      {col:<50} {count:>10,} ({pct:>5.1f}%)")
 
     if not null_counts_before:
         if verbose:
             print("\n✓ No NULL values found - no imputation needed!")
+            print("=" * 80)
         return df
 
-    # Impute based on strategy
-    imputed_cols = []
     imputation_log = {}
 
-    for col in df.columns:
-        if col in exclude_cols or col not in null_counts_before:
-            continue
+    # --- BOOLEAN COLUMNS: single pass to get modes ---
+    bool_cols_with_nulls = [c for c in boolean_cols if c in null_counts_before]
+    bool_fill = {}
+    if bool_cols_with_nulls:
+        # Count True values in one pass; mode = True if count_true > count_false
+        bool_aggs = []
+        for c in bool_cols_with_nulls:
+            bool_aggs.append(F.sum(F.when(F.col(c) == True, 1).otherwise(0)).alias(f"{c}__true"))
+            bool_aggs.append(F.sum(F.when(F.col(c).isNotNull(), 1).otherwise(0)).alias(f"{c}__nonnull"))
+        bool_row = df.agg(*bool_aggs).first()
 
-        # Get column data type
-        col_type = df.schema[col].dataType
+        for c in bool_cols_with_nulls:
+            true_count = bool_row[f"{c}__true"] or 0
+            nonnull_count = bool_row[f"{c}__nonnull"] or 0
+            if nonnull_count == 0:
+                bool_fill[c] = False
+                imputation_log[c] = "False (all NULL)"
+            else:
+                mode_val = true_count > (nonnull_count - true_count)
+                bool_fill[c] = mode_val
+                imputation_log[c] = f"mode={mode_val}"
 
-        # Determine imputation method based on type and strategy
-        if isinstance(col_type, BooleanType):
-            # Boolean: use mode (most common value)
-            try:
-                mode_row = df.groupBy(col).count() \
-                            .orderBy(F.desc("count")) \
-                            .first()
-                if mode_row is not None:
-                    mode_val = mode_row[0]
-                    if mode_val is not None:
-                        df = df.fillna({col: mode_val})
-                        imputed_cols.append(col)
-                        imputation_log[col] = f"mode={mode_val}"
-                    else:
-                        # All values are NULL, fill with False
-                        df = df.fillna({col: False})
-                        imputed_cols.append(col)
-                        imputation_log[col] = "False (all NULL)"
-                else:
-                    # All values are NULL, fill with False
-                    df = df.fillna({col: False})
-                    imputed_cols.append(col)
-                    imputation_log[col] = "False (all NULL)"
-            except Exception as e:
-                # Fallback: fill with False
-                df = df.fillna({col: False})
-                imputed_cols.append(col)
-                imputation_log[col] = f"False (error: {e})"
+        if bool_fill:
+            df = df.fillna(bool_fill)
 
-        elif isinstance(col_type, (NumericType, IntegralType, DecimalType, DoubleType, FloatType)):
-            # Numeric: use median, mean, or zero based on strategy
-            if strategy == "zero":
-                df = df.fillna({col: 0.0})
-                imputed_cols.append(col)
-                imputation_log[col] = "0.0"
-            elif strategy == "mean":
-                mean_val = df.agg(F.mean(col)).first()[0]
-                if mean_val is not None:
-                    df = df.fillna({col: float(mean_val)})
-                    imputed_cols.append(col)
-                    imputation_log[col] = f"mean={mean_val:.3f}"
+    # --- NUMERIC COLUMNS ---
+    num_cols_with_nulls = [c for c in numeric_cols if c in null_counts_before]
+    num_fill = {}
+
+    if num_cols_with_nulls:
+        if strategy == "zero":
+            for c in num_cols_with_nulls:
+                num_fill[c] = 0.0
+                imputation_log[c] = "0.0"
+        elif strategy == "mean":
+            # Single pass for all means
+            mean_exprs = [F.mean(c).alias(c) for c in num_cols_with_nulls]
+            mean_row = df.agg(*mean_exprs).first()
+            for c in num_cols_with_nulls:
+                val = mean_row[c]
+                if val is not None:
+                    num_fill[c] = float(val)
+                    imputation_log[c] = f"mean={val:.3f}"
                 else:
-                    # All values are NULL, fill with 0
-                    df = df.fillna({col: 0.0})
-                    imputed_cols.append(col)
-                    imputation_log[col] = "0.0 (all NULL)"
-            else:  # median or smart
-                quantiles = df.approxQuantile(col, [0.5], 0.01)
-                if quantiles and quantiles[0] is not None:
-                    median_val = quantiles[0]
-                    df = df.fillna({col: float(median_val)})
-                    imputed_cols.append(col)
-                    imputation_log[col] = f"median={median_val:.3f}"
-                else:
-                    # Try mean as fallback
-                    mean_val = df.agg(F.mean(col)).first()[0]
-                    if mean_val is not None:
-                        df = df.fillna({col: float(mean_val)})
-                        imputed_cols.append(col)
-                        imputation_log[col] = f"mean={mean_val:.3f} (median failed)"
-                    else:
-                        # All values are NULL, fill with 0
-                        df = df.fillna({col: 0.0})
-                        imputed_cols.append(col)
-                        imputation_log[col] = "0.0 (all NULL)"
+                    num_fill[c] = 0.0
+                    imputation_log[c] = "0.0 (all NULL)"
         else:
-            # String or other types: forward fill or leave as-is
-            # For demographic forecasting, we usually don't have string features
-            pass
+            # median or smart: single approxQuantile call for ALL columns at once
+            medians = df.approxQuantile(num_cols_with_nulls, [0.5], 0.01)
+            for i, c in enumerate(num_cols_with_nulls):
+                if medians[i] and medians[i][0] is not None:
+                    num_fill[c] = float(medians[i][0])
+                    imputation_log[c] = f"median={medians[i][0]:.3f}"
+                else:
+                    num_fill[c] = 0.0
+                    imputation_log[c] = "0.0 (all NULL)"
 
-    # Verify imputation worked
-    total_nulls_after = 0
-    remaining_nulls = {}
+        if num_fill:
+            df = df.fillna(num_fill)
 
-    for col in null_counts_before.keys():
-        null_count = df.filter(F.col(col).isNull()).count()
-        if null_count > 0:
-            remaining_nulls[col] = null_count
-            total_nulls_after += null_count
+    imputed_cols = list(bool_fill.keys()) + list(num_fill.keys())
 
     if verbose:
         print(f"\n✅ Imputation complete")
         print(f"   Columns imputed: {len(imputed_cols)}")
         print(f"   NULLs before: {total_nulls_before:,}")
-        print(f"   NULLs after:  {total_nulls_after:,}")
-        print(f"   Reduction: {total_nulls_before - total_nulls_after:,} ({(1 - total_nulls_after/total_nulls_before)*100:.1f}%)")
-
-        if remaining_nulls:
-            print(f"\n⚠️  WARNING: {len(remaining_nulls)} columns still have NULLs:")
-            sorted_remaining = sorted(remaining_nulls.items(), key=lambda x: x[1], reverse=True)
-            for col, count in sorted_remaining[:5]:
-                pct = count / df.count() * 100
-                print(f"      {col:<50} {count:>10,} ({pct:>5.1f}%)")
+        print(f"   Strategy: {strategy}")
+        for c in imputed_cols:
+            print(f"      {c:<50} → {imputation_log.get(c, '?')}")
 
     print("=" * 80)
 
@@ -190,13 +183,12 @@ def impute_with_group_medians(
     """
     Impute missing values using group-specific medians (e.g., per municipality).
 
-    This is more sophisticated than global imputation: it uses the median
-    within each group (e.g., municipality) rather than the overall median.
+    Optimized: computes all group medians in a single aggregation, then joins once.
 
     Args:
         df: Spark DataFrame
         group_col: Column to group by (e.g., 'refnis' for municipality)
-        feature_cols: Specific columns to impute (None = all numeric columns)
+        feature_cols: Specific columns to impute (None = all numeric columns with NULLs)
         exclude_cols: Columns to exclude from imputation
         verbose: Print progress
 
@@ -211,17 +203,24 @@ def impute_with_group_medians(
         print(f"IMPUTING WITH GROUP-SPECIFIC MEDIANS (by {group_col})")
         print("=" * 80)
 
-    # Auto-detect numeric columns if not specified
+    exclude_set = set(exclude_cols)
+
+    # Auto-detect numeric columns with NULLs in a single pass
     if feature_cols is None:
-        feature_cols = []
-        for col in df.columns:
-            if col not in exclude_cols:
-                col_type = df.schema[col].dataType
-                if isinstance(col_type, (NumericType, IntegralType, DecimalType, DoubleType, FloatType)):
-                    # Check if it has NULLs
-                    null_count = df.filter(F.col(col).isNull()).count()
-                    if null_count > 0:
-                        feature_cols.append(col)
+        candidate_cols = [
+            c for c in df.columns
+            if c not in exclude_set
+            and isinstance(df.schema[c].dataType, (NumericType, IntegralType, DecimalType, DoubleType, FloatType))
+        ]
+        if candidate_cols:
+            null_exprs = [
+                F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c)
+                for c in candidate_cols
+            ]
+            null_row = df.agg(*null_exprs).first()
+            feature_cols = [c for c in candidate_cols if (null_row[c] or 0) > 0]
+        else:
+            feature_cols = []
 
     if not feature_cols:
         if verbose:
@@ -231,48 +230,34 @@ def impute_with_group_medians(
     if verbose:
         print(f"Imputing {len(feature_cols)} columns using {group_col}-specific medians...")
 
-    # Compute group-specific medians for each feature
-    from pyspark.sql.window import Window
+    # Compute ALL group medians in a single aggregation
+    median_aggs = [
+        F.expr(f"percentile_approx(`{c}`, 0.5, 100) as `{c}_median`")
+        for c in feature_cols
+    ]
+    group_medians = df.groupBy(group_col).agg(*median_aggs)
 
-    for col in feature_cols:
-        # Window partitioned by group
-        w = Window.partitionBy(group_col)
+    # Single join
+    df = df.join(F.broadcast(group_medians), on=group_col, how='left')
 
-        # Compute median within each group (using approx percentile)
-        # Note: We use a DataFrame join approach since window functions don't support percentile_approx
-
-        # Approach: Compute group medians, then join back and fill
-        group_medians = df.groupBy(group_col).agg(
-            F.expr(f"percentile_approx({col}, 0.5, 100) as {col}_median")
-        )
-
-        # Join back
-        df = df.join(group_medians, on=group_col, how='left')
-
-        # Fill NULLs with group median
+    # Fill NULLs with group median, then drop temp columns
+    for c in feature_cols:
+        median_col = f"{c}_median"
         df = df.withColumn(
-            col,
-            F.when(F.col(col).isNull(), F.col(f"{col}_median")).otherwise(F.col(col))
+            c,
+            F.when(F.col(c).isNull(), F.col(median_col)).otherwise(F.col(c))
         )
+    # Drop all median columns at once
+    df = df.drop(*[f"{c}_median" for c in feature_cols])
 
-        # Drop temporary median column
-        df = df.drop(f"{col}_median")
-
-    # Fill any remaining NULLs with global median (for groups with all-NULL values)
+    # Fill any remaining NULLs with global median
     if verbose:
         print("Filling remaining NULLs with global medians...")
 
-    df = impute_missing_values(df, strategy="smart", exclude_cols=exclude_cols, verbose=False)
+    df = impute_missing_values(df, strategy="smart", exclude_cols=list(exclude_set), verbose=False)
 
     if verbose:
-        # Count remaining NULLs
-        total_nulls = 0
-        for col in feature_cols:
-            null_count = df.filter(F.col(col).isNull()).count()
-            total_nulls += null_count
-
         print(f"✅ Group-based imputation complete")
-        print(f"   Remaining NULLs: {total_nulls:,}")
         print("=" * 80)
 
     return df
@@ -292,17 +277,30 @@ def get_null_summary(df: DataFrame, exclude_cols: Optional[List[str]] = None) ->
     if exclude_cols is None:
         exclude_cols = ['sid', 'year', 'refnis']
 
-    total_rows = df.count()
-    null_summary = {}
+    exclude_set = set(exclude_cols)
+    target_cols = [c for c in df.columns if c not in exclude_set]
 
-    for col in df.columns:
-        if col not in exclude_cols:
-            null_count = df.filter(F.col(col).isNull()).count()
-            if null_count > 0:
-                null_summary[col] = {
-                    'count': null_count,
-                    'percent': null_count / total_rows * 100,
-                    'dtype': str(df.schema[col].dataType)
-                }
+    if not target_cols:
+        return {}
+
+    # Single pass for all null counts + total rows
+    agg_exprs = [
+        F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c)
+        for c in target_cols
+    ]
+    agg_exprs.append(F.count("*").alias("__total_rows__"))
+
+    result = df.agg(*agg_exprs).first()
+    total_rows = result["__total_rows__"]
+
+    null_summary = {}
+    for col in target_cols:
+        null_count = result[col] or 0
+        if null_count > 0:
+            null_summary[col] = {
+                'count': null_count,
+                'percent': null_count / total_rows * 100,
+                'dtype': str(df.schema[col].dataType)
+            }
 
     return null_summary

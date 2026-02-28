@@ -78,7 +78,7 @@ def create_hh_pos_features(df, window_spec=None):
         window_spec = globals().get('window_spec')
         if window_spec is None:
             # Create default window spec
-            window_spec = Window.partitionBy('sid').orderBy('year')
+            window_spec = Window.partitionBy('id').orderBy('year')
 
     df = df.withColumn('hh_pos_lag1', F.lag('hh_pos', 1).over(window_spec))
 
@@ -98,7 +98,7 @@ def create_income_features_spark(df, window_spec=None):
     if window_spec is None:
         window_spec = globals().get('window_spec')
         if window_spec is None:
-            window_spec = Window.partitionBy('sid').orderBy('year')
+            window_spec = Window.partitionBy('id').orderBy('year')
 
     # 1. Lagged income
     df = df.withColumn('income_lag1', F.lag('MS_ADI_PP', 1).over(window_spec))
@@ -292,7 +292,7 @@ def create_age_interactions_spark(df):
 
 def create_lags(df, event_cols):
 
-    id_col = "sid"
+    id_col = "id"
     t_col = "year"
 
 
@@ -497,7 +497,7 @@ def run_hyperparameter_tuning(parquet_path, total_rows, base_config=None, n_tria
         print(f"  ✓ Random sample: {len(df_pandas):,} rows")
 
     # Prepare data
-    drop_cols = ['sid', 'year', 'refnis', 'y_moved']
+    drop_cols = ['id', 'year', 'refnis', 'y_moved']
     leak_cols = get_leaky_columns(df_pandas.columns)
 
     feature_cols = [c for c in df_pandas.columns if c not in drop_cols and c not in leak_cols]
@@ -866,19 +866,44 @@ def main(
     # Optimized Spark configuration for large datasets with memory constraints
     spark = SparkSession.builder \
         .appName("DemographicForecasts") \
-        .config("spark.driver.memory", "10g") \
-        .config("spark.executor.memory", "10g") \
+        .config("spark.driver.memory", "12g") \
+        .config("spark.executor.memory", "12g") \
         .config("spark.driver.maxResultSize", "4g") \
-        .config("spark.sql.shuffle.partitions", "400") \
-        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
-        .config("spark.python.worker.memory", "4g") \
+        .config("spark.driver.memoryOverhead", "2g") \
+        .config("spark.executor.memoryOverhead", "2g") \
         .config("spark.memory.fraction", "0.8") \
-        .config("spark.memory.storageFraction", "0.2") \
+        .config("spark.memory.storageFraction", "0.5") \
+        .config("spark.sql.shuffle.partitions", "16") \
+        .config("spark.default.parallelism", "16") \
         .config("spark.sql.adaptive.enabled", "true") \
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+        .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "64MB") \
+        .config("spark.sql.autoBroadcastJoinThreshold", "256MB") \
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+        .config("spark.sql.execution.arrow.pyspark.fallback.enabled", "true") \
         .config("spark.sql.execution.arrow.maxRecordsPerBatch", "50000") \
-        .config("spark.executor.memoryOverhead", "2g") \
-        .config("spark.driver.memoryOverhead", "2g") \
+        .config("spark.python.worker.memory", "2g") \
+        .config("spark.driver.extraJavaOptions",
+                "-XX:+UseG1GC "
+                "-XX:InitiatingHeapOccupancyPercent=35 "
+                "-XX:G1HeapRegionSize=16M "
+                "-XX:MaxGCPauseMillis=200 "
+                "-XX:+ParallelRefProcEnabled "
+                "-XX:ParallelGCThreads=8 "
+                "-XX:ConcGCThreads=2 "
+                "-XX:ReservedCodeCacheSize=512m "
+                "-XX:NonProfiledCodeHeapSize=256m") \
+        .config("spark.executor.extraJavaOptions",
+                "-XX:+UseG1GC "
+                "-XX:InitiatingHeapOccupancyPercent=35 "
+                "-XX:G1HeapRegionSize=16M "
+                "-XX:MaxGCPauseMillis=200 "
+                "-XX:+ParallelRefProcEnabled "
+                "-XX:ParallelGCThreads=8 "
+                "-XX:ConcGCThreads=2 "
+                "-XX:ReservedCodeCacheSize=512m "
+                "-XX:NonProfiledCodeHeapSize=256m") \
+        .config("spark.ui.enabled", "false") \
         .getOrCreate()
 
     spark.sparkContext.setLogLevel("ERROR")
@@ -891,7 +916,7 @@ def main(
     print("✓ Spark session created with optimized settings")
     print(f"  Checkpoint dir: {checkpoint_dir}")
 
-    window_spec = Window.partitionBy('sid').orderBy('year')
+    window_spec = Window.partitionBy('id').orderBy('year')
 
     # ============================================================
     # STEP 2: READ DATA (NOW spark.read works!)
@@ -930,9 +955,9 @@ def main(
     event_cols.extend(['y_moved'])  # birth1_event, birth2_event, divorce_event, ...
 
     # Repartition by sid for better window operation performance
-    num_partitions = max(200, df.select("sid").distinct().count() // 1000)
-    print(f"Repartitioning by 'sid' into {num_partitions} partitions...")
-    df = df.repartition(num_partitions, "sid")
+    num_partitions = max(200, df.select("id").distinct().count() // 1000)
+    print(f"Repartitioning by 'id' into {num_partitions} partitions...")
+    df = df.repartition(num_partitions, "id")
 
     df2 = create_lags(df, event_cols)
     print("✓ Event history features created")
@@ -954,7 +979,7 @@ def main(
 
     df2 = create_all_socioeconomic_features(
         df2,  # This is your df AFTER creating event history features
-        id_col='sid',
+        id_col='id',
         time_col='year',
         include_hh_pos_features=True
     )
@@ -971,7 +996,7 @@ def main(
     df2 = impute_missing_values(
         df2,
         strategy="smart",  # median for numeric, mode for boolean
-        exclude_cols=['sid', 'year', 'refnis', 'y_moved'],  # Don't impute these
+        exclude_cols=['id', 'year', 'refnis', 'y_moved'],  # Don't impute these
         verbose=True
     )
     print("✓ Imputation complete")
@@ -1962,7 +1987,7 @@ def train_in_memory(
     with mlflow.start_run(run_name="in_memory_training"):
         try:
             # Drop non-feature columns
-            drop_cols = ['sid', 'year', 'refnis', 'y_moved']
+            drop_cols = ['id', 'year', 'refnis', 'y_moved']
             leak_cols = get_leaky_columns(df_pandas.columns)
             feature_cols = [c for c in df_pandas.columns if c not in drop_cols and c not in leak_cols]
 
@@ -2175,7 +2200,10 @@ def train_in_memory(
             print(f"    Precision: {prec_default:.4f} | Recall: {recall_default:.4f} | F1: {f1_default:.4f}")
             print(f"  Optimal threshold ({optimal_threshold:.3f}):")
             print(f"    Precision: {prec_optimal:.4f} | Recall: {recall_optimal:.4f} | F1: {f1_optimal:.4f}")
-            print(f"  F1 improvement: {(f1_optimal - f1_default) / f1_default * 100:+.1f}%")
+            if f1_default > 0:
+                print(f"  F1 improvement: {(f1_optimal - f1_default) / f1_default * 100:+.1f}%")
+            else:
+                print(f"  F1 improvement: N/A (default F1 = 0, optimal F1 = {f1_optimal:.4f})")
 
             # Log metrics to MLflow (using optimal threshold)
             mlflow.log_metric("auc_roc", auc)
@@ -2414,7 +2442,7 @@ def train_incremental(
         if len(sample_df) == 0:
             raise ValueError("No data found in parquet files!")
 
-        drop_cols = ['sid', 'year', 'refnis', 'y_moved']
+        drop_cols = ['id', 'year', 'refnis', 'y_moved']
         leak_cols = get_leaky_columns(sample_df.columns)
         feature_cols = [c for c in sample_df.columns if c not in drop_cols and c not in leak_cols]
 

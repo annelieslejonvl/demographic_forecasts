@@ -14,7 +14,7 @@ from typing import List, Optional
 
 def create_municipality_aggregates(
     df: DataFrame,
-    id_col: str = "sid",
+    id_col: str = "id",
     time_col: str = "year",
     muni_col: str = "refnis_lag1",  # CHANGED: Use ORIGIN municipality!
     lag_years: int = 1
@@ -174,7 +174,7 @@ def create_municipality_trends(
 
     # For trend calculation, we need a window over the past N years
     # IMPORTANT: Use lagged features to compute trends!
-    w_muni_id = Window.partitionBy(muni_col, 'sid').orderBy(time_col)
+    w_muni_id = Window.partitionBy(muni_col, 'id').orderBy(time_col)
 
     # Income trend: is median income rising or falling?
     df = df.withColumn('muni_income_trend_3yr',
@@ -198,7 +198,7 @@ def create_municipality_trends(
 
 def create_individual_vs_municipality_features(
     df: DataFrame,
-    id_col: str = "sid",
+    id_col: str = "id",
     time_col: str = "year",
     muni_col: str = "refnis_lag1",
     lag_years: int = 1
@@ -267,7 +267,7 @@ def create_individual_vs_municipality_features(
 
 def create_all_municipality_features(
     df: DataFrame,
-    id_col: str = "sid",
+    id_col: str = "id",
     time_col: str = "year",
     muni_col: str = "refnis_lag1",  # CHANGED: Use ORIGIN municipality!
     lag_years: int = 1,

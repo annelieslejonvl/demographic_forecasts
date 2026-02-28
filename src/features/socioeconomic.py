@@ -118,8 +118,9 @@ def create_income_features_spark(
         (F.col('MS_ADI_PP') - F.col('income_lag1')) / (F.col('income_lag1') + 1)
     )
 
-    # 3. Income normalized
-    median_income = df.approxQuantile('MS_ADI_PP', [0.5], 0.01)[0]
+    # 3. Income normalized + quintiles: single approxQuantile call for all thresholds
+    quantiles = df.approxQuantile('MS_ADI_PP', [0.2, 0.4, 0.5, 0.6, 0.8], 0.01)
+    median_income = quantiles[2]  # 0.5 quantile
     df = df.withColumn('income_norm', F.col('MS_ADI_PP') / median_income)
 
     # 4. Income shocks (cast to boolean!)
@@ -156,14 +157,13 @@ def create_income_features_spark(
         F.when(F.col('getalifeother_event_lag1'), F.col('income_norm')).otherwise(0)
     )
 
-    # 7. Income quintiles (int)
-    quantiles = df.approxQuantile('MS_ADI_PP', [0.2, 0.4, 0.6, 0.8], 0.01)
+    # 7. Income quintiles (int) — reuse quantiles from step 3
     df = df.withColumn(
         'income_quintile',
         F.when(F.col('MS_ADI_PP') < quantiles[0], 1)
          .when(F.col('MS_ADI_PP') < quantiles[1], 2)
-         .when(F.col('MS_ADI_PP') < quantiles[2], 3)
-         .when(F.col('MS_ADI_PP') < quantiles[3], 4)
+         .when(F.col('MS_ADI_PP') < quantiles[3], 3)
+         .when(F.col('MS_ADI_PP') < quantiles[4], 4)
          .otherwise(5)
     )
 
@@ -346,7 +346,7 @@ def create_age_interactions_spark(df: DataFrame) -> DataFrame:
 
 def create_all_socioeconomic_features(
     df: DataFrame,
-    id_col: str = "sid",
+    id_col: str = "id",
     time_col: str = "year",
     include_hh_pos_features: bool = True
 ) -> DataFrame:

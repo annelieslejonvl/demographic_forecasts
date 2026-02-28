@@ -256,43 +256,23 @@ def add_socioec_features_to_spark_df(
         print("  Assumption: Socio-economic structure changes slowly")
 
         # Simply join on refnis (no year matching needed)
-        df_before = df.count()
-        df = df.join(socioec_spark.drop('municipality_name'), on='refnis', how='left')
-        df_after = df.count()
+        # Use broadcast join since socioec table is tiny (290 rows)
+        df = df.join(F.broadcast(socioec_spark.drop('municipality_name')), on='refnis', how='left')
+        print(f"✓ Joined socioec data (broadcast join on {socioec_spark.count()} municipalities)")
 
-        print(f"✓ Joined socioec data")
-        print(f"  Rows before: {df_before:,}")
-        print(f"  Rows after:  {df_after:,}")
-
-        # Check match rate
-        non_null_count = df.filter(F.col('muni_avg_income_2020').isNotNull()).count()
-        match_rate = non_null_count / df_after * 100
-        print(f"  Match rate: {match_rate:.1f}% ({non_null_count:,} matched)")
-
-        if match_rate < 100:
-            print(f"\n⚠️  Some refnis codes not matched")
-            non_matched_df = df.filter(F.col('muni_avg_income_2020').isNull()).select('refnis').distinct()
-            non_matched_count = non_matched_df.count()
-            print(f"  {non_matched_count} unique refnis codes without socioeconomic data")
-            print(f"  These will be imputed with global median (see below)")
-
-        # Fill any remaining missing values with global median (fallback)
+        # Fill any remaining missing values with median computed from the small pandas table
+        # This avoids triggering expensive Spark actions on the large lazy DataFrame
         numeric_cols = [col for col in socioec_spark.columns if col not in ['refnis', 'municipality_name']]
 
-        print("\n📊 Final imputation for any remaining NULLs...")
-        imputed_cols = 0
+        print("📊 Filling unmatched refnis codes with pre-computed medians...")
+        fill_dict = {}
         for col in numeric_cols:
-            null_count = df.filter(F.col(col).isNull()).count()
-            if null_count > 0:
-                # Calculate median (excluding nulls)
-                quantiles = df.approxQuantile(col, [0.5], 0.01)
-                if quantiles and quantiles[0] is not None:
-                    median_val = quantiles[0]
-                    df = df.fillna({col: median_val})
-                    imputed_cols += 1
-
-        if imputed_cols > 0:
-            print(f"  ✓ Filled remaining NULLs in {imputed_cols} columns with global median")
+            median_val = socioec_pd[col].median() if col in socioec_pd.columns else None
+            if median_val is not None and pd.notna(median_val):
+                fill_dict[col] = float(median_val)
+        if fill_dict:
+            df = df.fillna(fill_dict)
+            print(f"  ✓ Prepared fill values for {len(fill_dict)} columns from source data")
 
         # Create derived features
         print("\n🔧 Creating derived features...")

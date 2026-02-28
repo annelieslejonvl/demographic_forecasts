@@ -25,7 +25,19 @@ import hashlib
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Always set JAVA_HOME to JDK 17 (required by Spark 4.x; JDK 25+ is incompatible)
+_jdk_path = Path.home() / "jdk-17.0.18+8"
+if _jdk_path.exists():
+    os.environ["JAVA_HOME"] = str(_jdk_path)
+
+# Hadoop winutils.exe required on Windows
+if not os.environ.get("HADOOP_HOME"):
+    _hadoop_path = Path.home() / "hadoop"
+    if _hadoop_path.exists():
+        os.environ["HADOOP_HOME"] = str(_hadoop_path)
 
 import mlflow
 import pandas as pd

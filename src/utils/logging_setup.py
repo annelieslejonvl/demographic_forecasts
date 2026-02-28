@@ -16,7 +16,7 @@ class TeeOutput:
     """Redirect stdout/stderr to both console and file."""
 
     def __init__(self, file_path, mode='w'):
-        self.file = open(file_path, mode)
+        self.file = open(file_path, mode, encoding='utf-8')
         self.terminal = sys.stdout if 'stdout' in str(file_path) else sys.stderr
 
     def write(self, message):
@@ -52,7 +52,7 @@ def setup_logging(log_file=None, log_dir='logs'):
     log_file_path = log_path / log_file
 
     print(f"=" * 80)
-    print(f"📝 Logging to: {log_file_path}")
+    print(f"Logging to: {log_file_path}")
     print(f"=" * 80)
 
     # Redirect stdout and stderr to both console and file
@@ -64,7 +64,7 @@ def setup_logging(log_file=None, log_dir='logs'):
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         handlers=[
-            logging.FileHandler(log_file_path, mode='a'),
+            logging.FileHandler(log_file_path, mode='a', encoding='utf-8'),
             logging.StreamHandler(sys.__stdout__)  # Original stdout
         ]
     )
