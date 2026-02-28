@@ -53,6 +53,10 @@ class FederatedServer:
         ssh_key: Optional[str] = None,
         local_mode: bool = False,
         data_path: Optional[str] = None,
+        sample_frac: Optional[float] = None,
+        server_pretrain_epochs: Optional[int] = None,
+        server_data_path: Optional[str] = None,
+        client_finetune_epochs: int = 0,
     ):
         """
         Args:
@@ -65,6 +69,10 @@ class FederatedServer:
             ssh_key: Optional path to SSH private key.
             local_mode: If True, run client in the same process (for testing).
             data_path: Path to parquet data (used in local_mode).
+            sample_frac: Sample fraction for testing (e.g., 0.01 = 1%).
+            server_pretrain_epochs: Pretrain on server synthetic data for N epochs.
+            server_data_path: Path to server's synthetic data for pretraining.
+            client_finetune_epochs: Number of epochs for client fine-tuning (0 = validation only).
         """
         self.config = config
         self.vocab_path = os.path.abspath(vocab_path)
@@ -75,6 +83,10 @@ class FederatedServer:
         self.ssh_key = ssh_key
         self.local_mode = local_mode
         self.data_path = data_path
+        self.sample_frac = sample_frac
+        self.server_pretrain_epochs = server_pretrain_epochs
+        self.server_data_path = server_data_path
+        self.client_finetune_epochs = client_finetune_epochs
 
         os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -169,12 +181,29 @@ class FederatedServer:
         self, cutoff_year: int, history_len: int, round_idx: int
     ) -> Dict[str, Any]:
         """Execute one federated round."""
-        # Get current state_dict (None for first round)
-        state_dict = None
-        if self.model_ is not None:
-            state_dict = {
-                k: v.cpu() for k, v in self.model_.state_dict().items()
-            }
+        # PHASE 1: Server-side pretraining (if enabled)
+        if self.server_pretrain_epochs is not None and self.server_pretrain_epochs > 0:
+            if self.server_data_path is None:
+                raise ValueError("server_data_path is required when server_pretrain_epochs > 0")
+
+            logger.info(
+                "Server pretraining: %d epochs on synthetic data (cutoff=%d)",
+                self.server_pretrain_epochs, cutoff_year
+            )
+            print(f"\n  [SERVER] Pretraining for {self.server_pretrain_epochs} epochs on synthetic data...")
+
+            state_dict = self._server_pretrain(
+                cutoff_year=cutoff_year,
+                history_len=history_len,
+                n_epochs=self.server_pretrain_epochs
+            )
+        else:
+            # Get current state_dict (None for first round)
+            state_dict = None
+            if self.model_ is not None:
+                state_dict = {
+                    k: v.cpu() for k, v in self.model_.state_dict().items()
+                }
 
         # Create package directory
         round_dir = os.path.join(
@@ -252,6 +281,97 @@ class FederatedServer:
         self.model_.load_state_dict(state_dict)
         logger.info("Initialized global model from client weights")
 
+    def _server_pretrain(
+        self, cutoff_year: int, history_len: int, n_epochs: int
+    ) -> Dict[str, torch.Tensor]:
+        """Pretrain model on server's synthetic data.
+
+        Args:
+            cutoff_year: Training cutoff year
+            history_len: Years of history per window
+            n_epochs: Number of epochs to train
+
+        Returns:
+            state_dict: Trained model weights
+        """
+        from ..sequence.dataset import SequenceDataset
+        from ..sequence.estimator import PyTorchSequenceEstimator
+        from ..sequence.vocabulary import LifeEventVocabulary
+        import pandas as pd
+        import pyarrow.parquet as pq
+
+        logger.info("Loading server synthetic data from %s", self.server_data_path)
+
+        # Load server's synthetic data
+        dataset = pq.ParquetDataset(self.server_data_path)
+        df = dataset.read().to_pandas()
+        logger.info(f"Server data: {len(df):,} rows")
+
+        # Filter to cutoff window
+        min_hist_year = cutoff_year - history_len
+        model_params = self.config.get("model", {}).get("params", {})
+        events = self.config.get("events", [])
+        horizons = self.config.get("horizons", [1, 3, 5])
+        max_horizon = max(horizons)
+
+        df = df[(df['year'] > min_hist_year) & (df['year'] <= cutoff_year + max_horizon)]
+        logger.info(f"Filtered to window: {len(df):,} rows")
+
+        # Identify valid persons (have both history and future)
+        id_col = 'sid' if 'sid' in df.columns else 'id'
+        persons_hist = set(df[df['year'] <= cutoff_year][id_col].unique())
+        persons_future = set(df[df['year'] > cutoff_year][id_col].unique())
+        valid_persons = persons_hist & persons_future
+        logger.info(f"Valid persons for training: {len(valid_persons):,}")
+
+        df_train = df[df[id_col].isin(valid_persons) & (df['year'] <= cutoff_year)].copy()
+        logger.info(f"Training data: {len(df_train):,} rows")
+
+        # Build dataset
+        vocab = LifeEventVocabulary.load(self.vocab_path)
+        max_seq_len = model_params.get("max_seq_len", 64)
+        use_numeric = bool(model_params.get("use_numeric_features", False))
+
+        train_dataset = SequenceDataset(
+            df=df_train,
+            vocabulary=vocab,
+            events=events,
+            horizons=horizons,
+            max_seq_len=max_seq_len,
+            use_numeric_features=use_numeric,
+            id_col=id_col,
+        )
+        logger.info(f"Server training dataset: {len(train_dataset):,} sequences")
+
+        # Override epochs in config for server pretraining
+        server_config = self.config.copy()
+        server_config['model']['params']['epochs'] = n_epochs
+
+        # Train
+        estimator = PyTorchSequenceEstimator(
+            model_config=server_config.get('model', {}),
+            device_config=server_config.get('device', {}),
+        )
+
+        result = estimator.fit(
+            train_dataset=train_dataset,
+            eval_dataset=None,  # No validation during server pretraining
+            vocabulary=vocab,
+        )
+
+        logger.info(
+            "Server pretraining complete: %d epochs, final loss: %.4f",
+            n_epochs,
+            result.metrics.get('train_loss', 0.0)
+        )
+        print(f"  [SERVER] Pretraining complete: {n_epochs} epochs, loss={result.metrics.get('train_loss', 0.0):.4f}")
+
+        # Store model for future rounds
+        self.model_ = estimator.model_
+
+        # Return weights to send to client
+        return {k: v.cpu() for k, v in estimator.model_.state_dict().items()}
+
     # ------------------------------------------------------------------
     # Local mode
     # ------------------------------------------------------------------
@@ -267,6 +387,8 @@ class FederatedServer:
             data_path=self.data_path,
             incoming_dir=package_dir,
             outgoing_dir=result_dir,
+            sample_frac=self.sample_frac,
+            finetune_epochs=self.client_finetune_epochs,
         )
         client.train_round()
 
@@ -297,6 +419,10 @@ class FederatedServer:
             f"--incoming {_quote_remote(remote_incoming)} "
             f"--outgoing {_quote_remote(remote_outgoing)}"
         )
+        if self.sample_frac is not None:
+            client_cmd += f" --sample-frac {self.sample_frac}"
+        if self.client_finetune_epochs > 0:
+            client_cmd += f" --finetune-epochs {self.client_finetune_epochs}"
         self._ssh_run(client_cmd)
 
         # 4. Download result

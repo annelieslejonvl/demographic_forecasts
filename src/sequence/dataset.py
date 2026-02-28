@@ -308,11 +308,22 @@ class SequenceDataset(Dataset):
             )
         return sample
 
-    def get_pos_weights(self) -> torch.Tensor:
-        """Compute positive class weight for each output label (for BCEWithLogitsLoss)."""
-        all_targets = np.stack(self._targets)  # (n_persons, n_outputs)
-        n_pos = all_targets.sum(axis=0).clip(min=1.0)
-        n_neg = (len(all_targets) - n_pos).clip(min=1.0)
+    def get_pos_weights(self, max_samples: Optional[int] = None) -> torch.Tensor:
+        """Compute positive class weight for each output label (for BCEWithLogitsLoss).
+
+        Args:
+            max_samples: If provided, sample at most this many samples for weight computation.
+        """
+        if max_samples is not None and max_samples < len(self._targets):
+            # Sample subset for efficiency
+            import random
+            indices = random.sample(range(len(self._targets)), max_samples)
+            targets = np.stack([self._targets[i] for i in indices])
+        else:
+            targets = np.stack(self._targets)  # (n_persons, n_outputs)
+
+        n_pos = targets.sum(axis=0).clip(min=1.0)
+        n_neg = (len(targets) - n_pos).clip(min=1.0)
         pos_weight = n_neg / n_pos
         return torch.from_numpy(pos_weight.astype(np.float32))
 

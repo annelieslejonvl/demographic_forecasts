@@ -87,6 +87,29 @@ def main():
         "--data-path",
         help="Path to parquet data (required for --local-mode)",
     )
+    parser.add_argument(
+        "--sample-frac",
+        type=float,
+        default=None,
+        help="Sample fraction of data for testing (e.g., 0.01 = 1%%)",
+    )
+    parser.add_argument(
+        "--server-pretrain-epochs",
+        type=int,
+        default=None,
+        help="Pretrain on server synthetic data for N epochs before client validation",
+    )
+    parser.add_argument(
+        "--server-data-path",
+        default=None,
+        help="Path to server's synthetic data for pretraining",
+    )
+    parser.add_argument(
+        "--client-finetune-epochs",
+        type=int,
+        default=0,
+        help="Number of epochs for client fine-tuning (0 = validation only)",
+    )
 
     args = parser.parse_args()
 
@@ -131,6 +154,10 @@ def main():
         ssh_key=args.ssh_key,
         local_mode=args.local_mode,
         data_path=args.data_path,
+        sample_frac=args.sample_frac,
+        server_pretrain_epochs=args.server_pretrain_epochs,
+        server_data_path=args.server_data_path,
+        client_finetune_epochs=args.client_finetune_epochs,
     )
 
     server.run(
