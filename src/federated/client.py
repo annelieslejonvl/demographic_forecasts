@@ -194,9 +194,14 @@ class FederatedClient:
         import pandas as pd
 
         # Limit PyTorch threads on CPU to avoid over-subscribing the i5
+        # Only set once (PyTorch doesn't allow changing after parallel work starts)
         n_cores = os.cpu_count() or 4
-        torch.set_num_threads(max(1, n_cores - 1))
-        torch.set_num_interop_threads(1)
+        try:
+            torch.set_num_threads(max(1, n_cores - 1))
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # Already set in previous round, ignore
+            pass
         logger.info(
             "PyTorch threads: %d (system cores: %d)",
             torch.get_num_threads(),
