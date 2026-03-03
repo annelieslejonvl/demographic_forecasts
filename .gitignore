@@ -31,3 +31,6 @@ demographic_forecasts.egg-info/*
 demographic_forecasts.egg-info/*.txt
 demographic_forecasts.egg-info/*.egg-info
 demographic_forecasts.egg-info/requires.txt
+sequence_cache/*
+sequence_cache_temp
+NUL
