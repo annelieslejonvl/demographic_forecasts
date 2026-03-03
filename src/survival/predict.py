@@ -96,6 +96,54 @@ def predict_survival_aft(
     return predictions
 
 
+def predict_survival_aft_dmatrix(
+    model, dmatrix, horizons=(1, 3, 5), distribution='normal', sigma=1.0,
+):
+    """Like predict_survival_aft but accepts a pre-built xgb.DMatrix."""
+    predicted_log_time = model.predict(dmatrix)
+    predicted_median_time = np.exp(predicted_log_time)
+    risk_score = -predicted_log_time
+    dist = _get_aft_distribution(distribution)
+    predictions = {
+        'predicted_log_time': predicted_log_time,
+        'predicted_median_time': predicted_median_time,
+        'risk_score': risk_score,
+    }
+    for h in horizons:
+        log_h = np.log(h) if h > 0 else -np.inf
+        prob = dist.cdf(log_h, loc=predicted_log_time, scale=sigma)
+        prob = np.clip(prob, 0.0, 1.0)
+        predictions[f'prob_{h}yr'] = prob
+    return predictions
+
+
+def predict_survival_cox_dmatrix(
+    model, dmatrix, baseline_hazard, horizons=(1, 3, 5),
+):
+    """Like predict_survival_cox but accepts a pre-built xgb.DMatrix."""
+    predicted_log_hr = model.predict(dmatrix)
+    risk_score = predicted_log_hr
+    predictions = {
+        'predicted_log_hr': predicted_log_hr,
+        'risk_score': risk_score,
+    }
+    for h in horizons:
+        if isinstance(baseline_hazard, dict):
+            available_times = sorted(baseline_hazard.keys())
+            nearest_t = min(available_times, key=lambda t: abs(t - h))
+            H0_t = baseline_hazard[nearest_t]
+        elif isinstance(baseline_hazard, pd.Series):
+            nearest_idx = (baseline_hazard.index - h).abs().argmin()
+            H0_t = baseline_hazard.iloc[nearest_idx]
+        else:
+            H0_t = float(baseline_hazard)
+        survival = np.exp(-H0_t * np.exp(predicted_log_hr))
+        prob = 1.0 - survival
+        prob = np.clip(prob, 0.0, 1.0)
+        predictions[f'prob_{h}yr'] = prob
+    return predictions
+
+
 def predict_survival_cox(
     model,
     X,

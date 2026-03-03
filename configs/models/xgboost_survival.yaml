@@ -60,6 +60,19 @@ events:
   - divorce_event
   - getalifeother_event
 
+# Rolling window configuration (used with --rolling flag)
+# Cutoff years are auto-detected from data if not specified here or via CLI
+rolling:
+  history_len: 5        # History length for cutoff range computation
+  # cutoffs: [2015, 2016, 2017, 2018, 2019, 2020]  # Optional explicit cutoffs
+
+# Checkpoint configuration
+checkpoint:
+  enabled: true
+  directory: checkpoints/survival  # Base directory (subdir per event created automatically)
+  period: 50                       # Save every N boosting rounds
+  max_to_keep: 3                   # Keep only the latest N checkpoints per event
+
 # Evaluation configuration
 evaluation:
   sample_fraction: 0.1

@@ -55,11 +55,13 @@ from src.survival.data_prep import (
     create_cox_labels,
     get_horizon_labels,
     create_survival_labels_chunked,
+    create_rolling_survival_dataset,
 )
 from src.survival.models import (
     train_survival_model,
     train_all_events,
     train_incremental_survival,
+    CheckpointCallback,
 )
 from src.survival.evaluation import (
     evaluate_survival_model,
@@ -99,6 +101,14 @@ def main_survival(
     tune=False,
     n_trials=50,
     target_batch_rows=None,
+    rolling=False,
+    history_len=5,
+    rolling_cutoffs=None,
+    rolling_train_cutoffs=None,
+    rolling_val_cutoff=None,
+    rolling_test_cutoff=None,
+    checkpoint_dir=None,
+    checkpoint_period=50,
 ):
     """
     Main survival analysis pipeline.
@@ -113,6 +123,12 @@ def main_survival(
         tune: Run hyperparameter tuning
         n_trials: Number of tuning trials
         target_batch_rows: Target rows per incremental batch
+        rolling: Use rolling window validation
+        history_len: History length in years for rolling cutoff range
+        rolling_cutoffs: Explicit list of cutoff years
+        rolling_train_cutoffs: Explicit list of training cutoff years
+        rolling_val_cutoff: Validation cutoff year
+        rolling_test_cutoff: Test cutoff year
     """
     from datetime import datetime
     # Setup logging
@@ -143,6 +159,13 @@ def main_survival(
         events = config.get('events', events)
         horizons = config.get('horizons', horizons)
 
+        # Read checkpoint config from YAML (CLI args take priority)
+        ckpt_cfg = config.get('checkpoint', {})
+        if checkpoint_dir is None and ckpt_cfg.get('enabled', False):
+            checkpoint_dir = ckpt_cfg.get('directory', 'checkpoints/survival')
+        if checkpoint_period == 50 and 'period' in ckpt_cfg:
+            checkpoint_period = ckpt_cfg['period']
+
     print("=" * 60)
     print("SURVIVAL ANALYSIS PIPELINE")
     print("=" * 60)
@@ -169,6 +192,28 @@ def main_survival(
         print("\nAlternatively, if you have processed features at a different path,")
         print("ensure there is a _SUCCESS marker file in the directory.")
         sys.exit(1)
+
+    # Rolling window mode: dispatch to dedicated pipeline
+    if rolling:
+        print(f"\n  Mode: ROLLING WINDOW")
+        return _run_rolling_survival_pipeline(
+            output_path=output_path,
+            events=events,
+            horizons=horizons,
+            config=config,
+            model_type=model_type,
+            distribution=distribution,
+            sigma=sigma,
+            feature_config_path=feature_config_path,
+            max_rows=max_rows,
+            rolling_cutoffs=rolling_cutoffs,
+            train_cutoffs=rolling_train_cutoffs,
+            val_cutoff=rolling_val_cutoff,
+            test_cutoff=rolling_test_cutoff,
+            history_len=history_len,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_period=checkpoint_period,
+        )
 
     log_stage_start("Loading Processed Features")
     print(f"\nLoading processed features from {output_path}...")
@@ -385,6 +430,8 @@ def main_survival(
         models = train_all_events(
             train_df, test_df, feature_cols, events,
             config=config, model_type=model_type,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_period=checkpoint_period,
         )
 
         log_stage_complete("Model Training")
@@ -477,12 +524,10 @@ def main_survival(
             # Log to MLflow
             mlflow.log_metric(f"{event}_c_index", metrics['c_index'])
             for h in horizons:
-                auc_key = f'auc_{h}yr'
-                brier_key = f'brier_{h}yr'
-                if auc_key in metrics and not np.isnan(metrics[auc_key]):
-                    mlflow.log_metric(f"{event}_{auc_key}", metrics[auc_key])
-                if brier_key in metrics and not np.isnan(metrics[brier_key]):
-                    mlflow.log_metric(f"{event}_{brier_key}", metrics[brier_key])
+                for key_pattern in ['auc_{h}yr', 'brier_{h}yr', 'f1_{h}yr', 'ap_{h}yr', 'auc_pr_{h}yr']:
+                    key = key_pattern.format(h=h)
+                    if key in metrics and not np.isnan(metrics[key]):
+                        mlflow.log_metric(f"{event}_{key}", metrics[key])
 
         # Shared AFT metrics (CRPS, IBS, TD-AUC) — comparable with GRU sequence
         if model_type == 'aft':
@@ -831,6 +876,49 @@ def main_survival(
                             mlflow.log_metric(f"{event}_group_rmse_unweighted_{h}yr", rmse_u)
                             mlflow.log_metric(f"{event}_group_mae_weighted_{h}yr", mae_w)
 
+        # Rate-based group evaluation (observed vs predicted rates, weighted RMSE/MAE)
+        try:
+            from src.sequence.evaluation import evaluate_groups
+            rate_group_cols = [c for c in ['gender', 'age_group', 'refnis'] if c in test_df.columns]
+            if rate_group_cols:
+                print(f"\n  Computing rate-based group evaluation by {rate_group_cols}...")
+                n_ev = len(events)
+                n_h = len(horizons)
+                y_true = np.zeros((len(test_df), n_ev * n_h), dtype=np.float32)
+                for ei, event in enumerate(events):
+                    dur_col = f"{event}_duration"
+                    evt_col = f"{event}_event_observed"
+                    if dur_col in test_df.columns and evt_col in test_df.columns:
+                        dur = test_df[dur_col].values
+                        evt = test_df[evt_col].values
+                        for hi, h in enumerate(horizons):
+                            y_true[:, ei * n_h + hi] = ((evt == 1) & (dur <= h)).astype(np.float32)
+
+                rate_group_df = test_df[rate_group_cols].copy()
+                rate_group_results = evaluate_groups(
+                    group_df=rate_group_df,
+                    all_predictions=all_predictions,
+                    y_true=y_true,
+                    events=events,
+                    horizons=horizons,
+                    group_cols=rate_group_cols,
+                    min_group_size=100,
+                )
+                for event, eres in rate_group_results.items():
+                    summary = eres.get('summary', {})
+                    if not summary:
+                        continue
+                    for h in horizons:
+                        rmse_w = summary.get(f'rmse_weighted_{h}yr')
+                        mae_w = summary.get(f'mae_weighted_{h}yr')
+                        if rmse_w is not None:
+                            print(f"    {event} @{h}yr: RMSE_w={rmse_w:.4f}  MAE_w={mae_w:.4f}")
+                del rate_group_df, y_true
+                gc.collect()
+        except Exception as e:
+            print(f"  Rate-based group evaluation failed: {e}")
+            import traceback; traceback.print_exc()
+
         log_stage_complete("Model Evaluation")
         log_memory_usage()
 
@@ -952,6 +1040,1150 @@ def main_survival(
     print("=" * 60)
 
     return models, all_metrics, pred_df
+
+
+def _scan_year_range(parquet_path, chunk_size=500_000):
+    """Scan parquet to find min and max year in the dataset."""
+    dataset = pq.ParquetDataset(parquet_path)
+    min_year = float('inf')
+    max_year = float('-inf')
+    for fragment in dataset.fragments:
+        for batch in fragment.to_batches(batch_size=chunk_size, columns=['year']):
+            years = batch.to_pandas()['year']
+            min_year = min(min_year, int(years.min()))
+            max_year = max(max_year, int(years.max()))
+    return min_year, max_year
+
+
+def _stream_features_to_npy(parquet_path, year, feature_cols, npy_path, n_rows,
+                            row_indices=None):
+    """
+    Stream feature columns from parquet to a memory-mapped .npy file.
+
+    Reads ~30 columns at a time to avoid loading the full 7M×300 DataFrame.
+    Applies the same dtype fixes as fix_dtypes (categorical→int, bool→int, all→float32).
+
+    Args:
+        row_indices: Optional sorted array of row indices to select (for subsampling).
+                     If None, all rows are written.
+    """
+    COLS_PER_BATCH = 30
+    categorical_cols = {'eerste_nationaliteit', 'hh_pos', 'gender', 'age_group', 'income_quintile'}
+
+    mmap_arr = np.lib.format.open_memmap(
+        npy_path, mode='w+', dtype=np.float32, shape=(n_rows, len(feature_cols))
+    )
+
+    for batch_start in range(0, len(feature_cols), COLS_PER_BATCH):
+        batch_cols = feature_cols[batch_start:batch_start + COLS_PER_BATCH]
+        batch_df = pd.read_parquet(
+            parquet_path,
+            columns=batch_cols,
+            filters=[('year', '==', year)],
+        )
+        for j, col in enumerate(batch_cols):
+            vals = batch_df[col]
+            if col in categorical_cols:
+                vals = vals.astype('category').cat.codes.astype(np.float32)
+            elif vals.dtype == 'object' or vals.dtype == 'bool':
+                vals = vals.astype('float32')
+            else:
+                vals = pd.to_numeric(vals, errors='coerce').astype(np.float32)
+            arr = vals.values
+            if row_indices is not None:
+                arr = arr[row_indices]
+            mask = np.isnan(arr)
+            if mask.any():
+                arr = arr.copy()
+                arr[mask] = np.nanmedian(arr)
+            mmap_arr[:, batch_start + j] = arr
+        del batch_df
+        gc.collect()
+
+    mmap_arr.flush()
+    del mmap_arr
+    gc.collect()
+
+
+def _run_rolling_survival_pipeline(
+    output_path,
+    events,
+    horizons,
+    config,
+    model_type,
+    distribution,
+    sigma,
+    feature_config_path,
+    max_rows,
+    rolling_cutoffs=None,
+    train_cutoffs=None,
+    val_cutoff=None,
+    test_cutoff=None,
+    history_len=5,
+    checkpoint_dir=None,
+    checkpoint_period=50,
+):
+    """
+    Rolling window evaluation pipeline for XGBoost survival models.
+
+    Creates multiple temporal windows using different cutoff years.
+    For each cutoff: features come from the cutoff year, survival labels
+    from the future window (cutoff, cutoff + max_horizon].
+
+    Follows the same structure as the GRU rolling pipeline in
+    run_with_municipality_sequence.py::_run_rolling_window_pipeline().
+    """
+    from src.survival.data_prep import create_rolling_survival_dataset
+
+    max_horizon = max(horizons)
+
+    # ================================================================
+    # Step 1: Determine cutoff years
+    # ================================================================
+    log_stage_start("Determining Cutoff Years")
+
+    if rolling_cutoffs is None:
+        print("  Auto-detecting year range from data...")
+        min_year, max_year = _scan_year_range(output_path)
+        print(f"  Data year range: {min_year}-{max_year}")
+        first_cutoff = min_year + history_len
+        last_cutoff = max_year - max_horizon
+        rolling_cutoffs = list(range(first_cutoff, last_cutoff + 1))
+
+    if train_cutoffs is None:
+        train_cutoffs = rolling_cutoffs[:-2]
+    if val_cutoff is None:
+        val_cutoff = rolling_cutoffs[-2]
+    if test_cutoff is None:
+        test_cutoff = rolling_cutoffs[-1]
+
+    print(f"\n  Rolling window configuration:")
+    print(f"    History length: {history_len} years")
+    print(f"    Max horizon: {max_horizon} years")
+    print(f"    All cutoffs: {rolling_cutoffs}")
+    print(f"    Train cutoffs: {train_cutoffs}")
+    print(f"    Val cutoff: {val_cutoff}")
+    print(f"    Test cutoff: {test_cutoff}")
+
+    for cutoff in rolling_cutoffs:
+        max_f = cutoff + max_horizon
+        role = "TRAIN" if cutoff in train_cutoffs else ("VAL" if cutoff == val_cutoff else "TEST")
+        print(f"    W cutoff={cutoff} [{role}]: features year={cutoff} -> targets ({cutoff}, {max_f}]")
+
+    log_stage_complete("Determining Cutoff Years")
+
+    # ================================================================
+    # Step 2: Determine feature columns from a sample year
+    # ================================================================
+    log_stage_start("Feature Preparation")
+
+    sample_df = pd.read_parquet(
+        output_path,
+        filters=[('year', '==', rolling_cutoffs[0])],
+    )
+    if len(sample_df) == 0:
+        sample_df = pd.read_parquet(output_path).head(1000)
+
+    drop_cols = ['sid', 'year', 'refnis', 'y_moved', 'cutoff_year']
+    survival_label_cols = []
+    for event in events:
+        survival_label_cols.extend([
+            f"{event}_duration", f"{event}_event_observed"
+        ])
+    leak_cols = get_leaky_columns(sample_df.columns)
+
+    feature_cols = [
+        c for c in sample_df.columns
+        if c not in drop_cols
+        and c not in leak_cols
+        and c not in survival_label_cols
+        and c not in events
+    ]
+    del sample_df
+    gc.collect()
+
+    if feature_config_path is not None:
+        feature_cols = filter_features_by_config(
+            feature_cols,
+            feature_config_path=feature_config_path,
+            verbose=True,
+        )
+
+    print(f"  Filtered out {len(leak_cols)} leaky columns")
+    print(f"  Final feature count: {len(feature_cols)}")
+
+    log_stage_complete("Feature Preparation")
+
+    # ================================================================
+    # Step 3: Stream all cutoff features to .npy + cache survival labels
+    # ================================================================
+    # A full 7M×300 DataFrame is ~8GB; never hold it in memory.
+    # Strategy: for each cutoff, compute labels (lightweight), then
+    # stream features column-by-column to a .npy file on disk.
+    # These .npy files are reused for training, test prediction, AND
+    # per-window stability analysis — never re-streamed.
+    log_stage_start("Preparing All Cutoff Data")
+
+    import xgboost as xgb
+    import tempfile
+    from src.survival.predict import predict_survival_aft_dmatrix, predict_survival_cox_dmatrix
+
+    # Shared cache: cutoff_year → (npy_path, n_rows)
+    npy_cache = {}
+    # Survival labels per cutoff: cutoff_year → {event: {duration, event}}
+    all_labels = {}
+
+    for cutoff in rolling_cutoffs:
+        print(f"  Cutoff {cutoff}: ", end="", flush=True)
+        cutoff_df = create_rolling_survival_dataset(
+            parquet_path=output_path,
+            cutoff_year=cutoff,
+            event_cols=events,
+            max_horizon=max_horizon,
+            labels_only=True,
+        )
+        n_rows = len(cutoff_df)
+        if n_rows == 0:
+            print("skipped (empty)")
+            continue
+
+        # Extract survival labels (tiny)
+        all_labels[cutoff] = {}
+        for event in events:
+            all_labels[cutoff][event] = {
+                'duration': cutoff_df[f"{event}_duration"].values.copy(),
+                'event': cutoff_df[f"{event}_event_observed"].values.copy(),
+            }
+        del cutoff_df
+        gc.collect()
+
+        # Stream features to .npy
+        npy_path = os.path.join(
+            tempfile.gettempdir(), f"features_{cutoff}_{os.getpid()}.npy"
+        )
+        _stream_features_to_npy(output_path, cutoff, feature_cols, npy_path, n_rows)
+        npy_cache[cutoff] = (npy_path, n_rows)
+        print(f"{n_rows:,} persons, features on disk")
+
+    n_val_rows = npy_cache[val_cutoff][1] if val_cutoff in npy_cache else 0
+    n_test_rows = npy_cache[test_cutoff][1] if test_cutoff in npy_cache else 0
+    if n_val_rows == 0 or n_test_rows == 0:
+        print("  ERROR: Val or test cutoff has no data!")
+        sys.exit(1)
+
+    # Build subsampled val labels for early stopping (full labels stay in all_labels)
+    VAL_SAMPLE_SIZE = 500_000
+    if n_val_rows > VAL_SAMPLE_SIZE:
+        rng = np.random.RandomState(42)
+        val_sample_idx = np.sort(rng.choice(n_val_rows, VAL_SAMPLE_SIZE, replace=False))
+        print(f"  Subsampling val: {n_val_rows:,} → {VAL_SAMPLE_SIZE:,} for early stopping DMatrix")
+        val_es_labels = {}
+        for event in events:
+            val_es_labels[event] = {
+                'duration': all_labels[val_cutoff][event]['duration'][val_sample_idx],
+                'event': all_labels[val_cutoff][event]['event'][val_sample_idx],
+            }
+        n_val_dmatrix_rows = VAL_SAMPLE_SIZE
+    else:
+        val_sample_idx = None
+        val_es_labels = all_labels[val_cutoff]
+        n_val_dmatrix_rows = n_val_rows
+
+    # Stream subsampled val features for early stopping DMatrix
+    val_es_npy_path = os.path.join(
+        tempfile.gettempdir(), f"val_es_{val_cutoff}_{os.getpid()}.npy"
+    )
+    _stream_features_to_npy(
+        output_path, val_cutoff, feature_cols, val_es_npy_path,
+        n_val_dmatrix_rows, row_indices=val_sample_idx,
+    )
+    print(f"  Val early-stopping features ({n_val_dmatrix_rows:,} rows) on disk")
+
+    # Organize train labels for incremental training
+    train_labels = {event: {'dur': [], 'evt': []} for event in events}
+    n_train_rows = 0
+    n_train_windows = 0
+    for cutoff in train_cutoffs:
+        if cutoff not in npy_cache:
+            continue
+        for event in events:
+            train_labels[event]['dur'].append(all_labels[cutoff][event]['duration'])
+            train_labels[event]['evt'].append(all_labels[cutoff][event]['event'])
+        n_train_rows += npy_cache[cutoff][1]
+        n_train_windows += 1
+
+    log_stage_complete("Preparing All Cutoff Data")
+    log_memory_usage()
+
+    # ================================================================
+    # Step 4: Train incrementally per cutoff (memory-efficient)
+    # ================================================================
+    log_stage_start("Incremental Model Training")
+
+    mlflow.set_tracking_uri("http://127.0.0.1:5000")
+    mlflow.set_experiment("demographic_forecasts_survival")
+
+    if config is not None:
+        params = config.get('model', {}).get('params', {}).copy()
+        model_type = config.get('model', {}).get('type', model_type)
+        n_estimators = params.pop('n_estimators', 500)
+        early_stopping_rounds = params.pop('early_stopping_rounds', 30)
+        verbose_eval = params.pop('verbose_eval', 25)
+    else:
+        from src.survival.models import _get_default_aft_params, _get_default_cox_params
+        params = _get_default_aft_params() if model_type == 'aft' else _get_default_cox_params()
+        n_estimators = 500
+        early_stopping_rounds = 30
+        verbose_eval = 25
+
+    # --- Train one model per event, incrementally across cutoffs ---
+    models = {}
+
+    for event in events:
+        print(f"\n{'='*60}")
+        print(f"Training {model_type.upper()} for: {event} (incremental over {n_train_windows} cutoffs)")
+        print(f"{'='*60}")
+
+        # Build val DMatrix for this event (subsampled, from early-stopping .npy)
+        val_X_np = np.load(val_es_npy_path, mmap_mode='r')
+        if model_type == 'aft':
+            y_lower_val, y_upper_val = create_aft_labels(
+                val_es_labels[event]['duration'], val_es_labels[event]['event']
+            )
+            dval = xgb.DMatrix(val_X_np)
+            dval.set_float_info('label_lower_bound', y_lower_val)
+            dval.set_float_info('label_upper_bound', y_upper_val)
+        else:
+            y_val = create_cox_labels(
+                val_es_labels[event]['duration'], val_es_labels[event]['event']
+            )
+            dval = xgb.DMatrix(val_X_np, label=y_val)
+        del val_X_np
+        gc.collect()
+
+        model = None
+        rounds_per_cutoff = max(30, n_estimators // max(len(train_cutoffs), 1))
+
+        label_idx = 0
+        for ci, cutoff in enumerate(train_cutoffs):
+            if cutoff not in npy_cache:
+                continue
+
+            npy_path, n_cutoff = npy_cache[cutoff]
+            print(f"  Cutoff {cutoff}...", end=" ", flush=True)
+
+            X_train_np = np.load(npy_path, mmap_mode='r')
+            dur_arr = train_labels[event]['dur'][label_idx]
+            evt_arr = train_labels[event]['evt'][label_idx]
+
+            if model_type == 'aft':
+                y_lower, y_upper = create_aft_labels(dur_arr, evt_arr)
+                dtrain = xgb.DMatrix(X_train_np)
+                dtrain.set_float_info('label_lower_bound', y_lower)
+                dtrain.set_float_info('label_upper_bound', y_upper)
+            else:
+                y_batch = create_cox_labels(dur_arr, evt_arr)
+                dtrain = xgb.DMatrix(X_train_np, label=y_batch)
+
+            del X_train_np
+            gc.collect()
+
+            rounds = rounds_per_cutoff if model is None else max(20, rounds_per_cutoff // 2)
+
+            callbacks = []
+            if checkpoint_dir:
+                event_ckpt_dir = os.path.join(checkpoint_dir, f"rolling_{event}")
+                callbacks.append(CheckpointCallback(
+                    directory=event_ckpt_dir,
+                    period=checkpoint_period,
+                    event_name=event,
+                ))
+
+            model = xgb.train(
+                params,
+                dtrain,
+                num_boost_round=rounds,
+                xgb_model=model,
+                evals=[(dval, 'val')],
+                early_stopping_rounds=early_stopping_rounds if ci == len(train_cutoffs) - 1 else None,
+                verbose_eval=verbose_eval,
+                callbacks=callbacks or None,
+            )
+
+            print(f"{n_cutoff:,} rows, {model.num_boosted_rounds()} trees")
+
+            del dtrain
+            gc.collect()
+            label_idx += 1
+
+        models[event] = model
+        del dval
+        gc.collect()
+
+    # Consolidate train labels into flat arrays
+    for event in events:
+        train_labels[event] = {
+            'duration': np.concatenate(train_labels[event]['dur']),
+            'event': np.concatenate(train_labels[event]['evt']),
+        }
+
+    # Free subsampled val early-stopping .npy (full val stays in npy_cache)
+    try:
+        os.unlink(val_es_npy_path)
+    except OSError:
+        pass
+    del val_es_labels
+    gc.collect()
+
+    print(f"\n  Train: {n_train_rows:,} rows ({n_train_windows} windows)")
+    print(f"  Val:   {n_val_rows:,} rows (cutoff={val_cutoff})")
+
+    log_stage_complete("Incremental Model Training")
+    log_memory_usage()
+
+    # Test labels already in all_labels[test_cutoff]
+    test_labels = all_labels[test_cutoff]
+
+    with mlflow.start_run(run_name=f"rolling_survival_{model_type}_h{history_len}_{'_'.join(events)}"):
+        mlflow.log_params({
+            'model_type': model_type,
+            'training_mode': 'rolling_window_incremental',
+            'history_len': history_len,
+            'train_cutoffs': str(train_cutoffs),
+            'val_cutoff': val_cutoff,
+            'test_cutoff': test_cutoff,
+            'n_features': len(feature_cols),
+            'train_rows': n_train_rows,
+            'val_rows': n_val_rows,
+            'test_rows': n_test_rows,
+            'events': ','.join(events),
+            'horizons': str(horizons),
+        })
+        if config:
+            for k, v in config.get('model', {}).get('params', {}).items():
+                mlflow.log_param(f"xgb_{k}", str(v))
+
+        # ================================================================
+        # Step 6: Predictions + evaluation on test cutoff
+        # ================================================================
+        log_stage_start("Prediction & Evaluation (test)")
+
+        # Build ONE DMatrix from mmap'd test features (shared across all events)
+        test_X_np = np.load(npy_cache[test_cutoff][0], mmap_mode='r')
+        dtest = xgb.DMatrix(test_X_np)
+        del test_X_np
+        gc.collect()
+
+        # For Cox: estimate baseline hazard from cached training labels
+        baseline_hazards = None
+        if model_type == 'cox':
+            baseline_hazards = {}
+            for event in events:
+                baseline_hazards[event] = estimate_baseline_hazard(
+                    train_labels[event]['duration'],
+                    train_labels[event]['event'],
+                )
+
+        # Predict per event using the shared DMatrix (avoids re-creating it)
+        all_predictions = {}
+        for event_col, model in models.items():
+            print(f"  Predicting {event_col}...")
+            bh = baseline_hazards.get(event_col) if baseline_hazards else None
+            if model_type == 'aft':
+                preds = predict_survival_aft_dmatrix(
+                    model, dtest, horizons=horizons,
+                    distribution=distribution, sigma=sigma,
+                )
+            else:
+                preds = predict_survival_cox_dmatrix(
+                    model, dtest, bh, horizons=horizons,
+                )
+            all_predictions[event_col] = preds
+
+        pred_df = predictions_to_dataframe(
+            all_predictions, horizons=horizons,
+        )
+
+        # Full evaluation (same as main_survival STAGE 8)
+        print("\n" + "=" * 60)
+        print(f"EVALUATION RESULTS (Rolling Window, test cutoff={test_cutoff})")
+        print("=" * 60)
+
+        all_metrics = {}
+        for event in events:
+            duration_col = f"{event}_duration"
+            observed_col = f"{event}_event_observed"
+
+            print(f"\n--- {event} ---")
+            event_proba = {}
+            for h in horizons:
+                key = f'prob_{h}yr'
+                if key in all_predictions[event]:
+                    event_proba[h] = all_predictions[event][key]
+
+            metrics = evaluate_survival_model(
+                predicted_risk=all_predictions[event]['risk_score'],
+                predicted_proba=event_proba,
+                duration_test=test_labels[event]['duration'],
+                event_test=test_labels[event]['event'],
+                horizons=horizons,
+                duration_train=train_labels[event]['duration'],
+                event_train=train_labels[event]['event'],
+                event_name=event,
+            )
+            all_metrics[event] = metrics
+            mlflow.log_metric(f"{event}_c_index", metrics['c_index'])
+            for h in horizons:
+                for key_pattern in ['auc_{h}yr', 'brier_{h}yr', 'f1_{h}yr', 'ap_{h}yr', 'auc_pr_{h}yr']:
+                    key = key_pattern.format(h=h)
+                    if key in metrics and not np.isnan(metrics[key]):
+                        mlflow.log_metric(f"{event}_{key}", metrics[key])
+
+        # Shared AFT metrics
+        if model_type == 'aft':
+            print(f"\n  Computing shared AFT metrics (distribution={distribution})...")
+            # Build lightweight DataFrame with just survival label columns
+            test_labels_df = pd.DataFrame({
+                f"{event}_{k}": test_labels[event][v]
+                for event in events
+                for k, v in [('duration', 'duration'), ('event_observed', 'event')]
+            })
+            shared_results = evaluate_aft_shared_metrics(
+                all_predictions, test_labels_df, events,
+                horizons=horizons,
+                distribution=distribution,
+                sigma=sigma,
+            )
+            del test_labels_df
+            agg = shared_results['aggregate']
+            print(f"  Shared AFT aggregate: "
+                  f"C-index={agg['mean_c_index']:.4f}, "
+                  f"CRPS={agg['mean_crps']:.4f}, "
+                  f"IBS={agg['mean_ibs']:.4f}, "
+                  f"TD-AUC={agg['mean_td_auc']:.4f}")
+            for k, v in agg.items():
+                if not np.isnan(v):
+                    mlflow.log_metric(f"shared_{k}", v)
+
+        # F1, AP, CRPS per event
+        from sklearn.metrics import f1_score, average_precision_score
+        from src.sequence.evaluation import _fast_crps
+
+        n_horizons = len(horizons)
+        all_f1, all_ap, all_crpss = [], [], []
+        for ei, event in enumerate(events):
+            event_f1s, event_aps = [], []
+            for h in horizons:
+                y_true = ((test_labels[event]['event'] == 1) &
+                          (test_labels[event]['duration'] <= h)).astype(int)
+                y_prob = all_predictions[event].get(f'prob_{h}yr')
+                if y_prob is None or y_true.sum() < 5:
+                    continue
+                ap = float(average_precision_score(y_true, y_prob))
+                event_aps.append(ap)
+                mlflow.log_metric(f"{event}_ap_{h}yr", ap)
+                base_rate = float(y_true.mean())
+                candidates = np.unique(np.concatenate([
+                    np.linspace(max(0.005, base_rate * 0.2),
+                                min(0.95, base_rate * 5), 30),
+                    np.array([0.5, base_rate]),
+                ]))
+                best_f1 = 0.0
+                for thr in candidates:
+                    _f1 = f1_score(y_true, (y_prob >= thr).astype(int), zero_division=0)
+                    if _f1 > best_f1:
+                        best_f1 = _f1
+                f1_val = float(best_f1)
+                event_f1s.append(f1_val)
+                mlflow.log_metric(f"{event}_f1_{h}yr", f1_val)
+
+            if event_f1s:
+                mean_f1_e = float(np.mean(event_f1s))
+                mean_ap_e = float(np.mean(event_aps))
+                all_f1.append(mean_f1_e)
+                all_ap.append(mean_ap_e)
+                print(f"  {event}: mean_F1={mean_f1_e:.4f}, mean_AP={mean_ap_e:.4f}")
+                mlflow.log_metric(f"{event}_mean_f1", mean_f1_e)
+                mlflow.log_metric(f"{event}_mean_ap", mean_ap_e)
+
+            # CRPSS per event (AFT only)
+            if model_type == 'aft' and 'predicted_log_time' in all_predictions[event]:
+                mu_e = all_predictions[event]['predicted_log_time']
+                sigma_e = np.full_like(mu_e, sigma)
+                dur = test_labels[event]['duration'].astype(np.float64)
+                evt = test_labels[event]['event'].astype(np.float64)
+                max_h = float(max(horizons))
+                crps_e, crps_naive_e, skill_e = _fast_crps(
+                    mu_e, sigma_e, dur, evt,
+                    max_horizon=max_h,
+                    distribution=distribution,
+                    return_skill=True,
+                )
+                all_crpss.append(skill_e)
+                print(f"  {event}: CRPS={crps_e:.4f}, CRPSS={skill_e:.4f} (naive={crps_naive_e:.4f})")
+                mlflow.log_metric(f"{event}_crps", crps_e)
+                mlflow.log_metric(f"{event}_crpss", skill_e)
+
+        if all_f1:
+            mean_f1 = float(np.mean(all_f1))
+            mean_ap = float(np.mean(all_ap))
+            print(f"\n  Overall: mean_F1={mean_f1:.4f}, mean_AP={mean_ap:.4f}")
+            mlflow.log_metric("mean_f1", mean_f1)
+            mlflow.log_metric("mean_ap", mean_ap)
+        if all_crpss:
+            mean_crpss = float(np.mean(np.clip(all_crpss, 0, None)))
+            print(f"  Overall: mean_CRPSS={mean_crpss:.4f}")
+            mlflow.log_metric("mean_crpss", mean_crpss)
+
+        # Per-event sigma calibration (AFT only)
+        if model_type == 'aft':
+            print(f"\n  Calibrating per-event sigma to minimise CRPS...")
+            sigma_candidates = np.geomspace(0.3, 3.0, 30) * sigma
+            for event in events:
+                if 'predicted_log_time' not in all_predictions[event]:
+                    continue
+                mu_e = all_predictions[event]['predicted_log_time']
+                dur = test_labels[event]['duration'].astype(np.float64)
+                evt = test_labels[event]['event'].astype(np.float64)
+                max_h = float(max(horizons))
+
+                best_crps, best_sigma = float('inf'), sigma
+                for s_cand in sigma_candidates:
+                    sigma_arr = np.full_like(mu_e, s_cand)
+                    crps_s = _fast_crps(
+                        mu_e, sigma_arr, dur, evt,
+                        max_horizon=max_h, distribution=distribution,
+                    )
+                    if crps_s < best_crps:
+                        best_crps = crps_s
+                        best_sigma = float(s_cand)
+                _, _, skill_cal = _fast_crps(
+                    mu_e, np.full_like(mu_e, best_sigma), dur, evt,
+                    max_horizon=max_h, distribution=distribution,
+                    return_skill=True,
+                )
+                print(f"  {event}: optimal_sigma={best_sigma:.3f} "
+                      f"(was {sigma:.3f}), CRPS={best_crps:.4f}, CRPSS={skill_cal:.4f}")
+                mlflow.log_metric(f"{event}_sigma_calibrated", best_sigma)
+                mlflow.log_metric(f"{event}_crps_calibrated", best_crps)
+                mlflow.log_metric(f"{event}_crpss_calibrated", skill_cal)
+
+        # Event ordering (AFT only)
+        if model_type == 'aft':
+            print(f"\n  Computing event ordering metrics...")
+            try:
+                from src.sequence.evaluation import evaluate_event_ordering
+
+                n_ev = len(events)
+                n_samples = n_test_rows
+                pred_mu = np.column_stack([
+                    all_predictions[event]['predicted_log_time'] for event in events
+                ])
+                targets = np.zeros((n_samples, n_ev * n_horizons), dtype=np.float32)
+                for ei, event in enumerate(events):
+                    dur = test_labels[event]['duration']
+                    evt = test_labels[event]['event']
+                    for hi, h in enumerate(horizons):
+                        col = ei * n_horizons + hi
+                        targets[:, col] = ((evt == 1) & (dur <= h)).astype(np.float32)
+
+                ordering = evaluate_event_ordering(
+                    predicted_mu=pred_mu,
+                    targets=targets,
+                    events=events,
+                    horizons=horizons,
+                    min_events=2,
+                    top_k=3,
+                )
+                n_elig = ordering['n_eligible']
+                print(f"  Persons with 2+ events: {n_elig} "
+                      f"({100*n_elig/n_samples:.1f}% of test set)")
+                if n_elig > 0:
+                    print(f"  Pairwise accuracy:     {ordering['pairwise_accuracy']:.4f}")
+                    print(f"  Top-1 accuracy:        {ordering['top1_accuracy']:.4f}")
+                    print(f"  Top-3 accuracy:        {ordering['topk_accuracy']:.4f}")
+                    print(f"  Mean reciprocal rank:  {ordering['mean_reciprocal_rank']:.4f}")
+                    print(f"  Kendall's tau:         {ordering['kendall_tau']:.4f}")
+                    for k, v in ordering.items():
+                        if isinstance(v, float) and not np.isnan(v):
+                            mlflow.log_metric(f"ordering_{k}", v)
+                    print("\n  Observed first-event distribution:")
+                    for event_name, rate in ordering['per_event_first_rate'].items():
+                        pred_rate = ordering['per_event_pred_first_rate'].get(event_name, 0)
+                        print(f"    {event_name}: observed={rate:.3f}, predicted={pred_rate:.3f}")
+                        mlflow.log_metric(f"ordering_obs_first_{event_name}", rate)
+                        mlflow.log_metric(f"ordering_pred_first_{event_name}", pred_rate)
+            except Exception as e:
+                print(f"  Event ordering failed: {e}")
+                import traceback; traceback.print_exc()
+
+        # Prediction intervals (AFT only)
+        if model_type == 'aft':
+            print(f"\n  Computing prediction intervals...")
+            from scipy.stats import norm, logistic as logistic_dist
+            dist_fn = norm if distribution == 'normal' else logistic_dist
+            for event in events:
+                if 'predicted_log_time' not in all_predictions[event]:
+                    continue
+                mu_e = all_predictions[event]['predicted_log_time']
+                med_time = np.exp(mu_e)
+                for level in [0.5, 0.8, 0.9]:
+                    alpha = 1.0 - level
+                    lower_q = dist_fn.ppf(alpha / 2, loc=mu_e, scale=sigma)
+                    upper_q = dist_fn.ppf(1 - alpha / 2, loc=mu_e, scale=sigma)
+                    ci_lower = np.exp(lower_q)
+                    ci_upper = np.exp(upper_q)
+                    level_pct = int(level * 100)
+                    print(f"  {event}: median={np.median(med_time):.2f}yr, "
+                          f"{level_pct}%CI=[{np.median(ci_lower):.2f}, {np.median(ci_upper):.2f}]yr")
+                    mlflow.log_metric(f"aft_{event}_median_tte", float(np.median(med_time)))
+                    mlflow.log_metric(f"aft_{event}_ci{level_pct}_width",
+                                      float(np.median(ci_upper - ci_lower)))
+
+        # LM-style metrics (top-k accuracy, MRR, perplexity)
+        print(f"\n  Computing LM-style metrics...")
+        try:
+            from src.sequence.evaluation import evaluate_lm_metrics, evaluate_grouped_metrics
+
+            # Build stacked arrays from test_labels (no test_df needed)
+            n_ev = len(events)
+            stacked_probs = np.zeros((n_test_rows, n_ev * n_horizons), dtype=np.float64)
+            stacked_targets = np.zeros((n_test_rows, n_ev * n_horizons), dtype=np.float32)
+            for ei, event in enumerate(events):
+                dur = test_labels[event]['duration']
+                evt = test_labels[event]['event']
+                for hi, h in enumerate(horizons):
+                    col = ei * n_horizons + hi
+                    prob_key = f'prob_{h}yr'
+                    if prob_key in all_predictions[event]:
+                        stacked_probs[:, col] = all_predictions[event][prob_key]
+                    stacked_targets[:, col] = ((evt == 1) & (dur <= h)).astype(np.float32)
+
+            lm_results = evaluate_lm_metrics(
+                stacked_probs, stacked_targets, events, horizons, top_k=3,
+            )
+            print(f"  LM next-event top-1 accuracy: {lm_results['next_event_top1_accuracy']:.4f}")
+            print(f"  LM next-event top-3 accuracy: {lm_results['next_event_topk_accuracy']:.4f}")
+            print(f"  LM MRR:                       {lm_results['next_event_mrr']:.4f}")
+            print(f"  LM event perplexity:          {lm_results['event_perplexity']:.4f}")
+            print(f"  LM temporal consistency:       {lm_results['temporal_consistency']:.4f}")
+            print(f"  LM cross-horizon rank stab.:   {lm_results['cross_horizon_rank_stability']:.4f}")
+
+            for k, v in lm_results.items():
+                if isinstance(v, float) and not np.isnan(v):
+                    mlflow.log_metric(f"lm_{k}", v)
+                elif isinstance(v, dict) and k == 'per_horizon':
+                    for h_name, h_metrics in v.items():
+                        for mk, mv in h_metrics.items():
+                            if isinstance(mv, float) and not np.isnan(mv):
+                                mlflow.log_metric(f"lm_{h_name}_{mk}", mv)
+                elif isinstance(v, dict) and k in ('per_event_recall', 'per_event_precision'):
+                    for ev_name, ev_val in v.items():
+                        if isinstance(ev_val, float) and not np.isnan(ev_val):
+                            mlflow.log_metric(f"lm_{k}_{ev_name}", ev_val)
+        except Exception as e:
+            print(f"  LM metrics failed: {e}")
+            import traceback; traceback.print_exc()
+
+        # Grouped evaluation (by age_group / refnis)
+        try:
+            group_col_names = ['age_group', 'refnis']
+            parquet_schema = pq.ParquetDataset(output_path).schema.names
+            available_groups = [c for c in group_col_names if c in parquet_schema]
+
+            if available_groups:
+                print(f"\n  Computing grouped evaluation by {available_groups}...")
+                # Load only group columns from parquet for the test cutoff
+                group_features_df = pd.read_parquet(
+                    output_path,
+                    columns=available_groups,
+                    filters=[('year', '==', test_cutoff)],
+                )
+
+                for grp_name in available_groups:
+                    group_labels = group_features_df[grp_name].values
+                    grp_result = evaluate_grouped_metrics(
+                        stacked_probs, stacked_targets, group_labels,
+                        events, horizons,
+                        group_name=grp_name,
+                        min_group_size=50,
+                        calibrate_thresholds=True,
+                    )
+
+                    gt = grp_result['group_table']
+                    summary = grp_result['summary']
+                    lm_sum = grp_result['lm_summary']
+
+                    print(f"\n  --- Grouped by {grp_name} ({summary.get('n_groups', 0)} groups) ---")
+                    for ei, event in enumerate(events):
+                        for hi, h in enumerate(horizons):
+                            prefix = f'{event}_{h}yr'
+                            mae_w = summary.get(f'{prefix}_mae_weighted')
+                            rmse_w = summary.get(f'{prefix}_rmse_weighted')
+                            if mae_w is not None:
+                                print(f"    {prefix}: MAE_w={mae_w:.4f}  RMSE_w={rmse_w:.4f}")
+                                mlflow.log_metric(f"grp_{grp_name}_{prefix}_mae_w", mae_w)
+                                mlflow.log_metric(f"grp_{grp_name}_{prefix}_rmse_w", rmse_w)
+                            cal_mae_w = summary.get(f'{prefix}_cal_mae_weighted')
+                            if cal_mae_w is not None:
+                                mlflow.log_metric(f"grp_{grp_name}_{prefix}_cal_mae_w", cal_mae_w)
+
+                    if lm_sum:
+                        print(f"    LM top-1 weighted: {lm_sum.get('lm_top1_acc_weighted', float('nan')):.4f}")
+                        print(f"    LM top-3 weighted: {lm_sum.get('lm_top3_acc_weighted', float('nan')):.4f}")
+                        print(f"    LM MRR weighted:   {lm_sum.get('lm_mrr_weighted', float('nan')):.4f}")
+                        for lk, lv in lm_sum.items():
+                            if isinstance(lv, float) and not np.isnan(lv):
+                                mlflow.log_metric(f"grp_{grp_name}_{lk}", lv)
+
+                    if not gt.empty:
+                        grp_csv = f"group_eval_{grp_name}.csv"
+                        gt.to_csv(grp_csv, index=False)
+                        mlflow.log_artifact(grp_csv)
+                        print(f"    Saved {grp_csv} ({len(gt)} groups)")
+
+                del group_features_df
+                gc.collect()
+        except Exception as e:
+            print(f"  Grouped evaluation failed: {e}")
+            import traceback; traceback.print_exc()
+
+        # Rate-based group evaluation (observed vs predicted rates, weighted RMSE/MAE)
+        try:
+            from src.sequence.evaluation import evaluate_groups
+            rate_group_cols = [c for c in ['gender', 'age_group', 'refnis']
+                               if c in pq.ParquetDataset(output_path).schema.names]
+            if rate_group_cols:
+                print(f"\n  Computing rate-based group evaluation by {rate_group_cols}...")
+                rate_group_df = pd.read_parquet(
+                    output_path,
+                    columns=rate_group_cols,
+                    filters=[('year', '==', test_cutoff)],
+                )
+                if len(rate_group_df) == n_test_rows:
+                    rate_group_results = evaluate_groups(
+                        group_df=rate_group_df,
+                        all_predictions=all_predictions,
+                        y_true=stacked_targets,
+                        events=events,
+                        horizons=horizons,
+                        group_cols=rate_group_cols,
+                        min_group_size=100,
+                    )
+                    for event, eres in rate_group_results.items():
+                        summary = eres.get('summary', {})
+                        if not summary:
+                            continue
+                        for h in horizons:
+                            rmse_w = summary.get(f'rmse_weighted_{h}yr')
+                            mae_w = summary.get(f'mae_weighted_{h}yr')
+                            if rmse_w is not None:
+                                print(f"    {event} @{h}yr: RMSE_w={rmse_w:.4f}  MAE_w={mae_w:.4f}")
+                                mlflow.log_metric(f"{event}_group_rmse_weighted_{h}yr", rmse_w)
+                                mlflow.log_metric(f"{event}_group_mae_weighted_{h}yr", mae_w)
+                else:
+                    print(f"  Rate group eval: row count mismatch ({len(rate_group_df)} vs {n_test_rows})")
+                del rate_group_df
+                gc.collect()
+        except Exception as e:
+            print(f"  Rate-based group evaluation failed: {e}")
+            import traceback; traceback.print_exc()
+
+        # Free test DMatrix + predictions before per-window eval
+        del dtest, all_predictions
+        gc.collect()
+
+        log_stage_complete("Prediction & Evaluation (test)")
+        log_memory_usage()
+
+        # ================================================================
+        # Step 7: Save checkpoint (before per-window, so results survive OOM)
+        # ================================================================
+        log_stage_start("Saving Artifacts")
+
+        checkpoint_dir = "checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        checkpoint_path = os.path.join(
+            checkpoint_dir, f"rolling_survival_{model_type}_{timestamp}"
+        )
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        # Save models
+        for event, model in models.items():
+            model_file = os.path.join(checkpoint_path, f"model_{event}.json")
+            model.save_model(model_file)
+            print(f"  Saved model: {model_file}")
+
+        # Save predictions
+        pred_path = os.path.join(checkpoint_path, "predictions.parquet")
+        pred_df.to_parquet(pred_path)
+        print(f"  Saved predictions: {pred_path}")
+
+        # Save feature importance
+        for event, model in models.items():
+            for imp_type in ['weight', 'gain', 'cover']:
+                try:
+                    importance = model.get_score(importance_type=imp_type)
+                    if importance:
+                        imp_df = pd.DataFrame([
+                            {'feature': k, 'importance': v}
+                            for k, v in importance.items()
+                        ]).sort_values('importance', ascending=False)
+                        imp_df.to_csv(
+                            os.path.join(checkpoint_path, f"feature_importance_{event}_{imp_type}.csv"),
+                            index=False,
+                        )
+                except Exception:
+                    pass
+
+        # Save metadata (without window metrics for now)
+        serializable_metrics = {}
+        for event, m in all_metrics.items():
+            serializable_metrics[event] = {
+                k: float(v) if isinstance(v, (np.floating, float)) else v
+                for k, v in m.items() if k != 'calibration'
+            }
+
+        metadata = {
+            'timestamp': timestamp,
+            'model_type': model_type,
+            'training_mode': 'rolling_window',
+            'events': events,
+            'horizons': horizons,
+            'distribution': distribution,
+            'sigma': sigma,
+            'history_len': history_len,
+            'rolling_cutoffs': rolling_cutoffs,
+            'train_cutoffs': train_cutoffs,
+            'val_cutoff': val_cutoff,
+            'test_cutoff': test_cutoff,
+            'n_features': len(feature_cols),
+            'feature_cols': feature_cols,
+            'train_rows': n_train_rows,
+            'val_rows': n_val_rows,
+            'test_rows': n_test_rows,
+            'metrics': serializable_metrics,
+            'window_metrics': {},
+        }
+        with open(os.path.join(checkpoint_path, "metadata.json"), 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+
+        print(f"  Checkpoint saved: {checkpoint_path}")
+        log_stage_complete("Saving Artifacts")
+
+        # Free predictions to make room for per-window eval
+        del pred_df
+        gc.collect()
+
+        # ================================================================
+        # Step 8: Per-window stability analysis (optional, reload on-the-fly)
+        # ================================================================
+        gc.collect()
+
+        log_stage_start("Per-Window Stability Analysis")
+        print("\n  Evaluating model on each individual window:")
+
+        window_metrics_all = {}
+        for cutoff in rolling_cutoffs:
+            if cutoff not in npy_cache or cutoff not in all_labels:
+                print(f"    W cutoff={cutoff}: skipped (not in cache)")
+                continue
+            try:
+                # Reuse cached labels and features (no re-streaming!)
+                w_labels = all_labels[cutoff]
+                w_npy_path, n_window = npy_cache[cutoff]
+
+                # Build single DMatrix from cached .npy
+                w_X = np.load(w_npy_path, mmap_mode='r')
+                dwindow = xgb.DMatrix(w_X)
+                del w_X
+                gc.collect()
+
+                # Predict per event using shared DMatrix
+                window_preds = {}
+                for event_col, model in models.items():
+                    bh = baseline_hazards.get(event_col) if baseline_hazards else None
+                    if model_type == 'aft':
+                        preds = predict_survival_aft_dmatrix(
+                            model, dwindow, horizons=horizons,
+                            distribution=distribution, sigma=sigma,
+                        )
+                    else:
+                        preds = predict_survival_cox_dmatrix(
+                            model, dwindow, bh, horizons=horizons,
+                        )
+                    window_preds[event_col] = preds
+
+                del dwindow
+                gc.collect()
+
+                window_event_metrics = {}
+                for event in events:
+                    event_proba = {
+                        h: window_preds[event][f'prob_{h}yr']
+                        for h in horizons
+                        if f'prob_{h}yr' in window_preds[event]
+                    }
+                    w_metrics = evaluate_survival_model(
+                        predicted_risk=window_preds[event]['risk_score'],
+                        predicted_proba=event_proba,
+                        duration_test=w_labels[event]['duration'],
+                        event_test=w_labels[event]['event'],
+                        horizons=horizons,
+                        event_name=event,
+                    )
+                    window_event_metrics[event] = w_metrics
+
+                window_metrics_all[cutoff] = window_event_metrics
+                role = "TRAIN" if cutoff in train_cutoffs else ("VAL" if cutoff == val_cutoff else "TEST")
+                mean_c = np.mean([m['c_index'] for m in window_event_metrics.values()])
+
+                # Aggregate F1/AP/AUC-PR/Brier across events for this window
+                w_f1s = [m.get(f'f1_{h}yr', float('nan')) for m in window_event_metrics.values() for h in horizons]
+                w_aps = [m.get(f'ap_{h}yr', float('nan')) for m in window_event_metrics.values() for h in horizons]
+                w_briers = [m.get(f'brier_{h}yr', float('nan')) for m in window_event_metrics.values() for h in horizons]
+                mean_f1 = float(np.nanmean(w_f1s)) if any(not np.isnan(v) for v in w_f1s) else float('nan')
+                mean_ap = float(np.nanmean(w_aps)) if any(not np.isnan(v) for v in w_aps) else float('nan')
+                mean_brier = float(np.nanmean(w_briers)) if any(not np.isnan(v) for v in w_briers) else float('nan')
+
+                extra = []
+                if not np.isnan(mean_f1):
+                    extra.append(f"F1={mean_f1:.4f}")
+                if not np.isnan(mean_ap):
+                    extra.append(f"AP={mean_ap:.4f}")
+                if not np.isnan(mean_brier):
+                    extra.append(f"Brier={mean_brier:.4f}")
+                extra_str = f", {', '.join(extra)}" if extra else ""
+                print(f"    W cutoff={cutoff} [{role}]: mean_C-index={mean_c:.4f}{extra_str}")
+
+                mlflow.log_metric(f"window_{cutoff}_mean_c_index", mean_c)
+                if not np.isnan(mean_f1):
+                    mlflow.log_metric(f"window_{cutoff}_mean_f1", mean_f1)
+                if not np.isnan(mean_ap):
+                    mlflow.log_metric(f"window_{cutoff}_mean_ap", mean_ap)
+                if not np.isnan(mean_brier):
+                    mlflow.log_metric(f"window_{cutoff}_mean_brier", mean_brier)
+
+                # Per-event per-horizon metrics to MLflow
+                for event, w_m in window_event_metrics.items():
+                    for h in horizons:
+                        for key_pat in ['f1_{h}yr', 'ap_{h}yr', 'auc_pr_{h}yr', 'brier_{h}yr']:
+                            key = key_pat.format(h=h)
+                            if key in w_m and not np.isnan(w_m[key]):
+                                mlflow.log_metric(f"window_{cutoff}_{event}_{key}", w_m[key])
+
+                # Group-level evaluation for this window
+                group_cols_for_window = ['gender', 'age_group']
+                try:
+                    # Load group columns for this cutoff year
+                    w_group_df = pd.read_parquet(
+                        output_path,
+                        columns=['sid'] + group_cols_for_window,
+                        filters=[('year', '==', cutoff)],
+                    )
+                    # Match row count (same persons as in labels)
+                    if len(w_group_df) == n_window:
+                        window_group_summaries = {}
+                        for event in events:
+                            duration_col = f"{event}_duration"
+                            observed_col = f"{event}_event_observed"
+                            # Build lightweight DataFrame for evaluate_by_group
+                            w_eval_df = w_group_df.copy()
+                            w_eval_df[duration_col] = w_labels[event]['duration']
+                            w_eval_df[observed_col] = w_labels[event]['event']
+                            event_proba = {
+                                h: window_preds[event][f'prob_{h}yr']
+                                for h in horizons
+                                if f'prob_{h}yr' in window_preds[event]
+                            }
+                            _, g_summary = evaluate_by_group(
+                                w_eval_df,
+                                window_preds[event]['risk_score'],
+                                event_proba,
+                                duration_col, observed_col,
+                                group_cols_for_window,
+                                horizons=horizons,
+                            )
+                            if g_summary:
+                                window_group_summaries[event] = g_summary
+                                for h in horizons:
+                                    rmse_w = g_summary.get(f'rmse_weighted_{h}yr')
+                                    if rmse_w is not None:
+                                        mlflow.log_metric(
+                                            f"window_{cutoff}_{event}_group_rmse_w_{h}yr",
+                                            rmse_w,
+                                        )
+                            del w_eval_df
+                        if window_group_summaries:
+                            window_event_metrics['_group_summaries'] = window_group_summaries
+                    del w_group_df
+                except Exception as e:
+                    print(f"      Group eval for W={cutoff} failed: {e}")
+
+                del window_preds
+                gc.collect()
+
+            except Exception as e:
+                print(f"    W cutoff={cutoff}: FAILED ({e})")
+
+        log_stage_complete("Per-Window Stability Analysis")
+
+        # Update metadata with window metrics if any succeeded
+        if window_metrics_all:
+            serializable_window_metrics = {}
+            for cutoff, cutoff_metrics in window_metrics_all.items():
+                cutoff_ser = {}
+                for event_key, m in cutoff_metrics.items():
+                    if event_key == '_group_summaries':
+                        # Group summaries: event → {metric_name: float}
+                        cutoff_ser['group_summaries'] = m
+                    else:
+                        cutoff_ser[event_key] = {
+                            k: float(v) if isinstance(v, (np.floating, float)) else v
+                            for k, v in m.items() if k != 'calibration'
+                        }
+                serializable_window_metrics[str(cutoff)] = cutoff_ser
+            metadata['window_metrics'] = serializable_window_metrics
+            with open(os.path.join(checkpoint_path, "metadata.json"), 'w') as f:
+                json.dump(metadata, f, indent=2, default=str)
+            print(f"  Updated checkpoint with {len(window_metrics_all)} window metrics")
+
+        mlflow.log_artifacts(checkpoint_path, artifact_path="rolling_survival_checkpoint")
+
+    # Clean up all cached .npy files
+    for cutoff, (npy_path, _) in npy_cache.items():
+        try:
+            os.unlink(npy_path)
+        except OSError:
+            pass
+    try:
+        os.unlink(val_es_npy_path)
+    except OSError:
+        pass
+    del npy_cache, all_labels
+    gc.collect()
+
+    # Final summary
+    print("\n" + "=" * 60)
+    print("ROLLING SURVIVAL ANALYSIS COMPLETE")
+    print("=" * 60)
+    for event in events:
+        m = all_metrics[event]
+        c_idx = m['c_index']
+        aucs = [m.get(f'auc_{h}yr', np.nan) for h in horizons]
+        auc_str = ", ".join(
+            f"{h}yr={a:.3f}" if not np.isnan(a) else f"{h}yr=N/A"
+            for h, a in zip(horizons, aucs)
+        )
+        print(f"  {event}: C-index={c_idx:.4f} | AUC: {auc_str}")
+    print(f"\n  Windows: {len(rolling_cutoffs)} cutoffs, "
+          f"train={len(train_cutoffs)}, val=1, test=1")
+    print(f"  Checkpoint: {checkpoint_path}")
+    print("=" * 60)
+
+    return models, all_metrics, checkpoint_path
 
 
 def _run_incremental_pipeline(
@@ -1496,6 +2728,26 @@ if __name__ == "__main__":
     parser.add_argument('--target-batch-rows', type=int,
                         help='Target rows per incremental batch')
 
+    # Rolling window arguments
+    parser.add_argument('--rolling', action='store_true',
+                        help='Use rolling window validation (multiple cutoff years)')
+    parser.add_argument('--history-len', type=int, default=5,
+                        help='History length in years for rolling cutoff range (default: 5)')
+    parser.add_argument('--rolling-cutoffs', type=str,
+                        help='Comma-separated cutoff years for rolling windows')
+    parser.add_argument('--rolling-train-cutoffs', type=str,
+                        help='Comma-separated cutoffs for training (default: all except last 2)')
+    parser.add_argument('--rolling-val-cutoff', type=int,
+                        help='Cutoff year for validation window')
+    parser.add_argument('--rolling-test-cutoff', type=int,
+                        help='Cutoff year for test window')
+
+    # Checkpoint arguments
+    parser.add_argument('--checkpoint-dir', type=str,
+                        help='Directory for model checkpoints (enables checkpointing)')
+    parser.add_argument('--checkpoint-period', type=int, default=50,
+                        help='Save checkpoint every N boosting rounds (default: 50)')
+
     args = parser.parse_args()
 
     # Parse events
@@ -1522,8 +2774,23 @@ if __name__ == "__main__":
     print(f"  Horizons: {horizons} years")
     if args.tune:
         print(f"  Tuning: {args.n_trials} trials")
+    if args.rolling:
+        print(f"  Mode: ROLLING WINDOW (history_len={args.history_len})")
+        if args.rolling_cutoffs:
+            print(f"  Rolling cutoffs: {args.rolling_cutoffs}")
+    if args.checkpoint_dir:
+        print(f"  Checkpoints: {args.checkpoint_dir} (every {args.checkpoint_period} rounds)")
     print("=" * 60)
     print()
+
+    # Parse rolling cutoffs (sorted, consistent with sequence pipeline)
+    rolling_cutoffs = None
+    if args.rolling_cutoffs:
+        rolling_cutoffs = sorted([int(c.strip()) for c in args.rolling_cutoffs.split(',')])
+
+    rolling_train_cutoffs = None
+    if args.rolling_train_cutoffs:
+        rolling_train_cutoffs = sorted([int(c.strip()) for c in args.rolling_train_cutoffs.split(',')])
 
     main_survival(
         reuse_processed=args.reuse,
@@ -1535,4 +2802,12 @@ if __name__ == "__main__":
         tune=args.tune,
         n_trials=args.n_trials,
         target_batch_rows=args.target_batch_rows,
+        rolling=args.rolling,
+        history_len=args.history_len,
+        rolling_cutoffs=rolling_cutoffs,
+        rolling_train_cutoffs=rolling_train_cutoffs,
+        rolling_val_cutoff=args.rolling_val_cutoff,
+        rolling_test_cutoff=args.rolling_test_cutoff,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_period=args.checkpoint_period,
     )

@@ -52,3 +52,10 @@ events:
 
 # Prediction horizons (years)
 horizons: [1, 3, 5]
+
+# Checkpoint configuration
+checkpoint:
+  enabled: true
+  directory: checkpoints/sequence_training  # Per-epoch training checkpoints
+  period: 5                                 # Save every N epochs
+  max_to_keep: 3                            # Keep only the latest N checkpoints

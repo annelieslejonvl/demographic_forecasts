@@ -108,21 +108,26 @@ def time_dependent_auc(
             time=np.asarray(duration_test, dtype=np.float64),
         )
 
-        # Filter horizons to valid range
-        valid_horizons = [h for h in horizons if h <= duration_test.max()]
+        # Filter horizons to valid range (sksurv requires strict < max follow-up)
+        valid_horizons = [h for h in horizons if h < duration_test.max()]
         if not valid_horizons:
             return {h: np.nan for h in horizons}
 
-        aucs, mean_auc = cumulative_dynamic_auc(
-            y_train, y_test, predicted_risk, np.array(valid_horizons)
-        )
-
-        result = {}
-        for h, auc_val in zip(valid_horizons, aucs):
-            result[h] = float(auc_val)
-        for h in horizons:
-            if h not in result:
-                result[h] = np.nan
+        # Try all valid horizons first; if IPCW fails (censoring survival = 0),
+        # progressively drop the longest horizon until it works.
+        result = {h: np.nan for h in horizons}
+        remaining = list(valid_horizons)
+        while remaining:
+            try:
+                aucs, mean_auc = cumulative_dynamic_auc(
+                    y_train, y_test, predicted_risk, np.array(remaining)
+                )
+                for h, auc_val in zip(remaining, aucs):
+                    result[h] = float(auc_val)
+                break
+            except ValueError:
+                # Censoring survival hits 0 at longest horizon — drop it
+                remaining.pop()
         return result
 
     except ImportError:
@@ -410,6 +415,52 @@ def evaluate_survival_model(
     for h, bs_val in bs.items():
         metrics[f'brier_{h}yr'] = bs_val
         print(f"      Brier @{h}yr: {bs_val:.4f}" if not np.isnan(bs_val) else f"      Brier @{h}yr: N/A")
+
+    # F1, AP, AUC-PR at each horizon
+    t0 = datetime.now()
+    print(f"    [{datetime.now().strftime('%H:%M:%S')}] Computing F1, AP, AUC-PR...")
+    from sklearn.metrics import (
+        f1_score, average_precision_score,
+        precision_recall_curve, auc as sk_auc,
+    )
+
+    for h in horizons:
+        if h not in predicted_proba:
+            continue
+        y_true = ((event_test == 1) & (duration_test <= h)).astype(int)
+        y_prob = np.asarray(predicted_proba[h], dtype=np.float64)
+        n_pos = int(y_true.sum())
+        if n_pos < 5 or n_pos >= len(y_true):
+            metrics[f'f1_{h}yr'] = float('nan')
+            metrics[f'ap_{h}yr'] = float('nan')
+            metrics[f'auc_pr_{h}yr'] = float('nan')
+            continue
+
+        # AP (average precision = area under PR curve, interpolated)
+        ap = float(average_precision_score(y_true, y_prob))
+        metrics[f'ap_{h}yr'] = ap
+
+        # AUC-PR (trapezoidal area under precision-recall curve)
+        precision, recall, _ = precision_recall_curve(y_true, y_prob)
+        auc_pr = float(sk_auc(recall, precision))
+        metrics[f'auc_pr_{h}yr'] = auc_pr
+
+        # F1 with optimal threshold search
+        base_rate = n_pos / len(y_true)
+        candidates = np.unique(np.concatenate([
+            np.linspace(max(0.005, base_rate * 0.2),
+                        min(0.95, base_rate * 5), 30),
+            np.array([0.5, base_rate]),
+        ]))
+        best_f1 = 0.0
+        for thr in candidates:
+            _f1 = f1_score(y_true, (y_prob >= thr).astype(int), zero_division=0)
+            if _f1 > best_f1:
+                best_f1 = _f1
+        metrics[f'f1_{h}yr'] = float(best_f1)
+        print(f"      @{h}yr: F1={best_f1:.4f}, AP={ap:.4f}, AUC-PR={auc_pr:.4f}")
+
+    print(f"    [{datetime.now().strftime('%H:%M:%S')}] F1/AP/AUC-PR done (+{(datetime.now() - t0).total_seconds():.1f}s)")
 
     # Calibration tables
     t0 = datetime.now()

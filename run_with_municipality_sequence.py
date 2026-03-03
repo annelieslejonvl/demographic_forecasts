@@ -349,6 +349,8 @@ def _evaluate_from_arrays(
         f1_score,
         brier_score_loss,
     )
+    from src.sequence.evaluation import _targets_to_survival
+    from src.survival.evaluation import brier_score_at_horizons
 
     results = {}
     n_horizons = len(horizons)
@@ -356,6 +358,24 @@ def _evaluate_from_arrays(
     for ei, event in enumerate(events):
         if event not in all_predictions:
             continue
+
+        # Recover duration/event for IPCW Brier
+        event_targets = y_true[:, ei * n_horizons:(ei + 1) * n_horizons]
+        duration, event_ind = _targets_to_survival(event_targets, horizons)
+
+        # Build predicted_proba dict for brier_score_at_horizons
+        predicted_proba_dict = {}
+        for hi, horizon in enumerate(horizons):
+            prob_key = f'prob_{horizon}yr'
+            if prob_key in all_predictions[event]:
+                predicted_proba_dict[horizon] = all_predictions[event][prob_key]
+
+        # Compute IPCW Brier scores for all horizons at once
+        ipcw_brier = brier_score_at_horizons(
+            duration, event_ind,
+            predicted_proba_dict, list(horizons),
+            duration_train=duration, event_train=event_ind,
+        )
 
         event_results = {}
         for hi, horizon in enumerate(horizons):
@@ -391,6 +411,7 @@ def _evaluate_from_arrays(
                 metrics['f1'] = float('nan')
                 metrics['brier'] = float('nan')
 
+            metrics['ipcw_brier'] = ipcw_brier.get(horizon, float('nan'))
             metrics['n_pos'] = n_pos
             metrics['n_total'] = len(y_event)
             metrics['prevalence'] = n_pos / len(y_event) if len(y_event) > 0 else 0
@@ -479,117 +500,7 @@ def _load_group_features_streaming(
     return result
 
 
-def _evaluate_groups(
-    group_df: pd.DataFrame,
-    all_predictions: Dict[str, Dict[str, np.ndarray]],
-    y_true: np.ndarray,
-    events: List[str],
-    horizons: List[int],
-    group_cols: List[str],
-    min_group_size: int = 100,
-    group_thresholds: Optional[Dict] = None,
-) -> Dict[str, Any]:
-    """Compute group-level observed vs predicted rates per event-horizon.
-
-    Returns dict with per-event group DataFrames and RMSE/MAE summaries.
-    If *group_thresholds* is provided (from ``calibrate_group_thresholds``),
-    also computes thresholded group rates for comparison.
-    """
-    n_horizons = len(horizons)
-    results = {}
-
-    for ei, event in enumerate(events):
-        if event not in all_predictions:
-            continue
-
-        rows = []
-        for h in horizons:
-            prob_key = f'prob_{h}yr'
-            if prob_key not in all_predictions[event]:
-                continue
-            col_idx = ei * n_horizons + horizons.index(h)
-            group_df[f'pred_{h}yr'] = all_predictions[event][prob_key]
-            group_df[f'true_{h}yr'] = y_true[:, col_idx]
-
-        grouped = group_df.groupby(group_cols, dropna=False)
-        group_rows = []
-        for group_key, group_data in grouped:
-            if len(group_data) < min_group_size:
-                continue
-            row = {}
-            if len(group_cols) == 1:
-                row[group_cols[0]] = group_key
-                gval = group_key
-            else:
-                for i, col in enumerate(group_cols):
-                    row[col] = group_key[i]
-                gval = group_key
-            row['count'] = len(group_data)
-
-            for hi, h in enumerate(horizons):
-                pred_col = f'pred_{h}yr'
-                true_col = f'true_{h}yr'
-                if pred_col in group_data.columns:
-                    obs_rate = float(group_data[true_col].mean())
-                    pred_rate = float(group_data[pred_col].mean())
-                    row[f'observed_rate_{h}yr'] = obs_rate
-                    row[f'predicted_rate_{h}yr'] = pred_rate
-                    row[f'abs_error_{h}yr'] = abs(pred_rate - obs_rate)
-                    row[f'sq_error_{h}yr'] = (pred_rate - obs_rate) ** 2
-
-                    # Per-group thresholded rate
-                    if group_thresholds is not None:
-                        col_idx = ei * n_horizons + hi
-                        g_thresh = group_thresholds.get(gval, {})
-                        thr = g_thresh.get(col_idx, 0.5)
-                        thr_rate = float((group_data[pred_col] >= thr).mean())
-                        row[f'predicted_rate_thr_{h}yr'] = thr_rate
-                        row[f'abs_error_thr_{h}yr'] = abs(thr_rate - obs_rate)
-                        row[f'sq_error_thr_{h}yr'] = (thr_rate - obs_rate) ** 2
-
-            group_rows.append(row)
-
-        if not group_rows:
-            results[event] = {'group_df': pd.DataFrame(), 'summary': {}}
-            continue
-
-        event_group_df = pd.DataFrame(group_rows)
-
-        # Compute summary RMSE/MAE
-        summary = {'groups': len(event_group_df), 'min_group_size': min_group_size}
-        counts = event_group_df['count'].values
-        total = counts.sum()
-
-        for h in horizons:
-            ae_col = f'abs_error_{h}yr'
-            se_col = f'sq_error_{h}yr'
-            if ae_col not in event_group_df.columns:
-                continue
-            ae = event_group_df[ae_col].values
-            se = event_group_df[se_col].values
-            weights = counts / total
-
-            summary[f'mae_weighted_{h}yr'] = float(np.average(ae, weights=weights))
-            summary[f'mae_unweighted_{h}yr'] = float(ae.mean())
-            summary[f'rmse_weighted_{h}yr'] = float(np.sqrt(np.average(se, weights=weights)))
-            summary[f'rmse_unweighted_{h}yr'] = float(np.sqrt(se.mean()))
-
-            # Thresholded summary
-            ae_thr_col = f'abs_error_thr_{h}yr'
-            se_thr_col = f'sq_error_thr_{h}yr'
-            if ae_thr_col in event_group_df.columns:
-                ae_t = event_group_df[ae_thr_col].values
-                se_t = event_group_df[se_thr_col].values
-                summary[f'mae_weighted_thr_{h}yr'] = float(np.average(ae_t, weights=weights))
-                summary[f'rmse_weighted_thr_{h}yr'] = float(np.sqrt(np.average(se_t, weights=weights)))
-
-        results[event] = {'group_df': event_group_df, 'summary': summary}
-
-        # Clean up temp columns
-        for h in horizons:
-            group_df.drop(columns=[f'pred_{h}yr', f'true_{h}yr'], errors='ignore', inplace=True)
-
-    return results
+from src.sequence.evaluation import evaluate_groups as _evaluate_groups
 
 
 def _run_hyperparameter_tuning(
@@ -1054,11 +965,18 @@ def _run_streaming_sequence_pipeline(
             'has_test_set': has_test,
         })
 
+        # Checkpoint config from YAML (if present)
+        ckpt_cfg = config.get('checkpoint', {}) if config else {}
+        ckpt_dir = ckpt_cfg.get('directory') if ckpt_cfg.get('enabled') else None
+        ckpt_period = ckpt_cfg.get('period', 5)
+
         result = estimator.fit(
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             vocabulary=vocabulary,
             lr_find_plot_path=os.path.join("checkpoints", "lr_finder.png"),
+            checkpoint_dir=ckpt_dir,
+            checkpoint_period=ckpt_period,
         )
 
         log_stage_complete("Model Training")
@@ -1128,10 +1046,12 @@ def _run_streaming_sequence_pipeline(
                     ap = h_metrics.get('ap', float('nan'))
                     f1 = h_metrics.get('f1', float('nan'))
                     brier = h_metrics.get('brier', float('nan'))
+                    ipcw_brier = h_metrics.get('ipcw_brier', float('nan'))
                     prev = h_metrics.get('prevalence', 0)
 
+                    ipcw_str = f"  IPCW_Brier={ipcw_brier:.4f}" if not np.isnan(ipcw_brier) else ""
                     print(f"  @{horizon_key}: AUC={auc:.4f}  AP={ap:.4f}  "
-                          f"F1={f1:.4f}  Brier={brier:.4f}  "
+                          f"F1={f1:.4f}  Brier={brier:.4f}{ipcw_str}  "
                           f"prevalence={prev:.3%}")
 
                     if not np.isnan(auc):
@@ -1142,6 +1062,8 @@ def _run_streaming_sequence_pipeline(
                         mlflow.log_metric(f"{event}_{horizon_key}_f1", f1)
                     if not np.isnan(brier):
                         mlflow.log_metric(f"{event}_{horizon_key}_brier", brier)
+                    if not np.isnan(ipcw_brier):
+                        mlflow.log_metric(f"{event}_{horizon_key}_ipcw_brier", ipcw_brier)
 
             agg = metrics['aggregate']
             print(f"\n  Aggregate: mean_AUC={agg['mean_auc']:.4f}, "
@@ -1728,11 +1650,18 @@ def _run_rolling_window_pipeline(
             'test_persons': len(test_dataset),
         })
 
+        # Checkpoint config from YAML (if present)
+        ckpt_cfg = config.get('checkpoint', {}) if config else {}
+        ckpt_dir = ckpt_cfg.get('directory') if ckpt_cfg.get('enabled') else None
+        ckpt_period = ckpt_cfg.get('period', 5)
+
         result = estimator.fit(
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             vocabulary=vocabulary,
             lr_find_plot_path=os.path.join("checkpoints", "lr_finder_rolling.png"),
+            checkpoint_dir=ckpt_dir,
+            checkpoint_period=ckpt_period,
         )
 
         log_stage_complete("Model Training")
@@ -1800,9 +1729,11 @@ def _run_rolling_window_pipeline(
                 ap = h_metrics.get('ap', float('nan'))
                 f1 = h_metrics.get('f1', float('nan'))
                 brier = h_metrics.get('brier', float('nan'))
+                ipcw_brier = h_metrics.get('ipcw_brier', float('nan'))
                 prev = h_metrics.get('prevalence', 0)
+                ipcw_str = f"  IPCW_Brier={ipcw_brier:.4f}" if not np.isnan(ipcw_brier) else ""
                 print(f"  @{horizon_key}: AUC={auc:.4f}  AP={ap:.4f}  "
-                      f"F1={f1:.4f}  Brier={brier:.4f}  "
+                      f"F1={f1:.4f}  Brier={brier:.4f}{ipcw_str}  "
                       f"prevalence={prev:.3%}")
                 if not np.isnan(auc):
                     mlflow.log_metric(f"{event}_{horizon_key}_auc", auc)
@@ -1810,6 +1741,8 @@ def _run_rolling_window_pipeline(
                     mlflow.log_metric(f"{event}_{horizon_key}_ap", ap)
                 if not np.isnan(f1):
                     mlflow.log_metric(f"{event}_{horizon_key}_f1", f1)
+                if not np.isnan(ipcw_brier):
+                    mlflow.log_metric(f"{event}_{horizon_key}_ipcw_brier", ipcw_brier)
 
         agg = metrics['aggregate']
         print(f"\n  Aggregate: mean_AUC={agg['mean_auc']:.4f}, "
@@ -1928,6 +1861,72 @@ def _run_rolling_window_pipeline(
                 print(f"  Prediction intervals FAILED: {e}")
                 import traceback; traceback.print_exc()
             log_stage_complete("Prediction Intervals")
+
+        # ================================================================
+        # Group-level evaluation (age_group, refnis)
+        # ================================================================
+        log_stage_start("Group-Level Evaluation")
+        group_cols = []
+        for col_name in ['gender', 'age_group', 'refnis']:
+            if col_name in pq.ParquetDataset(output_path).schema.names:
+                group_cols.append(col_name)
+
+        group_eval_results = {}
+        if group_cols:
+            print(f"\n  Loading group features ({', '.join(group_cols)}) from parquet...")
+            group_features_df = _load_group_features_streaming(
+                parquet_path=output_path,
+                sids=sids,
+                cutoff_year=test_cutoff,
+                group_cols=group_cols,
+            )
+            print(f"  Loaded features for {len(group_features_df):,} persons")
+
+            # Per-group threshold calibration
+            g_thresholds = None
+            if 'refnis' in group_cols:
+                print(f"  Calibrating per-refnis thresholds on test set...")
+                g_thresholds = estimator.calibrate_group_thresholds(
+                    dataset=test_dataset,
+                    group_series=group_features_df['refnis'].values,
+                    min_group_size=100,
+                )
+                print(f"  Per-group thresholds calibrated for {len(g_thresholds)} groups")
+
+            group_eval_results = _evaluate_groups(
+                group_df=group_features_df,
+                all_predictions=all_predictions,
+                y_true=y_true,
+                events=events,
+                horizons=horizons,
+                group_cols=group_cols,
+                min_group_size=100,
+                group_thresholds=g_thresholds,
+            )
+
+            print("\n" + "=" * 60)
+            print("GROUP-LEVEL EVALUATION")
+            print("=" * 60)
+
+            for event, eres in group_eval_results.items():
+                summary = eres.get('summary', {})
+                if not summary:
+                    continue
+                print(f"\n--- {event} ---")
+                for h in horizons:
+                    rmse_w = summary.get(f'rmse_weighted_{h}yr')
+                    mae_w = summary.get(f'mae_weighted_{h}yr')
+                    if rmse_w is not None:
+                        print(f"  @{h}yr: RMSE_w={rmse_w:.4f}  MAE_w={mae_w:.4f}")
+                        mlflow.log_metric(f"grp_{event}_rmse_w_{h}yr", rmse_w)
+                        mlflow.log_metric(f"grp_{event}_mae_w_{h}yr", mae_w)
+
+            del group_features_df
+            gc.collect()
+        else:
+            print("  No group columns found in parquet - skipping group evaluation")
+
+        log_stage_complete("Group-Level Evaluation")
 
         # ================================================================
         # Per-window evaluation (stability analysis)
@@ -2484,11 +2483,18 @@ def main_sequence(
             'val_persons': len(val_dataset),
         })
 
+        # Checkpoint config from YAML (if present)
+        ckpt_cfg = config.get('checkpoint', {}) if config else {}
+        ckpt_dir = ckpt_cfg.get('directory') if ckpt_cfg.get('enabled') else None
+        ckpt_period = ckpt_cfg.get('period', 5)
+
         result = estimator.fit(
             train_dataset=train_dataset,
             eval_dataset=val_dataset,
             vocabulary=vocabulary,
             lr_find_plot_path=os.path.join("checkpoints", "lr_finder.png"),
+            checkpoint_dir=ckpt_dir,
+            checkpoint_period=ckpt_period,
         )
 
         log_stage_complete("Model Training")
@@ -2587,10 +2593,12 @@ def main_sequence(
                 ap = h_metrics.get('ap', float('nan'))
                 f1 = h_metrics.get('f1', float('nan'))
                 brier = h_metrics.get('brier', float('nan'))
+                ipcw_brier = h_metrics.get('ipcw_brier', float('nan'))
                 prev = h_metrics.get('prevalence', 0)
 
+                ipcw_str = f"  IPCW_Brier={ipcw_brier:.4f}" if not np.isnan(ipcw_brier) else ""
                 print(f"  @{horizon_key}: AUC={auc:.4f}  AP={ap:.4f}  "
-                      f"F1={f1:.4f}  Brier={brier:.4f}  "
+                      f"F1={f1:.4f}  Brier={brier:.4f}{ipcw_str}  "
                       f"prevalence={prev:.3%}")
 
                 if not np.isnan(auc):
@@ -2601,6 +2609,8 @@ def main_sequence(
                     mlflow.log_metric(f"{event}_{horizon_key}_f1", f1)
                 if not np.isnan(brier):
                     mlflow.log_metric(f"{event}_{horizon_key}_brier", brier)
+                if not np.isnan(ipcw_brier):
+                    mlflow.log_metric(f"{event}_{horizon_key}_ipcw_brier", ipcw_brier)
 
         agg = metrics['aggregate']
         print(f"\n  Aggregate: mean_AUC={agg['mean_auc']:.4f}, "

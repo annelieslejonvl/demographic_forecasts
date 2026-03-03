@@ -640,3 +640,120 @@ def create_survival_labels_chunked(
         print(f"    {event_col}: _duration + _event_observed")
 
     return output_path
+
+
+def create_rolling_survival_dataset(
+    parquet_path,
+    cutoff_year,
+    event_cols,
+    max_horizon=5,
+    id_col='sid',
+    time_col='year',
+    labels_only=False,
+):
+    """
+    Create a survival dataset for a single rolling window cutoff.
+
+    For each person present at year=cutoff_year:
+    - Features come from the cutoff_year row (no future leakage)
+    - Survival labels are computed from years in (cutoff_year, cutoff_year + max_horizon]
+
+    Args:
+        parquet_path: Path to processed features parquet directory
+        cutoff_year: The cutoff year (features come from this year)
+        event_cols: List of event column names
+        max_horizon: Maximum future horizon in years
+        id_col: Individual ID column
+        time_col: Time column
+        labels_only: If True, only load id/time/event columns (no features).
+                     Returns a lightweight DataFrame with just survival labels.
+
+    Returns:
+        DataFrame with one row per person at cutoff_year, containing
+        all feature columns (unless labels_only) plus {event}_duration
+        and {event}_event_observed for each event, and a 'cutoff_year' column.
+    """
+    import gc
+
+    # Load data for persons at the cutoff year
+    read_kwargs = dict(filters=[(time_col, '==', cutoff_year)])
+    if labels_only:
+        # Only load columns needed for survival label computation (saves ~8GB)
+        read_kwargs['columns'] = [id_col, time_col] + [e for e in event_cols]
+    cutoff_df = pd.read_parquet(parquet_path, **read_kwargs)
+    if len(cutoff_df) == 0:
+        print(f"    WARNING: No data for cutoff year {cutoff_year}")
+        return cutoff_df
+
+    cutoff_sids = cutoff_df[id_col].values
+
+    # Load slim future data: only (sid, year, event_cols) for the future window
+    future_years_min = cutoff_year + 1
+    future_years_max = cutoff_year + max_horizon
+    slim_cols = [id_col, time_col] + [e for e in event_cols if e in cutoff_df.columns]
+
+    future_df = pd.read_parquet(
+        parquet_path,
+        filters=[
+            (time_col, '>=', future_years_min),
+            (time_col, '<=', future_years_max),
+        ],
+        columns=slim_cols,
+    )
+
+    # Only keep persons that exist at the cutoff year
+    future_df = future_df[future_df[id_col].isin(set(cutoff_sids))]
+
+    # Last observable year per person in future window
+    last_observed = future_df.groupby(id_col)[time_col].max()
+
+    # Compute survival labels per event
+    for event_col in event_cols:
+        if event_col not in future_df.columns:
+            cutoff_df[f'{event_col}_duration'] = np.float32(max_horizon)
+            cutoff_df[f'{event_col}_event_observed'] = np.int32(0)
+            continue
+
+        duration_col = f'{event_col}_duration'
+        observed_col = f'{event_col}_event_observed'
+
+        # Find earliest future event year per person
+        event_rows = future_df[future_df[event_col].astype(int) == 1]
+        next_event_year = event_rows.groupby(id_col)[time_col].min()
+
+        # Build arrays aligned with cutoff_df
+        sid_series = pd.Series(cutoff_df[id_col].values, index=cutoff_df.index)
+
+        has_event = sid_series.isin(next_event_year.index)
+        event_year_mapped = sid_series.map(next_event_year)
+        last_obs_mapped = sid_series.map(last_observed)
+
+        duration = np.where(
+            has_event,
+            event_year_mapped.values - cutoff_year,
+            np.where(
+                last_obs_mapped.notna(),
+                last_obs_mapped.values - cutoff_year,
+                max_horizon,
+            ),
+        ).astype(np.float32)
+
+        event_observed = has_event.values.astype(np.int32)
+
+        # Floor duration at 0.5 for AFT compatibility
+        duration = np.where(duration <= 0, 0.5, duration)
+
+        cutoff_df[duration_col] = duration
+        cutoff_df[observed_col] = event_observed
+
+        n_events = event_observed.sum()
+        n_total = len(event_observed)
+        print(f"    {event_col}: {n_events:,} events, {n_total - n_events:,} censored "
+              f"({n_events / n_total:.1%} event rate)")
+
+    cutoff_df['cutoff_year'] = cutoff_year
+
+    del future_df
+    gc.collect()
+
+    return cutoff_df

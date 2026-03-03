@@ -4,13 +4,120 @@ Survival model training wrappers for XGBoost AFT and Cox.
 Provides train_survival_aft and train_survival_cox functions that
 follow the same patterns as the classifier training in run_test.py.
 """
+import os
+import json
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 import gc
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 
 from .data_prep import create_aft_labels, create_cox_labels
+
+
+class CheckpointCallback(xgb.callback.TrainingCallback):
+    """
+    XGBoost callback that saves model checkpoints during training.
+
+    Saves the booster to disk every `period` rounds. Keeps only the
+    latest `max_to_keep` checkpoints to avoid filling disk. Also writes
+    a small JSON metadata file alongside each checkpoint so training
+    can be resumed with full context.
+
+    Usage:
+        cb = CheckpointCallback("checkpoints/y_moved", period=50)
+        xgb.train(params, dtrain, callbacks=[cb])
+
+        # Resume from latest checkpoint:
+        model_path, meta = CheckpointCallback.latest_checkpoint("checkpoints/y_moved")
+        xgb.train(params, dtrain, xgb_model=model_path, ...)
+    """
+
+    def __init__(
+        self,
+        directory: str,
+        period: int = 50,
+        max_to_keep: int = 3,
+        event_name: str = "",
+    ):
+        self.directory = directory
+        self.period = period
+        self.max_to_keep = max_to_keep
+        self.event_name = event_name
+        self._saved: list = []
+
+    def after_iteration(self, model, epoch, evals_log):
+        """Save checkpoint every `period` rounds."""
+        round_num = epoch + 1  # epoch is 0-indexed
+        if round_num % self.period != 0:
+            return False  # continue training
+
+        os.makedirs(self.directory, exist_ok=True)
+
+        # Save model
+        model_path = os.path.join(self.directory, f"checkpoint_{round_num:05d}.json")
+        model.save_model(model_path)
+
+        # Save metadata
+        meta = {
+            "round": round_num,
+            "event_name": self.event_name,
+            "num_boosted_rounds": model.num_boosted_rounds(),
+        }
+        # Include eval metrics if available
+        if evals_log:
+            meta["evals"] = {
+                ds: {metric: vals[-1] for metric, vals in metrics.items()}
+                for ds, metrics in evals_log.items()
+            }
+        meta_path = os.path.join(self.directory, f"checkpoint_{round_num:05d}.meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        self._saved.append(round_num)
+
+        # Prune old checkpoints
+        while len(self._saved) > self.max_to_keep:
+            old_round = self._saved.pop(0)
+            for suffix in [".json", ".meta.json"]:
+                old_path = os.path.join(self.directory, f"checkpoint_{old_round:05d}{suffix}")
+                try:
+                    os.unlink(old_path)
+                except OSError:
+                    pass
+
+        return False  # continue training
+
+    @staticmethod
+    def latest_checkpoint(directory: str) -> Optional[tuple]:
+        """
+        Find the latest checkpoint in a directory.
+
+        Returns:
+            (model_path, meta_dict) or None if no checkpoint found.
+        """
+        if not os.path.isdir(directory):
+            return None
+
+        checkpoints = sorted(
+            p for p in os.listdir(directory)
+            if p.startswith("checkpoint_") and p.endswith(".json")
+            and not p.endswith(".meta.json")
+        )
+        if not checkpoints:
+            return None
+
+        latest = checkpoints[-1]
+        model_path = os.path.join(directory, latest)
+        meta_path = model_path.replace(".json", ".meta.json")
+
+        meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+
+        return model_path, meta
 
 
 def _get_default_aft_params():
@@ -62,6 +169,10 @@ def train_survival_aft(
     n_estimators=500,
     early_stopping_rounds=30,
     verbose_eval=25,
+    checkpoint_dir=None,
+    checkpoint_period=50,
+    event_name='',
+    resume_from=None,
 ):
     """
     Train XGBoost Accelerated Failure Time (AFT) model.
@@ -77,6 +188,10 @@ def train_survival_aft(
         n_estimators: Number of boosting rounds
         early_stopping_rounds: Early stopping patience
         verbose_eval: Verbosity interval
+        checkpoint_dir: Directory to save checkpoints (None to disable)
+        checkpoint_period: Save checkpoint every N rounds
+        event_name: Event name for checkpoint metadata
+        resume_from: Path to model checkpoint to resume from
 
     Returns:
         Trained xgb.Booster model
@@ -101,6 +216,15 @@ def train_survival_aft(
         dtest.set_float_info('label_upper_bound', y_upper_test)
         evals.append((dtest, 'test'))
 
+    # Build callbacks
+    callbacks = []
+    if checkpoint_dir:
+        callbacks.append(CheckpointCallback(
+            directory=checkpoint_dir,
+            period=checkpoint_period,
+            event_name=event_name,
+        ))
+
     # Train
     model = xgb.train(
         params,
@@ -109,6 +233,8 @@ def train_survival_aft(
         evals=evals,
         early_stopping_rounds=early_stopping_rounds,
         verbose_eval=verbose_eval,
+        xgb_model=resume_from,
+        callbacks=callbacks or None,
     )
 
     return model
@@ -125,6 +251,10 @@ def train_survival_cox(
     n_estimators=500,
     early_stopping_rounds=30,
     verbose_eval=25,
+    checkpoint_dir=None,
+    checkpoint_period=50,
+    event_name='',
+    resume_from=None,
 ):
     """
     Train XGBoost Cox Proportional Hazards model.
@@ -140,6 +270,10 @@ def train_survival_cox(
         n_estimators: Number of boosting rounds
         early_stopping_rounds: Early stopping patience
         verbose_eval: Verbosity interval
+        checkpoint_dir: Directory to save checkpoints (None to disable)
+        checkpoint_period: Save checkpoint every N rounds
+        event_name: Event name for checkpoint metadata
+        resume_from: Path to model checkpoint to resume from
 
     Returns:
         Trained xgb.Booster model
@@ -159,6 +293,15 @@ def train_survival_cox(
         dtest = xgb.DMatrix(X_test, label=y_test)
         evals.append((dtest, 'test'))
 
+    # Build callbacks
+    callbacks = []
+    if checkpoint_dir:
+        callbacks.append(CheckpointCallback(
+            directory=checkpoint_dir,
+            period=checkpoint_period,
+            event_name=event_name,
+        ))
+
     model = xgb.train(
         params,
         dtrain,
@@ -166,6 +309,8 @@ def train_survival_cox(
         evals=evals,
         early_stopping_rounds=early_stopping_rounds,
         verbose_eval=verbose_eval,
+        xgb_model=resume_from,
+        callbacks=callbacks or None,
     )
 
     return model
@@ -180,6 +325,10 @@ def train_survival_model(
     event_test=None,
     config=None,
     model_type='aft',
+    checkpoint_dir=None,
+    checkpoint_period=50,
+    event_name='',
+    resume_from=None,
 ):
     """
     Unified training function that dispatches to AFT or Cox.
@@ -189,6 +338,10 @@ def train_survival_model(
         X_test, duration_test, event_test: Optional test data
         config: Model configuration dict (from YAML)
         model_type: 'aft' or 'cox'
+        checkpoint_dir: Directory to save checkpoints (None to disable)
+        checkpoint_period: Save checkpoint every N rounds
+        event_name: Event name for checkpoint metadata
+        resume_from: Path to model checkpoint to resume from
 
     Returns:
         Trained xgb.Booster model
@@ -205,6 +358,13 @@ def train_survival_model(
         early_stopping_rounds = 30
         verbose_eval = 25
 
+    ckpt_kwargs = dict(
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_period=checkpoint_period,
+        event_name=event_name,
+        resume_from=resume_from,
+    )
+
     if model_type == 'cox':
         return train_survival_cox(
             X_train, duration_train, event_train,
@@ -213,6 +373,7 @@ def train_survival_model(
             n_estimators=n_estimators,
             early_stopping_rounds=early_stopping_rounds,
             verbose_eval=verbose_eval,
+            **ckpt_kwargs,
         )
     else:
         return train_survival_aft(
@@ -222,6 +383,7 @@ def train_survival_model(
             n_estimators=n_estimators,
             early_stopping_rounds=early_stopping_rounds,
             verbose_eval=verbose_eval,
+            **ckpt_kwargs,
         )
 
 
@@ -232,6 +394,8 @@ def train_all_events(
     event_cols,
     config=None,
     model_type='aft',
+    checkpoint_dir=None,
+    checkpoint_period=50,
 ):
     """
     Train one survival model per event type.
@@ -243,6 +407,8 @@ def train_all_events(
         event_cols: List of event column names (e.g., ['y_moved', 'birth1_event', ...])
         config: Model configuration dict
         model_type: 'aft' or 'cox'
+        checkpoint_dir: Base directory for checkpoints (subdir per event)
+        checkpoint_period: Save checkpoint every N rounds
 
     Returns:
         Dict mapping event_col → trained model
@@ -270,11 +436,16 @@ def train_all_events(
         print(f"  Train: {n_events:,} events, {n_censored:,} censored "
               f"({n_events / len(event_train):.1%} event rate)")
 
+        event_ckpt_dir = os.path.join(checkpoint_dir, event_col) if checkpoint_dir else None
+
         model = train_survival_model(
             X_train, duration_train, event_train,
             X_test, duration_test, event_test,
             config=config,
             model_type=model_type,
+            checkpoint_dir=event_ckpt_dir,
+            checkpoint_period=checkpoint_period,
+            event_name=event_col,
         )
 
         models[event_col] = model
@@ -294,6 +465,8 @@ def train_incremental_survival(
     config=None,
     model_type='aft',
     target_batch_rows=None,
+    checkpoint_dir=None,
+    checkpoint_period=50,
 ):
     """
     Train a survival model incrementally on large datasets.
@@ -309,6 +482,8 @@ def train_incremental_survival(
         config: Model configuration
         model_type: 'aft' or 'cox'
         target_batch_rows: Target rows per batch
+        checkpoint_dir: Directory to save checkpoints (None to disable)
+        checkpoint_period: Save checkpoint every N rounds
 
     Returns:
         Trained xgb.Booster model
@@ -386,6 +561,15 @@ def train_incremental_survival(
             dtrain = xgb.DMatrix(X_batch, label=y_batch_labels)
 
         rounds = 50 if model is None else 20
+
+        callbacks = []
+        if checkpoint_dir:
+            callbacks.append(CheckpointCallback(
+                directory=checkpoint_dir,
+                period=checkpoint_period,
+                event_name=event_col,
+            ))
+
         model = xgb.train(
             params,
             dtrain,
@@ -393,6 +577,7 @@ def train_incremental_survival(
             xgb_model=model,
             evals=[(dtest, 'test')],
             verbose_eval=0,
+            callbacks=callbacks or None,
         )
 
         print(f"{len(batch):,} rows, {model.num_boosted_rounds()} trees")

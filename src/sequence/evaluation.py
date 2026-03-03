@@ -57,12 +57,17 @@ def evaluate_sequence_predictions(
         f1_score,
         brier_score_loss,
     )
+    from src.survival.evaluation import brier_score_at_horizons
 
     results = {}
 
     for event in events:
         if event not in all_predictions:
             continue
+
+        # Collect all horizon labels + probs for IPCW Brier (computed per-event)
+        horizon_labels = {}  # horizon -> y_true array
+        horizon_probs = {}   # horizon -> y_prob array
 
         event_results = {}
         for horizon in horizons:
@@ -93,6 +98,9 @@ def evaluate_sequence_predictions(
                 )
                 continue
 
+            horizon_labels[horizon] = y_true
+            horizon_probs[horizon] = y_prob
+
             metrics = {}
             n_pos = int(y_true.sum())
             n_neg = len(y_true) - n_pos
@@ -118,6 +126,22 @@ def evaluate_sequence_predictions(
             metrics['prevalence'] = n_pos / len(y_true) if len(y_true) > 0 else 0
 
             event_results[f'{horizon}yr'] = metrics
+
+        # Compute IPCW Brier scores using duration/event from binary targets
+        if horizon_labels and horizon_probs:
+            # Stack binary targets into (n_samples, n_horizons) for _targets_to_survival
+            sorted_horizons = sorted(horizon_labels.keys())
+            stacked = np.column_stack([horizon_labels[h] for h in sorted_horizons])
+            duration, event_ind = _targets_to_survival(stacked, sorted_horizons)
+            ipcw_brier = brier_score_at_horizons(
+                duration, event_ind,
+                horizon_probs, sorted_horizons,
+                duration_train=duration, event_train=event_ind,
+            )
+            for horizon in sorted_horizons:
+                hkey = f'{horizon}yr'
+                if hkey in event_results:
+                    event_results[hkey]['ipcw_brier'] = ipcw_brier.get(horizon, float('nan'))
 
         results[event] = event_results
 
@@ -1775,3 +1799,120 @@ def evaluate_grouped_metrics(
         'summary': summary,
         'lm_summary': lm_summary,
     }
+
+
+def evaluate_groups(
+    group_df: pd.DataFrame,
+    all_predictions: Dict[str, Dict[str, np.ndarray]],
+    y_true: np.ndarray,
+    events: List[str],
+    horizons: List[int],
+    group_cols: List[str],
+    min_group_size: int = 100,
+    group_thresholds: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    """Compute group-level observed vs predicted rates per event-horizon.
+
+    Works with both sequence and survival pipelines — only requires
+    ``all_predictions`` in ``{event: {'prob_{h}yr': array}}`` format and
+    a stacked binary target matrix ``y_true`` of shape
+    ``(n_samples, n_events * n_horizons)``.
+
+    Returns dict with per-event group DataFrames and RMSE/MAE summaries.
+    If *group_thresholds* is provided (from ``calibrate_group_thresholds``),
+    also computes thresholded group rates for comparison.
+    """
+    n_horizons = len(horizons)
+    results = {}
+
+    for ei, event in enumerate(events):
+        if event not in all_predictions:
+            continue
+
+        for h in horizons:
+            prob_key = f'prob_{h}yr'
+            if prob_key not in all_predictions[event]:
+                continue
+            col_idx = ei * n_horizons + horizons.index(h)
+            group_df[f'pred_{h}yr'] = all_predictions[event][prob_key]
+            group_df[f'true_{h}yr'] = y_true[:, col_idx]
+
+        grouped = group_df.groupby(group_cols, dropna=False)
+        group_rows = []
+        for group_key, group_data in grouped:
+            if len(group_data) < min_group_size:
+                continue
+            row = {}
+            if len(group_cols) == 1:
+                row[group_cols[0]] = group_key
+                gval = group_key
+            else:
+                for i, col in enumerate(group_cols):
+                    row[col] = group_key[i]
+                gval = group_key
+            row['count'] = len(group_data)
+
+            for hi, h in enumerate(horizons):
+                pred_col = f'pred_{h}yr'
+                true_col = f'true_{h}yr'
+                if pred_col in group_data.columns:
+                    obs_rate = float(group_data[true_col].mean())
+                    pred_rate = float(group_data[pred_col].mean())
+                    row[f'observed_rate_{h}yr'] = obs_rate
+                    row[f'predicted_rate_{h}yr'] = pred_rate
+                    row[f'abs_error_{h}yr'] = abs(pred_rate - obs_rate)
+                    row[f'sq_error_{h}yr'] = (pred_rate - obs_rate) ** 2
+
+                    # Per-group thresholded rate
+                    if group_thresholds is not None:
+                        col_idx = ei * n_horizons + hi
+                        g_thresh = group_thresholds.get(gval, {})
+                        thr = g_thresh.get(col_idx, 0.5)
+                        thr_rate = float((group_data[pred_col] >= thr).mean())
+                        row[f'predicted_rate_thr_{h}yr'] = thr_rate
+                        row[f'abs_error_thr_{h}yr'] = abs(thr_rate - obs_rate)
+                        row[f'sq_error_thr_{h}yr'] = (thr_rate - obs_rate) ** 2
+
+            group_rows.append(row)
+
+        if not group_rows:
+            results[event] = {'group_df': pd.DataFrame(), 'summary': {}}
+            continue
+
+        event_group_df = pd.DataFrame(group_rows)
+
+        # Compute summary RMSE/MAE
+        summary = {'groups': len(event_group_df), 'min_group_size': min_group_size}
+        counts = event_group_df['count'].values
+        total = counts.sum()
+
+        for h in horizons:
+            ae_col = f'abs_error_{h}yr'
+            se_col = f'sq_error_{h}yr'
+            if ae_col not in event_group_df.columns:
+                continue
+            ae = event_group_df[ae_col].values
+            se = event_group_df[se_col].values
+            weights = counts / total
+
+            summary[f'mae_weighted_{h}yr'] = float(np.average(ae, weights=weights))
+            summary[f'mae_unweighted_{h}yr'] = float(ae.mean())
+            summary[f'rmse_weighted_{h}yr'] = float(np.sqrt(np.average(se, weights=weights)))
+            summary[f'rmse_unweighted_{h}yr'] = float(np.sqrt(se.mean()))
+
+            # Thresholded summary
+            ae_thr_col = f'abs_error_thr_{h}yr'
+            se_thr_col = f'sq_error_thr_{h}yr'
+            if ae_thr_col in event_group_df.columns:
+                ae_t = event_group_df[ae_thr_col].values
+                se_t = event_group_df[se_thr_col].values
+                summary[f'mae_weighted_thr_{h}yr'] = float(np.average(ae_t, weights=weights))
+                summary[f'rmse_weighted_thr_{h}yr'] = float(np.sqrt(np.average(se_t, weights=weights)))
+
+        results[event] = {'group_df': event_group_df, 'summary': summary}
+
+        # Clean up temp columns
+        for h in horizons:
+            group_df.drop(columns=[f'pred_{h}yr', f'true_{h}yr'], errors='ignore', inplace=True)
+
+    return results

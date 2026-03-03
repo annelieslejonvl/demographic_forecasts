@@ -4,6 +4,7 @@ PyTorch sequence model estimator integrating with the BaseEstimator interface.
 Wraps SequenceModel (LSTM/GRU/Transformer) into the BackendFactory pattern
 used by the rest of the project.
 """
+import json
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Iterable
@@ -721,6 +722,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
         device: Optional[str] = None,
         epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
         initial_state_dict: Optional[Dict[str, torch.Tensor]] = None,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_period: int = 5,
+        resume_from_checkpoint: Optional[str] = None,
         **kwargs,
     ) -> TrainResult:
         """
@@ -732,6 +736,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
             vocabulary: LifeEventVocabulary (required for model construction).
             device: Override device selection.
             initial_state_dict: Pre-trained weights to warm-start from (federated learning).
+            checkpoint_dir: Directory for epoch checkpoints (None to disable).
+            checkpoint_period: Save checkpoint every N epochs (default 5).
+            resume_from_checkpoint: Path to checkpoint directory to resume from.
             X, y, sample_weight, eval_set: For BaseEstimator compatibility (unused).
         """
         if train_dataset is None:
@@ -963,6 +970,29 @@ class PyTorchSequenceEstimator(BaseEstimator):
         best_model_state = None
         patience_counter = 0
         history = {'train_loss': [], 'val_loss': []}
+        start_epoch = 0
+
+        # Resume from checkpoint if provided
+        if resume_from_checkpoint:
+            ckpt_file = resume_from_checkpoint
+            if os.path.isdir(ckpt_file):
+                ckpt_file = self.latest_training_checkpoint(ckpt_file)
+            if ckpt_file and os.path.isfile(ckpt_file):
+                ckpt = torch.load(ckpt_file, map_location=device, weights_only=False)
+                self.model_.load_state_dict(ckpt['model_state_dict'])
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                scaler.load_state_dict(ckpt['scaler_state_dict'])
+                best_val_loss = ckpt.get('best_val_loss', float('inf'))
+                best_composite = ckpt.get('best_composite', -float('inf'))
+                patience_counter = ckpt.get('patience_counter', 0)
+                history = ckpt.get('history', history)
+                start_epoch = ckpt['epoch'] + 1
+                logger.info(f"Resumed training from checkpoint epoch {ckpt['epoch']} ({ckpt_file})")
+                print(f"  Resumed from checkpoint epoch {ckpt['epoch']}")
+                del ckpt
+            else:
+                logger.warning(f"No checkpoint found at {resume_from_checkpoint}, starting fresh")
 
         # Early stopping metric: 'composite' (0.4*AP + 0.3*F1 + 0.3*AUC),
         # 'val_loss', 'val_mean_auc', 'val_mean_ap', 'val_mean_f1'
@@ -971,7 +1001,7 @@ class PyTorchSequenceEstimator(BaseEstimator):
         es_value = float('nan')
         logger.info(f"Early stopping metric: {es_metric} ({'higher' if es_higher_is_better else 'lower'} is better)")
 
-        epoch_iter = _progress_iter(range(int(self.epochs)), desc="Epochs", total=int(self.epochs))
+        epoch_iter = _progress_iter(range(start_epoch, int(self.epochs)), desc="Epochs", total=int(self.epochs) - start_epoch)
         for epoch in epoch_iter:
             # Training
             self.model_.train()
@@ -1064,11 +1094,29 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 val_targets = torch.cat(all_val_targets).numpy()
                 del all_val_probs, all_val_targets
 
-                from sklearn.metrics import f1_score
+                from sklearn.metrics import f1_score, brier_score_loss
+                from src.sequence.evaluation import _targets_to_survival
+                from src.survival.evaluation import brier_score_at_horizons
                 epoch_aucs = []
                 epoch_aps = []
                 epoch_f1s = []
+                epoch_briers = []
+                epoch_ipcw_briers = []
                 for ei, event in enumerate(self.events):
+                    # Compute IPCW Brier for this event (all horizons at once)
+                    event_cols = [ei * n_horizons + hi for hi in range(n_horizons)]
+                    event_targets = val_targets[:, event_cols]
+                    duration, event_ind = _targets_to_survival(event_targets, list(self.horizons))
+                    proba_dict = {
+                        h: val_probs[:, ei * n_horizons + hi]
+                        for hi, h in enumerate(self.horizons)
+                    }
+                    ipcw_bs = brier_score_at_horizons(
+                        duration, event_ind,
+                        proba_dict, list(self.horizons),
+                        duration_train=duration, event_train=event_ind,
+                    )
+
                     for hi, horizon in enumerate(self.horizons):
                         col = ei * n_horizons + hi
                         y_t = val_targets[:, col]
@@ -1077,6 +1125,8 @@ class PyTorchSequenceEstimator(BaseEstimator):
                         if n_pos > 0 and n_pos < len(y_t):
                             auc = float(roc_auc_score(y_t, y_p))
                             ap = float(average_precision_score(y_t, y_p))
+                            brier = float(brier_score_loss(y_t, y_p))
+                            ipcw_brier_val = ipcw_bs.get(horizon, float('nan'))
                             # Find optimal F1 threshold — fixed 0.5 is wrong
                             # for rare events where probabilities are low
                             base_rate = n_pos / len(y_t)
@@ -1095,16 +1145,26 @@ class PyTorchSequenceEstimator(BaseEstimator):
                             epoch_aucs.append(auc)
                             epoch_aps.append(ap)
                             epoch_f1s.append(f1)
+                            epoch_briers.append(brier)
+                            if not np.isnan(ipcw_brier_val):
+                                epoch_ipcw_briers.append(ipcw_brier_val)
                             mlflow.log_metric(f"val_auc_{event}_{horizon}yr", auc, step=epoch)
                             mlflow.log_metric(f"val_ap_{event}_{horizon}yr", ap, step=epoch)
                             mlflow.log_metric(f"val_f1_{event}_{horizon}yr", f1, step=epoch)
+                            mlflow.log_metric(f"val_brier_{event}_{horizon}yr", brier, step=epoch)
+                            if not np.isnan(ipcw_brier_val):
+                                mlflow.log_metric(f"val_ipcw_brier_{event}_{horizon}yr", ipcw_brier_val, step=epoch)
 
                 mean_auc = float(np.mean(epoch_aucs)) if epoch_aucs else float('nan')
                 mean_ap = float(np.mean(epoch_aps)) if epoch_aps else float('nan')
                 mean_f1 = float(np.mean(epoch_f1s)) if epoch_f1s else float('nan')
+                mean_brier = float(np.mean(epoch_briers)) if epoch_briers else float('nan')
+                mean_ipcw_brier = float(np.mean(epoch_ipcw_briers)) if epoch_ipcw_briers else float('nan')
                 mlflow.log_metric("val_mean_auc", mean_auc, step=epoch)
                 mlflow.log_metric("val_mean_ap", mean_ap, step=epoch)
                 mlflow.log_metric("val_mean_f1", mean_f1, step=epoch)
+                mlflow.log_metric("val_mean_brier", mean_brier, step=epoch)
+                mlflow.log_metric("val_mean_ipcw_brier", mean_ipcw_brier, step=epoch)
                 # AFT-native metrics per epoch (C-index, CRPS, TD-AUC)
                 # Uses fast sampled C-index (O(k) instead of O(n²))
                 aft_metrics_str = ""
@@ -1281,7 +1341,9 @@ class PyTorchSequenceEstimator(BaseEstimator):
 
                 del val_probs, val_targets
 
-                val_metrics_str = f", mean_AUC: {mean_auc:.4f}, mean_AP: {mean_ap:.4f}, mean_F1: {mean_f1:.4f}{aft_metrics_str}{lm_metrics_str}"
+                brier_str = f", mean_Brier: {mean_brier:.4f}" if not np.isnan(mean_brier) else ""
+                ipcw_brier_str = f", mean_IPCW_Brier: {mean_ipcw_brier:.4f}" if not np.isnan(mean_ipcw_brier) else ""
+                val_metrics_str = f", mean_AUC: {mean_auc:.4f}, mean_AP: {mean_ap:.4f}, mean_F1: {mean_f1:.4f}{brier_str}{ipcw_brier_str}{aft_metrics_str}{lm_metrics_str}"
 
                 # Epoch callback (e.g. for Optuna pruning)
                 if epoch_callback is not None:
@@ -1291,6 +1353,8 @@ class PyTorchSequenceEstimator(BaseEstimator):
                         'val_mean_auc': mean_auc,
                         'val_mean_ap': mean_ap,
                         'val_mean_f1': mean_f1,
+                        'val_mean_brier': mean_brier,
+                        'val_mean_ipcw_brier': mean_ipcw_brier,
                         'val_mean_c_index': mean_c,
                         'val_mean_td_auc': mean_td,
                         'val_mean_crps': mean_crps,
@@ -1370,6 +1434,20 @@ class PyTorchSequenceEstimator(BaseEstimator):
             es_str = f", es({es_metric}): {es_value:.4f} [pat={patience_counter}]" if val_loader is not None and not np.isnan(es_value) else ""
             logger.info(f"Epoch {epoch}: train_loss: {train_loss:.4f}{val_str}{val_metrics_str}{es_str}")
             print(f"  Epoch {epoch}: train_loss={train_loss:.4f}{val_str}{val_metrics_str}{es_str}")
+
+            # Save training checkpoint
+            if checkpoint_dir and (epoch + 1) % checkpoint_period == 0:
+                self._save_training_checkpoint(
+                    directory=checkpoint_dir,
+                    epoch=epoch,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    best_val_loss=best_val_loss,
+                    best_composite=best_composite,
+                    patience_counter=patience_counter,
+                    history=history,
+                )
 
         # Log learned event weights if using Kendall weighting
         if isinstance(loss_fn, LearnedWeightedLoss):
@@ -2087,6 +2165,92 @@ class PyTorchSequenceEstimator(BaseEstimator):
             result[event] = event_probs
 
         return result
+
+    def _save_training_checkpoint(
+        self,
+        directory: str,
+        epoch: int,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        scaler: torch.amp.GradScaler,
+        best_val_loss: float,
+        best_composite: float,
+        patience_counter: int,
+        history: dict,
+        max_to_keep: int = 3,
+    ) -> str:
+        """Save a training checkpoint for resuming interrupted training."""
+        os.makedirs(directory, exist_ok=True)
+
+        ckpt_name = f"epoch_{epoch:04d}"
+        ckpt_path = os.path.join(directory, f"{ckpt_name}.pt")
+
+        torch.save(
+            {
+                'epoch': epoch,
+                'model_state_dict': self.model_.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'best_val_loss': best_val_loss,
+                'best_composite': best_composite,
+                'patience_counter': patience_counter,
+                'history': history,
+            },
+            ckpt_path,
+        )
+
+        # Save metadata as JSON
+        meta = {
+            'epoch': epoch,
+            'best_val_loss': best_val_loss,
+            'best_composite': best_composite,
+            'patience_counter': patience_counter,
+            'train_loss': history['train_loss'][-1] if history['train_loss'] else None,
+            'val_loss': history['val_loss'][-1] if history['val_loss'] else None,
+        }
+        meta_path = os.path.join(directory, f"{ckpt_name}.meta.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+        # Prune old checkpoints
+        existing = sorted(
+            p for p in os.listdir(directory)
+            if p.startswith("epoch_") and p.endswith(".pt")
+        )
+        while len(existing) > max_to_keep:
+            old = existing.pop(0)
+            for suffix in ["", ".meta.json"]:
+                old_path = os.path.join(directory, old.replace(".pt", "") + suffix)
+                if suffix == "":
+                    old_path = os.path.join(directory, old)
+                try:
+                    os.unlink(old_path)
+                except OSError:
+                    pass
+
+        logger.info(f"Saved training checkpoint: {ckpt_path}")
+        return ckpt_path
+
+    @staticmethod
+    def latest_training_checkpoint(directory: str) -> Optional[str]:
+        """
+        Find the latest training checkpoint in a directory.
+
+        Returns:
+            Path to the .pt checkpoint file, or None if no checkpoint found.
+        """
+        if not os.path.isdir(directory):
+            return None
+
+        checkpoints = sorted(
+            p for p in os.listdir(directory)
+            if p.startswith("epoch_") and p.endswith(".pt")
+        )
+        if not checkpoints:
+            return None
+
+        return os.path.join(directory, checkpoints[-1])
 
     def save(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
