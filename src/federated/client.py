@@ -188,7 +188,9 @@ class FederatedClient:
 
     def train_round(self):
         """Run one training round using the package in incoming_dir."""
-        from ..sequence.dataset import CachedSequenceDataset, SequenceDataset
+        from ..sequence.dataset import (
+            CachedSequenceDataset, SequenceDataset, StreamingSequenceDataset,
+        )
         from ..sequence.estimator import PyTorchSequenceEstimator
         from ..sequence.vocabulary import LifeEventVocabulary
         import pandas as pd
@@ -261,49 +263,72 @@ class FederatedClient:
             initial_state_dict = protocol.import_weights(weights_path)
             print("  Loaded server weights for warm-start")
 
-        # 6. Build dataset
+        # 6. Build datasets
+        #    Pass 1 (lightweight): scan [id, year] to find valid persons
+        #    Pass 2 (val only): load full rows for sampled val persons
+        #    Train: StreamingSequenceDataset — no data loaded, streams on demand
         min_hist_year = cutoff_year - history_len
+        val_frac = self.sample_frac or 0.05  # default 5% for val
 
-        # If sampling, use SequenceDataset (on-the-fly tokenization) instead of CachedSequenceDataset
-        if self.sample_frac is not None:
-            print(f"  Using SequenceDataset with {self.sample_frac*100:.1f}% sampling (no cache)")
+        # --- Pass 1: lightweight scan for valid person IDs ---
+        print(f"  Pass 1: scanning person IDs (2 columns only)...")
+        import time as _time
+        _t0 = _time.time()
+        dataset_pq = pq.ParquetDataset(self.data_path)
+        history_ids: set = set()
+        future_ids: set = set()
+        n_rows_scanned = 0
 
-            # Load and filter data
-            print(f"  Loading data from {self.data_path}...")
-            dataset = pq.ParquetDataset(self.data_path)
+        for fi, fragment in enumerate(dataset_pq.fragments):
+            for batch in fragment.to_batches(
+                batch_size=PARQUET_CHUNK_SIZE, columns=[id_col, "year"]
+            ):
+                df_chunk = batch.to_pandas()
+                n_rows_scanned += len(df_chunk)
 
-            # Read year-by-year and filter to window
-            dfs = []
-            for fragment in dataset.fragments:
-                df_year = fragment.to_table().to_pandas()
-                # Filter to relevant years: history + horizon
-                year_mask = (df_year['year'] > min_hist_year) & (df_year['year'] <= cutoff_year + max_horizon)
-                df_filtered = df_year[year_mask].copy()
-                if len(df_filtered) > 0:
-                    # Sample each year
-                    df_sampled = df_filtered.sample(frac=self.sample_frac, random_state=42)
-                    dfs.append(df_sampled)
-                del df_year, df_filtered
+                hist_mask = (df_chunk["year"] > min_hist_year) & (df_chunk["year"] <= cutoff_year)
+                future_mask = (df_chunk["year"] > cutoff_year) & (df_chunk["year"] <= cutoff_year + max_horizon)
+                if hist_mask.any():
+                    history_ids.update(df_chunk.loc[hist_mask, id_col].unique().tolist())
+                if future_mask.any():
+                    future_ids.update(df_chunk.loc[future_mask, id_col].unique().tolist())
+                del df_chunk
 
-            df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-            del dfs
-            gc.collect()
-            print(f"  Loaded {len(df):,} rows (sampled)")
+            if (fi + 1) % 3 == 0:
+                elapsed = _time.time() - _t0
+                print(f"    Fragment {fi+1}: {n_rows_scanned:,} rows in {elapsed:.0f}s")
 
-            # Filter to valid persons (have both history and future)
-            persons_hist = set(df[df['year'] <= cutoff_year][id_col].unique())
-            persons_future = set(df[df['year'] > cutoff_year][id_col].unique())
-            valid_persons = persons_hist & persons_future
-            print(f"  Valid persons: {len(valid_persons):,}")
+        valid_persons = history_ids & future_ids
+        n_valid = len(valid_persons)
+        del history_ids, future_ids
+        elapsed = _time.time() - _t0
+        print(f"  Valid persons: {n_valid:,} ({n_rows_scanned:,} rows scanned in {elapsed:.0f}s)")
 
-            df_train = df[df[id_col].isin(valid_persons) & (df['year'] <= cutoff_year)].copy()
-            del df
-            gc.collect()
-            print(f"  Training data: {len(df_train):,} rows")
+        # Sample val persons
+        rng = np.random.RandomState(42)
+        n_val = max(1, int(n_valid * val_frac))
+        val_persons = set(rng.choice(list(valid_persons), n_val, replace=False))
+        print(f"  Val sample: {n_val:,} persons ({val_frac*100:.1f}%)")
 
-            # Build SequenceDataset
-            train_dataset = SequenceDataset(
-                df=df_train,
+        # --- Pass 2: load val persons using pyarrow dataset filter (fast) ---
+        print(f"  Pass 2: loading val data for {n_val:,} persons (pyarrow filter)...")
+        _t1 = _time.time()
+        import pyarrow.dataset as ds
+
+        val_list = list(val_persons)
+        val_filter = (
+            ds.field(id_col).isin(val_list)
+            & (ds.field("year") > min_hist_year)
+            & (ds.field("year") <= cutoff_year + max_horizon)
+        )
+        val_ds = ds.dataset(self.data_path, format='parquet')
+        df_val = val_ds.to_table(filter=val_filter).to_pandas()
+        elapsed2 = _time.time() - _t1
+        print(f"  Loaded {len(df_val):,} val rows in {elapsed2:.0f}s")
+
+        if len(df_val) > 0:
+            eval_dataset = SequenceDataset(
+                df=df_val,
                 vocabulary=vocabulary,
                 events=events,
                 horizons=horizons,
@@ -311,93 +336,212 @@ class FederatedClient:
                 use_numeric_features=use_numeric,
                 id_col=id_col,
             )
-            del df_train
+            del df_val
             gc.collect()
+            print(f"  Validation dataset: {len(eval_dataset):,} samples (in-memory)")
         else:
-            # Use cached dataset for full data
-            cache_path = os.path.join(
-                self.cache_dir, f"cut{cutoff_year}_h{history_len}.pt"
+            eval_dataset = None
+            del df_val
+            print(f"  No validation data available")
+
+        # --- Train dataset: no data loaded now, streams on demand ---
+        train_dataset = StreamingSequenceDataset(
+            parquet_path=self.data_path,
+            vocabulary=vocabulary,
+            max_seq_len=max_seq_len,
+            events=events,
+            horizons=horizons,
+            cutoff_year=cutoff_year,
+            id_col=id_col,
+            allowed_sids=valid_persons,
+            n_samples=n_valid,
+            min_history_year=min_hist_year,
+        )
+        total_elapsed = _time.time() - _t0
+        print(f"  Training: StreamingSequenceDataset ({n_valid:,} persons, online)")
+        print(f"  Data prep complete in {total_elapsed:.0f}s — starting training...")
+
+        del valid_persons, val_persons
+        gc.collect()
+
+        # 7. Validation-only mode: skip training, just evaluate pretrained model
+        if self.finetune_epochs is not None and self.finetune_epochs == 0:
+            if eval_dataset is None:
+                raise ValueError("Validation-only mode requires validation data")
+            train_metrics = self._validate_only(
+                config, vocabulary, eval_dataset, initial_state_dict,
+                cutoff_year, history_len, max_horizon, max_seq_len,
+                use_numeric, id_col,
             )
+        else:
+            # 7b. Train (online streaming) with offline validation
+            model_config = config.get("model", {})
+            estimator = PyTorchSequenceEstimator(model_config=model_config)
 
-            cache_exists = os.path.exists(cache_path) or os.path.isdir(
-                cache_path.replace(".pt", "_chunks")
-            )
-
-            if not cache_exists:
-                print(f"  Building dataset cache for cutoff={cutoff_year}...")
-                valid_persons = _collect_valid_persons_windowed(
-                    self.data_path, cutoff_year, min_hist_year, max_horizon,
-                    id_col=id_col
-                )
-                print(f"  Valid persons: {len(valid_persons):,}")
-            else:
-                valid_persons = None
-                print(f"  Reusing existing cache: {cache_path}")
-
-            train_dataset = CachedSequenceDataset(
-                parquet_path=self.data_path,
+            result = estimator.fit(
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
                 vocabulary=vocabulary,
-                max_seq_len=max_seq_len,
-                events=events,
-                horizons=horizons,
-                cutoff_year=cutoff_year,
-                id_col=id_col,
-                allowed_sids=valid_persons,
-                cache_path=cache_path,
-                min_history_year=min_hist_year,
-                use_numeric_features=use_numeric,
-                chunk_size=PARQUET_CHUNK_SIZE,
+                initial_state_dict=initial_state_dict,
+                device="cpu",
             )
-            del valid_persons
+
+            print(f"  Training complete: {result.metadata.get('epochs_trained', '?')} epochs")
+
+            # 8. Export result
+            train_metrics = {
+                "cutoff_year": cutoff_year,
+                "epochs_trained": result.metadata.get("epochs_trained", 0),
+                "train_loss": float(result.metrics.get("train_loss", 0)),
+                "val_loss": float(result.metrics.get("val_loss", 0))
+                if result.metrics.get("val_loss") is not None
+                else None,
+                "n_samples": n_valid,
+                "n_params": result.metadata.get("n_params", 0),
+                "device": "cpu",
+                "platform": platform.system(),
+            }
+
+            protocol.export_round_result(
+                result_dir=self.outgoing_dir,
+                state_dict={k: v.cpu() for k, v in estimator.model_.state_dict().items()},
+                train_metrics=train_metrics,
+            )
+
+            # Free memory
+            del estimator, train_dataset, eval_dataset, initial_state_dict
             gc.collect()
 
-        print(f"  Dataset: {len(train_dataset):,} samples")
+        print(f"  Result exported to {self.outgoing_dir}")
+        return train_metrics
 
-        # 7. Build validation dataset (next year after cutoff, if data exists)
-        eval_dataset = self._build_validation_dataset(
-            config, vocabulary, cutoff_year, history_len, max_horizon,
-            max_seq_len, use_numeric, id_col=id_col,
+    def _validate_only(
+        self, config, vocabulary, dataset, initial_state_dict,
+        cutoff_year, history_len, max_horizon, max_seq_len,
+        use_numeric, id_col,
+    ):
+        """Run inference only on pretrained model — no training.
+
+        Loads the pretrained weights, runs a forward pass over the dataset
+        to compute validation metrics, and exports the result.
+        """
+        from ..sequence.models import SequenceModel
+        from ..sequence.dataset import sequence_collate_fn
+        from ..sequence.vocabulary import N_NUMERIC_FEATURES
+        from torch.utils.data import DataLoader
+
+        print("  [CLIENT] Validation-only mode: running inference on pretrained model")
+
+        if initial_state_dict is None:
+            raise ValueError("Validation-only mode requires pretrained weights (initial_state_dict)")
+
+        events = config.get("events", [])
+        horizons = config.get("horizons", [1, 3, 5])
+        model_params = config.get("model", {}).get("params", {})
+        n_numeric = N_NUMERIC_FEATURES if use_numeric else 0
+
+        # Build model and load pretrained weights
+        model = SequenceModel(
+            vocab_size=vocabulary.vocab_size,
+            embed_dim=model_params.get("embed_dim", 128),
+            encoder_type=model_params.get("encoder_type", "gru"),
+            encoder_config=model_params.get("encoder", {}),
+            n_events=len(events),
+            n_horizons=len(horizons),
+            max_seq_len=model_params.get("max_seq_len", 64),
+            head_hidden_dims=model_params.get("head_hidden_dims", [128, 64]),
+            dropout=model_params.get("dropout", 0.1),
+            loss_type=model_params.get("loss_type", "bce"),
+            multi_head=bool(model_params.get("multi_head", False)),
+            n_numeric_features=n_numeric,
+            numeric_inject=model_params.get("numeric_inject", "add"),
+        )
+        model.load_state_dict(initial_state_dict)
+        model.eval()
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"  Model loaded: {n_params:,} parameters")
+
+        # Run inference
+        loader = DataLoader(
+            dataset, batch_size=model_params.get("batch_size", 64),
+            shuffle=False, collate_fn=sequence_collate_fn, drop_last=False,
         )
 
-        # 7. Train
-        model_config = config.get("model", {})
-        estimator = PyTorchSequenceEstimator(model_config=model_config)
+        total_loss = 0.0
+        n_seen = 0
+        all_preds = []
+        all_targets = []
 
-        result = estimator.fit(
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            vocabulary=vocabulary,
-            initial_state_dict=initial_state_dict,
-            device="cpu",
-        )
+        with torch.no_grad():
+            for batch in loader:
+                input_ids = batch['input_ids']
+                attention_mask = batch['attention_mask']
+                targets = batch['targets']
+                numeric = batch.get('numeric_features')
 
-        print(f"  Training complete: {result.metadata.get('epochs_trained', '?')} epochs")
+                logits = model(input_ids, attention_mask, numeric_features=numeric)
+                # Compute loss using model's loss function
+                loss = model.compute_loss(logits, targets)
+                bs = input_ids.size(0)
+                total_loss += loss.item() * bs
+                n_seen += bs
 
-        # 8. Export result
+                # Collect predictions for metrics
+                if model.multi_head:
+                    # Multi-head: logits is list of (B, n_horizons) tensors
+                    preds = torch.stack([torch.sigmoid(h) for h in logits], dim=1)  # (B, n_events, n_horizons)
+                else:
+                    preds = torch.sigmoid(logits)
+                all_preds.append(preds.cpu())
+                all_targets.append(targets.cpu())
+
+        val_loss = total_loss / max(n_seen, 1)
+        print(f"  Validation loss: {val_loss:.4f} ({n_seen:,} samples)")
+
+        # Compute per-event metrics
+        all_preds = torch.cat(all_preds, dim=0).numpy()
+        all_targets = torch.cat(all_targets, dim=0).numpy()
+
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        n_outputs = all_targets.shape[1]
+        event_names = []
+        for e in events:
+            for h in horizons:
+                event_names.append(f"{e}_h{h}")
+
+        for i in range(min(n_outputs, len(event_names))):
+            t = all_targets[:, i]
+            p = all_preds.reshape(-1, n_outputs)[:, i] if all_preds.ndim >= 2 else all_preds[:, i]
+            if t.sum() > 0 and t.sum() < len(t):
+                try:
+                    auc = roc_auc_score(t, p)
+                    ap = average_precision_score(t, p)
+                    print(f"    {event_names[i]}: AUC={auc:.4f}, AP={ap:.4f} (pos_rate={t.mean():.4f})")
+                except Exception:
+                    pass
+
+        # Export: send pretrained weights back unchanged + validation metrics
         train_metrics = {
             "cutoff_year": cutoff_year,
-            "epochs_trained": result.metadata.get("epochs_trained", 0),
-            "train_loss": float(result.metrics.get("train_loss", 0)),
-            "val_loss": float(result.metrics.get("val_loss", 0))
-            if result.metrics.get("val_loss") is not None
-            else None,
-            "n_samples": len(train_dataset),
-            "n_params": result.metadata.get("n_params", 0),
+            "epochs_trained": 0,
+            "mode": "validation_only",
+            "train_loss": None,
+            "val_loss": val_loss,
+            "n_samples": n_seen,
+            "n_params": n_params,
             "device": "cpu",
             "platform": platform.system(),
         }
 
         protocol.export_round_result(
             result_dir=self.outgoing_dir,
-            state_dict={k: v.cpu() for k, v in estimator.model_.state_dict().items()},
+            state_dict={k: v.cpu() for k, v in model.state_dict().items()},
             train_metrics=train_metrics,
         )
 
-        # Free memory
-        del estimator, train_dataset, eval_dataset, initial_state_dict
+        del model, loader, all_preds, all_targets, dataset
         gc.collect()
 
-        print(f"  Result exported to {self.outgoing_dir}")
         return train_metrics
 
     def _build_validation_dataset(

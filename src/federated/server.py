@@ -344,7 +344,8 @@ class FederatedServer:
         logger.info(f"Server training dataset: {len(train_dataset):,} sequences")
 
         # Override epochs in config for server pretraining
-        server_config = self.config.copy()
+        import copy
+        server_config = copy.deepcopy(self.config)
         server_config['model']['params']['epochs'] = n_epochs
 
         # Train

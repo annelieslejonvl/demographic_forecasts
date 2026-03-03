@@ -287,11 +287,16 @@ class PyTorchSequenceEstimator(BaseEstimator):
 
     def _compute_event_weights(self, train_dataset) -> torch.Tensor:
         """Compute inverse-prevalence per-event weights from training data."""
+        from torch.utils.data import IterableDataset
         n_events = len(self.events)
         n_horizons = len(self.horizons)
         max_samples = None
         if getattr(train_dataset, '_using_chunks', False):
             max_samples = min(500_000, len(train_dataset))
+        elif isinstance(train_dataset, IterableDataset):
+            # Streaming dataset: cap to avoid scanning the entire dataset
+            max_samples = 10_000
+            logger.info(f"Streaming dataset: capping event weight computation to {max_samples:,} samples")
         pw = train_dataset.get_pos_weights(max_samples=max_samples)
 
         # Use longest horizon rate per event
@@ -331,9 +336,12 @@ class PyTorchSequenceEstimator(BaseEstimator):
             return hw.to(device)
 
         # auto: inverse prevalence per horizon, averaged across events
+        from torch.utils.data import IterableDataset
         max_samples = None
         if getattr(train_dataset, '_using_chunks', False):
             max_samples = min(500_000, len(train_dataset))
+        elif isinstance(train_dataset, IterableDataset):
+            max_samples = 10_000
         pw = train_dataset.get_pos_weights(max_samples=max_samples)
 
         horizon_rates = []
@@ -876,13 +884,15 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 drop_last=False,
             )
 
-        # Event weights
+        # Event weights — use eval_dataset if available (already in memory),
+        # otherwise fall back to train_dataset
+        weight_source = eval_dataset if eval_dataset is not None else train_dataset
         event_weights = None
         if self.event_weight_mode in ('inverse_rate', 'learned'):
-            event_weights = self._compute_event_weights(train_dataset).to(device)
+            event_weights = self._compute_event_weights(weight_source).to(device)
 
         # Horizon weights
-        horizon_weights = self._compute_horizon_weights(train_dataset, device)
+        horizon_weights = self._compute_horizon_weights(weight_source, device)
 
         # Loss function
         pos_weight = None
@@ -893,7 +903,7 @@ class PyTorchSequenceEstimator(BaseEstimator):
             loss_fn = self._build_loss_fn(device, event_weights=event_weights, horizon_weights=horizon_weights)
             logger.info(f"Using DeepHit loss (alpha={self.deephit_alpha}, horizons={self.horizons})")
         else:  # bce or focal
-            if is_iterable_train:
+            if is_iterable_train and eval_dataset is None:
                 pos_params = self.model_config.get('params', {})
                 max_samples = int(pos_params.get('pos_weight_max_samples', 100000))
                 if max_samples <= 0:
@@ -903,10 +913,11 @@ class PyTorchSequenceEstimator(BaseEstimator):
                     logger.info(f"Estimating pos_weight from {max_samples} samples (streaming)")
                     pos_weight = train_dataset.get_pos_weights(max_samples=max_samples).to(device)
             else:
+                pw_source = eval_dataset if (is_iterable_train and eval_dataset is not None) else train_dataset
                 max_pw_samples = None
-                if getattr(train_dataset, '_using_chunks', False):
-                    max_pw_samples = min(500_000, len(train_dataset))
-                pos_weight = train_dataset.get_pos_weights(max_samples=max_pw_samples).to(device)
+                if getattr(pw_source, '_using_chunks', False):
+                    max_pw_samples = min(500_000, len(pw_source))
+                pos_weight = pw_source.get_pos_weights(max_samples=max_pw_samples).to(device)
             loss_fn = self._build_loss_fn(device, pos_weight=pos_weight, event_weights=event_weights, horizon_weights=horizon_weights)
 
         logger.info(f"Loss: {self.loss_type}, event_weight_mode: {self.event_weight_mode}, multi_head: {self.multi_head}")
@@ -994,6 +1005,11 @@ class PyTorchSequenceEstimator(BaseEstimator):
                 bs = input_ids.size(0)
                 train_loss_sum += float(loss.item()) * bs
                 n_seen += bs
+
+                # Log progress periodically for streaming datasets
+                if n_seen % (self.batch_size * 100) == 0 and n_seen > 0:
+                    running_loss = train_loss_sum / n_seen
+                    logger.info(f"  Epoch {epoch}: {n_seen:,} samples processed, running_loss={running_loss:.4f}")
 
             train_loss = train_loss_sum / max(n_seen, 1)
             history['train_loss'].append(train_loss)

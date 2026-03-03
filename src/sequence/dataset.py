@@ -4,6 +4,7 @@ PyTorch Dataset classes for sequence-based demographic event prediction.
 Converts panel data (person x year) into tokenized sequences with
 multi-label targets for event prediction at multiple horizons.
 """
+import gc
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple, Set
@@ -568,10 +569,11 @@ class CachedSequenceDataset(Dataset):
 
         # Try loading from cache (supports single .pt file or chunk directory)
         self._numeric_features = None
+        self._cache_path = cache_path  # stored for _build_from_parquet
         chunk_dir = cache_path.replace('.pt', '_chunks') if cache_path else None
         if cache_path and os.path.exists(cache_path):
             logger.info(f"Loading cached dataset from {cache_path}")
-            cache = torch.load(cache_path, map_location='cpu')
+            cache = torch.load(cache_path, map_location='cpu', weights_only=False)
             self._input_ids = cache['input_ids']
             self._attention_masks = cache['attention_masks']
             self._targets = cache['targets']
@@ -585,21 +587,10 @@ class CachedSequenceDataset(Dataset):
             self._load_from_chunks(chunk_dir)
             logger.info(f"CachedSequenceDataset: {len(self)} persons (from {len(self._chunk_paths)} chunks)")
         else:
-            # Build from parquet
+            # Build from parquet — writes chunk files directly to disk
+            if chunk_dir:
+                os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
             self._build_from_parquet(parquet_path, allowed_sids)
-            if cache_path:
-                import os as _os
-                _os.makedirs(_os.path.dirname(cache_path) or '.', exist_ok=True)
-                cache_data = {
-                    'input_ids': self._input_ids,
-                    'attention_masks': self._attention_masks,
-                    'targets': self._targets,
-                    'sids': self._sids,
-                }
-                if self._numeric_features is not None:
-                    cache_data['numeric_features'] = self._numeric_features
-                torch.save(cache_data, cache_path)
-                logger.info(f"Cached dataset saved to {cache_path}")
 
     def _load_from_chunks(self, chunk_dir: str):
         """Load dataset from multiple chunk .pt files using lazy loading.
@@ -778,117 +769,163 @@ class CachedSequenceDataset(Dataset):
             shard_files = sorted([f for f in os.listdir(temp_dir) if f.endswith('.parquet')])
             logger.info(f"Pass 2: Found {len(shard_files)} shards")
 
-            # Step 2a: Create a single sorted, deduplicated parquet from all shards
-            # This uses disk instead of memory
-            merged_path = os.path.join(temp_dir, '_merged_sorted.parquet')
-            logger.info("Pass 2a: Merging and sorting shards on disk...")
+            # Step 2a: Deduplicate and sort each shard individually, then
+            # combine via PyArrow dataset in Pass 2b (no full re-read needed).
+            merged_dir = os.path.join(temp_dir, '_merged_parts')
+            os.makedirs(merged_dir, exist_ok=True)
+            logger.info("Pass 2a: Deduplicating and sorting shards...")
 
+            part_idx = 0
             chunk_dfs = []
             for idx, shard_file in enumerate(shard_files):
                 shard_path = os.path.join(temp_dir, shard_file)
                 df = pd.read_parquet(shard_path)
                 chunk_dfs.append(df)
 
-                # Write to disk every 50 shards to limit memory
+                # Flush every 50 shards as a sorted, deduplicated part
                 if len(chunk_dfs) >= 50 or idx == len(shard_files) - 1:
                     if len(chunk_dfs) > 0:
                         chunk = pd.concat(chunk_dfs, ignore_index=True)
                         chunk = chunk.drop_duplicates(subset=[self.id_col, self.time_col])
                         chunk = chunk.sort_values([self.id_col, self.time_col])
 
-                        # Append to merged file
-                        if os.path.exists(merged_path):
-                            existing = pd.read_parquet(merged_path)
-                            chunk = pd.concat([existing, chunk], ignore_index=True)
-                            chunk = chunk.drop_duplicates(subset=[self.id_col, self.time_col])
-                            chunk = chunk.sort_values([self.id_col, self.time_col])
-
-                        chunk.to_parquet(merged_path, index=False)
+                        part_path = os.path.join(merged_dir, f"part_{part_idx:04d}.parquet")
+                        chunk.to_parquet(part_path, index=False)
+                        part_idx += 1
                         del chunk
                         chunk_dfs = []
+                        gc.collect()
 
                         if (idx + 1) % 50 == 0:
-                            logger.info(f"Pass 2a: Merged {idx + 1}/{len(shard_files)} shards...")
+                            logger.info(f"Pass 2a: Processed {idx + 1}/{len(shard_files)} shards...")
 
-            logger.info("Pass 2a: Shards merged and sorted on disk")
+            logger.info("Pass 2a: Created %d sorted parts on disk", part_idx)
 
-            # Step 2b: Stream through sorted merged file and tokenize
+            # Step 2b: Stream through sorted parts, tokenize, and flush
+            # to chunk files on disk to avoid holding all data in memory.
             logger.info("Pass 2b: Streaming tokenization from sorted data...")
-            all_input_ids = []
-            all_masks = []
-            all_targets = []
-            all_sids = []
-            all_numerics = []
-            n_processed = 0
 
-            # Read merged parquet in batches via PyArrow
-            import pyarrow.parquet as pq_local
-            pf = pq_local.ParquetFile(merged_path)
-            for batch in pf.iter_batches(batch_size=100_000):
-                chunk = batch.to_pandas()
-                for sid, person_df in chunk.groupby(self.id_col):
-                    person_df = person_df.sort_values(self.time_col)
-                    history = person_df[person_df[self.time_col] <= self.cutoff_year]
-                    if self.min_history_year is not None:
-                        history = history[history[self.time_col] > self.min_history_year]
-                    if len(history) == 0:
-                        continue
-
-                    if self.use_numeric_features:
-                        tokens, numeric = self.vocabulary.tokenize_person_history_with_numerics(
-                            history, time_col=self.time_col, max_year=self.cutoff_year,
-                            min_year=self.min_history_year,
-                        )
-                    else:
-                        tokens = self.vocabulary.tokenize_person_history(
-                            history, time_col=self.time_col, max_year=self.cutoff_year,
-                            min_year=self.min_history_year,
-                        )
-                        numeric = None
-
-                    future = person_df[person_df[self.time_col] > self.cutoff_year]
-                    targets = self._build_targets(future)
-                    input_ids, attention_mask = self._pad_or_truncate(tokens)
-
-                    all_input_ids.append(input_ids)
-                    all_masks.append(attention_mask)
-                    all_targets.append(targets)
-                    all_sids.append(sid)
-
-                    if numeric is not None:
-                        padded_numeric = self._pad_or_truncate_numerics(numeric, len(tokens))
-                        all_numerics.append(padded_numeric)
-
-                    n_processed += 1
-                    if n_processed % 50000 == 0:
-                        logger.info(f"Pass 2b: Tokenized {n_processed:,} persons...")
-
-                del chunk
-
-            logger.info(f"Pass 2 complete: Tokenized {n_processed:,} unique persons")
-
-            if all_input_ids:
-                self._input_ids = torch.from_numpy(np.stack(all_input_ids))
-                self._attention_masks = torch.from_numpy(np.stack(all_masks))
-                self._targets = torch.from_numpy(np.stack(all_targets))
-                self._sids = np.array(all_sids)
-                if all_numerics:
-                    self._numeric_features = torch.from_numpy(np.stack(all_numerics))
+            # Determine chunk output directory (reuses the _chunks convention).
+            # Must be OUTSIDE temp_dir so chunks survive cleanup.
+            if getattr(self, '_cache_path', None):
+                chunk_dir = self._cache_path.replace('.pt', '_chunks')
             else:
-                self._input_ids = torch.zeros(0, self.max_seq_len, dtype=torch.long)
-                self._attention_masks = torch.zeros(0, self.max_seq_len, dtype=torch.float32)
-                self._targets = torch.zeros(0, self.n_outputs, dtype=torch.float32)
-                self._sids = np.array([])
+                # No cache path — write chunks next to the parquet data
+                chunk_dir = os.path.join(os.path.dirname(parquet_path), '_sequence_chunks')
+            os.makedirs(chunk_dir, exist_ok=True)
 
-            logger.info(f"CachedSequenceDataset: {len(self._input_ids)} persons pre-tokenized")
+            CHUNK_FLUSH_SIZE = 500_000  # persons per chunk file
+
+            buf_input_ids = []
+            buf_masks = []
+            buf_targets = []
+            buf_sids = []
+            buf_numerics = []
+            n_processed = 0
+            chunk_idx = 0
+            chunk_sizes = []
+            seen_sids = set()  # Track across parts for cross-part dedup
+
+            def _flush_chunk():
+                nonlocal chunk_idx, buf_input_ids, buf_masks, buf_targets, buf_sids, buf_numerics
+                if not buf_input_ids:
+                    return
+                chunk_data = {
+                    'input_ids': torch.from_numpy(np.stack(buf_input_ids)),
+                    'attention_masks': torch.from_numpy(np.stack(buf_masks)),
+                    'targets': torch.from_numpy(np.stack(buf_targets)),
+                    'sids': np.array(buf_sids),
+                }
+                if buf_numerics:
+                    chunk_data['numeric_features'] = torch.from_numpy(np.stack(buf_numerics))
+                chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_idx:04d}.pt")
+                torch.save(chunk_data, chunk_path)
+                chunk_sizes.append(len(buf_input_ids))
+                logger.info(f"Pass 2b: Flushed chunk {chunk_idx} ({len(buf_input_ids):,} persons) to disk")
+                chunk_idx += 1
+                buf_input_ids = []
+                buf_masks = []
+                buf_targets = []
+                buf_sids = []
+                buf_numerics = []
+                del chunk_data
+                gc.collect()
+
+            # Read all parts via PyArrow dataset (streams without full load)
+            import pyarrow.parquet as pq_local
+            merged_dataset = pq_local.ParquetDataset(merged_dir)
+            for fragment in merged_dataset.fragments:
+                for batch in fragment.to_batches(batch_size=100_000):
+                    chunk = batch.to_pandas()
+                    for sid, person_df in chunk.groupby(self.id_col):
+                        # Skip persons already tokenized from an earlier part
+                        if sid in seen_sids:
+                            continue
+                        seen_sids.add(sid)
+
+                        person_df = person_df.sort_values(self.time_col)
+                        history = person_df[person_df[self.time_col] <= self.cutoff_year]
+                        if self.min_history_year is not None:
+                            history = history[history[self.time_col] > self.min_history_year]
+                        if len(history) == 0:
+                            continue
+
+                        if self.use_numeric_features:
+                            tokens, numeric = self.vocabulary.tokenize_person_history_with_numerics(
+                                history, time_col=self.time_col, max_year=self.cutoff_year,
+                                min_year=self.min_history_year,
+                            )
+                        else:
+                            tokens = self.vocabulary.tokenize_person_history(
+                                history, time_col=self.time_col, max_year=self.cutoff_year,
+                                min_year=self.min_history_year,
+                            )
+                            numeric = None
+
+                        future = person_df[person_df[self.time_col] > self.cutoff_year]
+                        targets = self._build_targets(future)
+                        input_ids, attention_mask = self._pad_or_truncate(tokens)
+
+                        buf_input_ids.append(input_ids)
+                        buf_masks.append(attention_mask)
+                        buf_targets.append(targets)
+                        buf_sids.append(sid)
+
+                        if numeric is not None:
+                            padded_numeric = self._pad_or_truncate_numerics(numeric, len(tokens))
+                            buf_numerics.append(padded_numeric)
+
+                        n_processed += 1
+                        if n_processed % 50000 == 0:
+                            logger.info(f"Pass 2b: Tokenized {n_processed:,} persons...")
+
+                        if len(buf_input_ids) >= CHUNK_FLUSH_SIZE:
+                            _flush_chunk()
+
+                    del chunk
+
+            # Flush remaining
+            _flush_chunk()
+            del seen_sids
+            gc.collect()
+
+            logger.info(f"Pass 2 complete: Tokenized {n_processed:,} unique persons in {chunk_idx} chunks")
+
+            # Write manifest for fast reload
+            import json as _json
+            chunk_files = sorted([f for f in os.listdir(chunk_dir) if f.endswith('.pt')])
+            manifest = {'chunk_files': chunk_files, 'chunk_sizes': chunk_sizes}
+            with open(os.path.join(chunk_dir, 'manifest.json'), 'w') as f:
+                _json.dump(manifest, f)
+
+            # Switch to chunk-based lazy loading (keeps only 2 chunks in memory)
+            self._load_from_chunks(chunk_dir)
 
         finally:
-            # TEMPORARILY DISABLED: Keep temp directory for recovery if needed
-            # Clean up temp directory
-            # if os.path.exists(temp_dir):
-            #     shutil.rmtree(temp_dir)
-            #     logger.info(f"Cleaned up temp directory: {temp_dir}")
-            logger.info(f"Temp directory preserved for recovery: {temp_dir}")
+            # Clean up temp directory (shards + merged parts)
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up temp directory: {temp_dir}")
 
     def _build_targets(self, future_df: pd.DataFrame) -> np.ndarray:
         targets = np.zeros(self.n_outputs, dtype=np.float32)

@@ -32,8 +32,11 @@ import argparse
 import logging
 import os
 import sys
+from datetime import datetime
 
 import yaml
+
+from src.utils.logging_setup import setup_logging
 
 
 def main():
@@ -113,10 +116,10 @@ def main():
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    log_file = setup_logging(
+        log_file=f"federated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
     )
+    print(f"Logging to: {log_file}")
 
     # Validate arguments
     if not args.local_mode:
